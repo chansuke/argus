@@ -1,0 +1,6 @@
+[default.extend-words]
+# File extension of argus-log's per-actor append logs.
+alog = "alog"
+
+[files]
+extend-exclude = ["ui/pnpm-lock.yaml", "Cargo.lock", "flake.lock"]
