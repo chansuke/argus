@@ -1,5 +1,8 @@
-use std::fs::File;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::Write;
+use std::path::Path;
 
+use crate::frame::{self, FileHead};
 use crate::{ActorKey, LogDir, LogError, Seq, Stamp};
 
 /// The only handle that can append to one actor's log. Not `Clone`; holds the OS lock
@@ -10,6 +13,9 @@ pub struct LogWriter {
     actor: ActorKey,
     next: Seq,
     last_stamp: Option<Stamp>,
+    /// Byte length of the trusted file; a failed append is cut back to it.
+    end: u64,
+    buf: Vec<u8>,
     dirty: bool,
 }
 
@@ -33,13 +39,61 @@ impl LogWriter {
         actor: &ActorKey,
         header: &[u8],
     ) -> Result<(Self, Recovery), LogError> {
-        // TODO:
-        //   create_dir_all(dir.root); open read+append (create)
-        //   file.try_lock() -> Err(Locked) on WouldBlock
-        //   if len == 0: write MAGIC + header; sync
-        //   else: verify MAGIC, compare header; scan frame heads to find the last good
-        //         frame (stop at short read / bad crc / seq != index); set_len(good_end)
-        todo!("not implemented")
+        fs::create_dir_all(dir.root())?;
+        let path = dir.log_path(actor);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(LogError::Locked(path)),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+
+        let mut recovery = Recovery::default();
+        let len = file.metadata()?.len();
+        let fresh = frame::encode_file_head(header);
+        let start = if len == 0 {
+            create(&mut file, &fresh, dir.root())?
+        } else {
+            match frame::read_file_head(&mut file, &path)? {
+                // A crash while this log was created: nothing was ever appended to it.
+                FileHead::Torn { bytes } if fresh.starts_with(&bytes) => {
+                    file.set_len(0)?;
+                    recovery.truncated_bytes = len;
+                    create(&mut file, &fresh, dir.root())?
+                }
+                FileHead::Torn { .. } => return Err(LogError::HeaderMismatch(path)),
+                FileHead::Whole { header: found, .. } if found != header => {
+                    return Err(LogError::HeaderMismatch(path));
+                }
+                FileHead::Whole { end, .. } => end,
+            }
+        };
+
+        let scan = frame::scan(&mut file, start, Seq::FIRST, None)?;
+        let len = file.metadata()?.len();
+        if len > scan.end {
+            file.set_len(scan.end)?;
+            file.sync_all()?;
+            recovery.truncated_bytes += len - scan.end;
+        }
+        let next = Seq::from_persisted(scan.offsets.len() as u64);
+        recovery.last = scan
+            .last_stamp
+            .map(|stamp| (Seq::from_persisted(next.get() - 1), stamp));
+        let writer = LogWriter {
+            file,
+            actor: actor.clone(),
+            next,
+            last_stamp: scan.last_stamp,
+            end: scan.end,
+            buf: Vec::new(),
+            dirty: false,
+        };
+        Ok((writer, recovery))
     }
 
     /// Appends one frame and returns its seq. Does not fsync; see [`LogWriter::sync`].
@@ -50,13 +104,28 @@ impl LogWriter {
         {
             return Err(LogError::NonMonotonicStamp { last, given: stamp });
         }
-        // TODO: frame::encode into a reused buffer; single write_all; bump next, set dirty.
-        todo!("not implemented")
+        self.buf.clear();
+        frame::encode(self.next, stamp, payload, &mut self.buf);
+        if let Err(e) = self.file.write_all(&self.buf) {
+            // Leave no partial frame behind for the next append to follow.
+            self.file.set_len(self.end)?;
+            return Err(e.into());
+        }
+        let seq = self.next;
+        self.end += self.buf.len() as u64;
+        self.next = seq.next();
+        self.last_stamp = Some(stamp);
+        self.dirty = true;
+        Ok(seq)
     }
 
     /// `fdatasync` if anything was appended since the last sync.
     pub fn sync(&mut self) -> Result<(), LogError> {
-        todo!("not implemented")
+        if self.dirty {
+            self.file.sync_data()?;
+            self.dirty = false;
+        }
+        Ok(())
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -68,4 +137,12 @@ impl LogWriter {
     pub fn actor(&self) -> &ActorKey {
         &self.actor
     }
+}
+
+/// Writes the file head in one write and makes the new file's name durable.
+fn create(file: &mut File, head: &[u8], root: &Path) -> Result<u64, LogError> {
+    file.write_all(head)?;
+    file.sync_all()?;
+    File::open(root)?.sync_all()?;
+    Ok(head.len() as u64)
 }

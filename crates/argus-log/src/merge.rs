@@ -23,12 +23,44 @@ pub struct MergedFrames {
     primed: bool,
 }
 
+impl MergedFrames {
+    fn push_head(&mut self, idx: usize) -> Result<(), LogError> {
+        if let Some(stamp) = self.iters[idx].peek_stamp()? {
+            let actor = self.iters[idx].actor().clone();
+            self.heap.push(Reverse((stamp, actor, idx)));
+        }
+        Ok(())
+    }
+
+    fn read_next(&mut self) -> Result<Option<Frame>, LogError> {
+        if !self.primed {
+            self.primed = true;
+            for idx in 0..self.iters.len() {
+                self.push_head(idx)?;
+            }
+        }
+        let Some(Reverse((_, _, idx))) = self.heap.pop() else {
+            return Ok(None);
+        };
+        let frame = self.iters[idx]
+            .next()
+            .transpose()?
+            .expect("a peeked iterator has a next frame");
+        self.push_head(idx)?;
+        Ok(Some(frame))
+    }
+}
+
 impl Iterator for MergedFrames {
     type Item = Result<Frame, LogError>;
     fn next(&mut self) -> Option<Self::Item> {
-        // TODO: on first call push (peek_stamp, actor, idx) for each iter; then pop min,
-        //       take that iter's next frame, re-push its new peek if any.
-        todo!("not implemented")
+        let item = self.read_next().transpose();
+        if matches!(item, Some(Err(_))) {
+            // A broken log ends the merge: frames after it could be out of order.
+            self.heap.clear();
+            self.iters.clear();
+        }
+        item
     }
 }
 

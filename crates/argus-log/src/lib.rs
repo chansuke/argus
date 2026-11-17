@@ -17,8 +17,6 @@
 //! Readers need no lock: they only ever see whole frames, so a viewer process can read a
 //! store while the host writes it.
 
-#![allow(dead_code, unused_variables)]
-
 mod blob;
 mod frame;
 mod merge;
@@ -125,8 +123,22 @@ impl LogDir {
     }
     /// Every actor that has a log here, in key order.
     pub fn actors(&self) -> Result<Vec<ActorKey>, LogError> {
-        // TODO: read_dir, keep `*.alog`, parse stems with ActorKey::new, sort.
-        todo!("not implemented")
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut actors = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            // A file argus did not name is not one of its logs.
+            let key = name.to_str().and_then(|n| n.strip_suffix(".alog"));
+            if let Some(actor) = key.and_then(|k| ActorKey::new(k).ok()) {
+                actors.push(actor);
+            }
+        }
+        actors.sort();
+        Ok(actors)
     }
     pub fn blobs(&self) -> BlobStore {
         BlobStore::at(self.root.join("blobs"))
