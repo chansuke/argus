@@ -184,6 +184,7 @@ await api.answer_permission({ request_id: requestId(), job, run, answer: "Allow"
 - Should argus reuse tlars' message catalog (`tlars-msg`) through a cross-repo path dependency, or vendor the few TLC codes it needs?
 - Which agent comes next: Codex's real adapter, OpenCode, Gemini, or ACP as a common protocol?
 - CI: `argus-app` (Tauri v2) is outside the std-only workspace, so CI must build it in a separate job with network access (`cargo check --manifest-path crates/argus-app/Cargo.toml`), next to the workspace check, clippy, `pnpm gen:check`, and `tsc --strict`.
+- Desktop renderer: revisit [react-native-gpui](https://github.com/streetwriters/react-native-gpui) (React Native 0.87 on Zed's GPUI) when it leaves alpha. It would let the desktop and Expo apps share components and draw large diffs on the GPU. As of 2026-11-18 it is six weeks old, IME composition is untested, its docs disagree on whether a web view exists, and it targets RN 0.87 while `apps/mobile` is on 0.88. View logic stays in `@argus/client`, so a switch would replace only the component layer.
 
 ## Next implementation step
 
