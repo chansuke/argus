@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# The one verification gate. Local runs, the Claude Code hook, and CI all call
+# this script, so "it passed" means the same thing everywhere.
+#
+#   tools/gate            run every step that needs no network
+#   tools/gate <step>...  run the named steps
+#   tools/gate --list     print the step names
+#
+# Run it inside the dev shell (`nix develop -c tools/gate`).
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+
+step_fmt() {
+  cargo fmt --all --check
+  nixfmt --check flake.nix
+}
+
+step_clippy() {
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+}
+
+step_test() {
+  cargo nextest run --workspace --locked --no-tests=pass
+}
+
+# The TS client is generated from argus-api's op list; a stale copy fails here.
+step_tsgen() {
+  cargo run -q --locked -p argus-api --bin argus-ts | diff -u ui/packages/argus-client/src/gen/api.ts -
+}
+
+step_ts() {
+  (cd ui && pnpm install --frozen-lockfile --silent && pnpm -s typecheck)
+}
+
+step_typos() {
+  typos
+}
+
+step_actionlint() {
+  if [[ -d .github/workflows ]]; then
+    actionlint
+  fi
+}
+
+# Every listed config must pass; every config in specs/tla/mutants.txt must
+# FAIL with the expected TLC exit code, which proves the spec can catch the
+# bug it was written against.
+step_tla() {
+  tools/tla-check
+}
+
+step_lean() {
+  tools/lean-check
+}
+
+# Tauri resolves crates from the network, so this step is not in the default set.
+step_app() {
+  cargo check --locked --manifest-path crates/argus-app/Cargo.toml
+}
+
+default_steps=(fmt clippy test tsgen ts typos actionlint tla lean)
+all_steps=("${default_steps[@]}" app)
+
+if [[ ${1:-} == --list ]]; then
+  printf '%s\n' "${all_steps[@]}"
+  exit 0
+fi
+
+steps=("$@")
+if [[ ${#steps[@]} -eq 0 ]]; then
+  steps=("${default_steps[@]}")
+fi
+
+for s in "${steps[@]}"; do
+  if ! declare -F "step_$s" >/dev/null; then
+    echo "gate: unknown step '$s' (see tools/gate --list)" >&2
+    exit 2
+  fi
+done
+
+failed=()
+for s in "${steps[@]}"; do
+  echo "::group::gate $s"
+  start=$SECONDS
+  if "step_$s"; then
+    echo "gate: $s ok ($((SECONDS - start))s)"
+  else
+    echo "gate: $s FAILED ($((SECONDS - start))s)" >&2
+    failed+=("$s")
+  fi
+  echo "::endgroup::"
+done
+
+if [[ ${#failed[@]} -gt 0 ]]; then
+  echo "gate: failed steps: ${failed[*]}" >&2
+  exit 1
+fi
+echo "gate: all steps passed (${steps[*]})"
