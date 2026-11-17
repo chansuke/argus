@@ -84,7 +84,16 @@ failed=()
 for s in "${steps[@]}"; do
   echo "::group::gate $s"
   start=$SECONDS
-  if "step_$s"; then
+  # Run outside any `if`: bash ignores `set -e` in a condition, which would let
+  # an early failing command in a multi-command step go unnoticed.
+  set +e
+  (
+    set -e
+    "step_$s"
+  )
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
     echo "gate: $s ok ($((SECONDS - start))s)"
   else
     echo "gate: $s FAILED ($((SECONDS - start))s)" >&2
