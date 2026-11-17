@@ -164,6 +164,16 @@ fn crash_at_any_byte_keeps_every_whole_frame() {
             s.frame_ends[whole - 1]
         };
         assert_eq!(rec.truncated_bytes, cut - good_end, "cut at {cut}");
+        // Nothing is lost: the bytes that were cut off are kept next to the log.
+        match &rec.quarantined {
+            Some(kept) => assert_eq!(
+                fs::read(kept).unwrap(),
+                &s.bytes[good_end as usize..cut as usize],
+                "cut at {cut}"
+            ),
+            None => assert_eq!(cut, good_end, "cut at {cut}"),
+        }
+        assert_eq!(dir.actors().unwrap(), vec![a.clone()], "cut at {cut}");
         assert_eq!(
             rec.last.map(|(seq, st)| (seq.get(), st)),
             whole.checked_sub(1).map(|i| (i as u64, s.stamps[i])),
@@ -183,9 +193,10 @@ fn crash_at_any_byte_keeps_every_whole_frame() {
 }
 
 /// A damaged byte anywhere in a frame ends the trusted prefix at that frame. A reader
-/// never returns a frame whose bytes changed.
+/// never returns a frame whose bytes changed, and the writer moves that frame and every
+/// frame after it, intact ones included, into a quarantine file before it cuts the log.
 #[test]
-fn a_damaged_frame_and_everything_after_it_is_not_read() {
+fn a_damaged_frame_and_everything_after_it_is_set_aside() {
     let mut rng = Rng(3);
     let s = write_sample(&mut rng, 5);
     let a = actor("agent-1");
@@ -201,8 +212,43 @@ fn a_damaged_frame_and_everything_after_it_is_not_read() {
         for (i, f) in frames.iter().enumerate() {
             assert_eq!(f.payload, s.payloads[i], "byte {pos}");
         }
+
+        let (_, rec) = LogWriter::open(&dir, &a, HEADER).unwrap();
+        let good_end = damaged
+            .checked_sub(1)
+            .map_or(s.header_end, |i| s.frame_ends[i]);
+        let kept = rec.quarantined.expect("the damaged tail is kept");
+        assert_eq!(
+            fs::read(kept).unwrap(),
+            &bytes[good_end as usize..],
+            "byte {pos}"
+        );
+        assert_eq!(fs::metadata(log_file(&dir, &a)).unwrap().len(), good_end);
         fs::remove_dir_all(dir.root()).unwrap();
     }
+}
+
+/// Two crashes that leave a torn tail at the same offset keep both tails.
+#[test]
+fn a_second_quarantine_does_not_overwrite_the_first() {
+    let dir = scratch("twice");
+    let a = actor("agent-1");
+    let (mut w, _) = LogWriter::open(&dir, &a, HEADER).unwrap();
+    w.append(Clock::starting_after(None).tick(), b"kept")
+        .unwrap();
+    drop(w);
+    let path = log_file(&dir, &a);
+    let mut kept = Vec::new();
+    for tail in [&b"first torn tail"[..], b"second"] {
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(tail);
+        fs::write(&path, &bytes).unwrap();
+        let (_, rec) = LogWriter::open(&dir, &a, HEADER).unwrap();
+        kept.push(rec.quarantined.unwrap());
+    }
+    assert_ne!(kept[0], kept[1]);
+    assert_eq!(fs::read(&kept[0]).unwrap(), b"first torn tail");
+    assert_eq!(fs::read(&kept[1]).unwrap(), b"second");
 }
 
 /// One clock stamps every frame of a ledger, so merging the per-actor logs by stamp gives
