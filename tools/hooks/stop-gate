@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Claude Code Stop hook: when the working tree has changes, run the gate and
+# hand failures back to Claude (exit 2). A second stop in the same turn is let
+# through so a failing gate cannot trap the session.
+set -uo pipefail
+
+input=$(cat)
+if grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' <<<"$input"; then
+  exit 0
+fi
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$root"
+if [[ -z $(git status --porcelain -- crates ui specs proofs tools Cargo.toml Cargo.lock flake.nix) ]]; then
+  exit 0
+fi
+
+out=$(nix develop --command tools/gate 2>&1)
+status=$?
+if [[ $status -ne 0 ]]; then
+  {
+    echo "The verification gate failed. Fix the cause (see .claude/skills/verify/SKILL.md):"
+    grep -E '^gate: ' <<<"$out"
+    echo "--- last lines ---"
+    tail -n 40 <<<"$out"
+  } >&2
+  exit 2
+fi
+exit 0
