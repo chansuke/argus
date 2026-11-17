@@ -1,0 +1,9 @@
+name = "argus-proofs"
+defaultTargets = ["ArgusProofs"]
+
+[leanOptions]
+# A `sorry` or any other warning fails the build.
+warningAsError = true
+
+[[lean_lib]]
+name = "ArgusProofs"

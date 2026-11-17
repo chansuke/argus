@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Build the Lean proofs. lakefile.toml sets warningAsError, so a `sorry`
+# fails the build; new axioms are rejected here as well.
+set -euo pipefail
+
+dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../proofs" && pwd)
+cd "$dir"
+
+if grep -rnE '^\s*axiom\b' --include='*.lean' . --exclude-dir=.lake; then
+  echo "lean: declare no axioms; prove the statement instead" >&2
+  exit 1
+fi
+lake build
