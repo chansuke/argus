@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::Write;
-use std::path::Path;
+use std::io::{self, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use crate::frame::{self, FileHead};
 use crate::{ActorKey, LogDir, LogError, Seq, Stamp};
@@ -25,6 +25,8 @@ pub struct Recovery {
     /// Bytes of an incomplete or corrupt final frame that were cut off.
     pub truncated_bytes: u64,
     pub last: Option<(Seq, Stamp)>,
+    /// Where the cut-off bytes were kept, if any were cut.
+    pub quarantined: Option<PathBuf>,
 }
 
 impl LogWriter {
@@ -33,7 +35,9 @@ impl LogWriter {
     /// - A new file gets `header` written once; an existing file must carry the same
     ///   header bytes, or this fails with `HeaderMismatch` (one key, one meaning).
     /// - Takes the exclusive lock before reading anything.
-    /// - Truncates a torn tail (invariant 4) and reports it.
+    /// - Truncates a torn tail (invariant 4) and reports it. The cut-off bytes are first
+    ///   copied to `<actor>.alog.torn-<offset>`: a damaged frame in the middle cuts off
+    ///   intact frames too, and those must stay recoverable.
     pub fn open(
         dir: &LogDir,
         actor: &ActorKey,
@@ -61,6 +65,7 @@ impl LogWriter {
             match frame::read_file_head(&mut file, &path)? {
                 // A crash while this log was created: nothing was ever appended to it.
                 FileHead::Torn { bytes } if fresh.starts_with(&bytes) => {
+                    recovery.quarantined = Some(quarantine(&mut file, &path, 0)?);
                     file.set_len(0)?;
                     recovery.truncated_bytes = len;
                     create(&mut file, &fresh, dir.root())?
@@ -76,6 +81,7 @@ impl LogWriter {
         let scan = frame::scan(&mut file, start, Seq::FIRST, None)?;
         let len = file.metadata()?.len();
         if len > scan.end {
+            recovery.quarantined = Some(quarantine(&mut file, &path, scan.end)?);
             file.set_len(scan.end)?;
             file.sync_all()?;
             recovery.truncated_bytes += len - scan.end;
@@ -137,6 +143,34 @@ impl LogWriter {
     pub fn actor(&self) -> &ActorKey {
         &self.actor
     }
+}
+
+/// Copies the bytes from `from` to the end of the log into a new file next to it and makes
+/// that copy durable, so the caller may cut them off. Never overwrites an earlier copy.
+fn quarantine(file: &mut File, path: &Path, from: u64) -> Result<PathBuf, LogError> {
+    let name = path.file_name().unwrap().to_string_lossy();
+    let parent = path.parent().unwrap();
+    let mut n = 0;
+    let (kept_path, mut kept) = loop {
+        let candidate = match n {
+            0 => parent.join(format!("{name}.torn-{from}")),
+            n => parent.join(format!("{name}.torn-{from}-{n}")),
+        };
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    file.seek(SeekFrom::Start(from))?;
+    io::copy(file, &mut kept)?;
+    kept.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(kept_path)
 }
 
 /// Writes the file head in one write and makes the new file's name durable.

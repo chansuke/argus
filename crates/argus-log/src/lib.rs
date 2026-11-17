@@ -11,7 +11,8 @@
 //! 3. **Stamps strictly increase within a file.** The ledger's sequencer guarantees it and
 //!    the writer rejects violations.
 //! 4. **A torn tail (crash mid-append) is never surfaced.** Length + CRC detect it;
-//!    readers stop before it and the writer truncates it on open.
+//!    readers stop before it and the writer truncates it on open, after copying the
+//!    cut-off bytes to `<actor>.alog.torn-<offset>` so no intact frame is ever lost.
 //! 5. **Blobs are immutable and named by content.** Writing the same bytes twice is a no-op.
 //!
 //! Readers need no lock: they only ever see whole frames, so a viewer process can read a
