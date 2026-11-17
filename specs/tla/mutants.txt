@@ -1,0 +1,6 @@
+# Configs that model a design argus rejected. TLC must find the violation;
+# a mutant that passes means the spec lost its teeth.
+# <config> <expected TLC exit code: 12 safety, 13 liveness>
+Lease.StartBeforeRecord.cfg 12
+ReviewGate.StaleApproval.cfg 12
+ReviewGate.RetryDelivery.cfg 12

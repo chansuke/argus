@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Model-check every specs/tla/*.cfg with TLC. <Spec>.<anything>.cfg checks
+# <Spec>.tla. Configs listed in specs/tla/mutants.txt must fail with the
+# listed exit code; every other config must pass.
+set -euo pipefail
+
+dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../specs/tla" && pwd)
+cd "$dir"
+meta=$(mktemp -d)
+trap 'rm -rf "$meta"' EXIT
+
+declare -A expect=()
+while read -r cfg code; do
+  [[ -z $cfg || $cfg == \#* ]] && continue
+  expect[$cfg]=$code
+done < mutants.txt
+
+for cfg in "${!expect[@]}"; do
+  [[ -f $cfg ]] || { echo "tla: $cfg is listed in mutants.txt but missing" >&2; exit 1; }
+done
+
+status=0
+for cfg in *.cfg; do
+  spec=${cfg%%.*}.tla
+  want=${expect[$cfg]:-0}
+  set +e
+  tlc -workers auto -metadir "$meta/${cfg%.cfg}" -config "$cfg" "$spec" > "$meta/out" 2>&1
+  got=$?
+  set -e
+  if [[ $got -eq $want ]]; then
+    if [[ $want -eq 0 ]]; then
+      echo "tla: $cfg passed ($(grep -m1 'distinct states found' "$meta/out" | sed 's/^.*generated, //'))"
+    else
+      echo "tla: $cfg failed as expected: $(grep -m1 -E 'is violated' "$meta/out" || echo "exit $got")"
+    fi
+  else
+    echo "tla: $cfg exited $got, expected $want" >&2
+    cat "$meta/out" >&2
+    status=1
+  fi
+done
+exit $status
