@@ -21,4 +21,4 @@ license = "MIT"
 
 [workspace.lints.clippy]
 # Iteration order must never leak into logs, views, or generated TS (same rule as tlars).
-disallowed-types = "warn"
+disallowed_types = "warn"
