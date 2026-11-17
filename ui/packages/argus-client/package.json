@@ -9,10 +9,21 @@
     "./react": "./src/react.ts"
   },
   "peerDependencies": {
-    "react": "*",
+    "react": "^19",
     "@tauri-apps/api": "^2"
   },
   "peerDependenciesMeta": {
-    "@tauri-apps/api": { "optional": true }
+    "@tauri-apps/api": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/react": "19.3.0",
+    "react": "19.3.1",
+    "@tauri-apps/api": "2.12.5"
   }
 }

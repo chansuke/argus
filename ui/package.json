@@ -3,6 +3,8 @@
   "private": true,
   "scripts": {
     "gen": "cargo run -q --manifest-path ../Cargo.toml -p argus-api --bin argus-ts > packages/argus-client/src/gen/api.ts",
-    "gen:check": "cargo run -q --manifest-path ../Cargo.toml -p argus-api --bin argus-ts | diff - packages/argus-client/src/gen/api.ts"
-  }
+    "gen:check": "cargo run -q --manifest-path ../Cargo.toml -p argus-api --bin argus-ts | diff - packages/argus-client/src/gen/api.ts",
+    "typecheck": "pnpm -r --if-present typecheck"
+  },
+  "packageManager": "pnpm@12.9.0"
 }

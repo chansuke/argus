@@ -5,9 +5,9 @@
   "description": "Expo (React Native + TS) app over websocketTransport. Home screen = overview.queue (what needs the human, most urgent first); review, decide, merge, and one-tap permission answers like the desktop. Verified in development on EAS Simulators via the same Device check argus runs for agents.",
   "dependencies": {
     "@argus/client": "workspace:*",
-    "expo": "*",
-    "expo-router": "*",
-    "react": "^19",
-    "react-native": "*"
+    "expo": "58.0.25",
+    "expo-router": "58.0.31",
+    "react": "19.3.1",
+    "react-native": "0.88.1"
   }
 }
