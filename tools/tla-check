@@ -24,7 +24,7 @@ for cfg in *.cfg; do
   spec=${cfg%%.*}.tla
   want=${expect[$cfg]:-0}
   set +e
-  tlc -workers auto -metadir "$meta/${cfg%.cfg}" -config "$cfg" "$spec" > "$meta/out" 2>&1
+  tlc -noGenerateSpecTE -workers auto -metadir "$meta/${cfg%.cfg}" -config "$cfg" "$spec" > "$meta/out" 2>&1
   got=$?
   set -e
   if [[ $got -eq $want ]]; then
