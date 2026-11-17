@@ -1,0 +1,17 @@
+[package]
+name = "argus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "argus"
+path = "src/main.rs"
+
+# The CLI is a client of the API like the app and the phone; it never opens a ledger.
+[dependencies]
+argus-json = { path = "../argus-json" }
+argus-api = { path = "../argus-api" }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+# Not a workspace member (see the root Cargo.toml `exclude`): Tauri needs serde and
+# network resolution. The crate holds no business logic; it adapts Tauri IPC to the host.
+[package]
+name = "argus-app"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+argus-api = { path = "../argus-api" }
+argus-host = { path = "../argus-host" }
+argus-json = { path = "../argus-json" }
+tauri = { version = "2" }
+serde_json = "1"
+
+[build-dependencies]
+tauri-build = { version = "2" }

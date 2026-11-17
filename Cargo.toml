@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/argus-log",
+    "crates/argus-json",
+    "crates/argus-core",
+    "crates/argus-api",
+    "crates/argus-host",
+    "crates/argus-cli",
+]
+# Tauri pulls serde/tao/wry and needs the network to resolve; it is built separately
+# (`cargo check --manifest-path crates/argus-app/Cargo.toml`) so the core stays std-only.
+exclude = ["crates/argus-app"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+
+# std only: no third-party dependencies in workspace members.
+
+[workspace.lints.clippy]
+# Iteration order must never leak into logs, views, or generated TS (same rule as tlars).
+disallowed-types = "warn"

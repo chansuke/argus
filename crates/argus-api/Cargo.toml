@@ -1,0 +1,13 @@
+[package]
+name = "argus-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Depends on argus-json only: view models are presentation shapes, not domain types.
+# The host maps core views into them; this crate never sees a projection.
+[dependencies]
+argus-json = { path = "../argus-json" }
+
+[lints]
+workspace = true

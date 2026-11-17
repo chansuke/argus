@@ -1,0 +1,12 @@
+[package]
+name = "argus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+argus-log = { path = "../argus-log" }
+argus-json = { path = "../argus-json" }
+
+[lints]
+workspace = true

@@ -1,0 +1,199 @@
+//! Identifiers and small value types. Every id that a client can submit is minted by the
+//! submitter (CLI, app, policy), so a retried submission carries the same id and the
+//! ledger can drop it as a duplicate (see `Event::dedup_key`).
+
+use std::num::NonZeroU32;
+
+pub use argus_log::{BlobId, EventId, Seq, Stamp};
+
+/// 128-bit id. Random for human/agent submissions; derived (FNV-1a/128 over a canonical
+/// key) for policy submissions, so the same policy decision always yields the same id.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Id128(pub u128);
+
+impl Id128 {
+    /// Wall time + pid + counter + `/dev/urandom`. Formats as a UUID so an agent run's
+    /// id doubles as the Claude Code `--session-id`.
+    pub fn mint() -> Self {
+        todo!("not implemented")
+    }
+    pub fn derive(namespace: &str, key: &[u8]) -> Self {
+        todo!("not implemented")
+    }
+}
+
+macro_rules! id_newtype {
+    ($($(#[$m:meta])* $name:ident;)*) => {$(
+        $(#[$m])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+        pub struct $name(pub Id128);
+    )*};
+}
+
+id_newtype! {
+    JobId;
+    /// One external effect: an agent session, a review, a check, a snapshot, ...
+    RunId;
+    /// One raw byte stream (a transcript file, a stdout pipe, a PTY).
+    SourceId;
+    ThreadId;
+    CommentId;
+    TaskKey;
+    BookmarkId;
+    InputId;
+    /// A billed external resource (an EAS simulator session).
+    LeaseId;
+    /// One human verdict on a head snapshot (`Event::Decided`). Feedback delivery runs
+    /// derive their `RunId` from it, so a delivery is requested at most once per decision.
+    DecisionId;
+}
+
+/// Retry number of a run. Every attempt that starts also finishes exactly once
+/// (possibly as `Abandoned` after a host crash).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Attempt(pub u16);
+
+/// A decoded fact: frame `event`, part `part` (one raw record can decode into several
+/// observations, e.g. an assistant message with thinking + text + two tool calls).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct FactId {
+    pub event: EventId,
+    pub part: u16,
+}
+
+impl FactId {
+    /// `<actor>:<seq>.<part>`, the form the API and stored references use.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (event, part) = s.rsplit_once('.')?;
+        Some(FactId {
+            event: EventId::parse(event)?,
+            part: part.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for FactId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.event, self.part)
+    }
+}
+
+/// A finding inside a review run's result: the result fact + index within it.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct FindingId {
+    pub fact: FactId,
+    pub index: u16,
+}
+
+/// A skill candidate inside an insight run's result.
+pub type CandidateId = FindingId;
+
+/// Which ledger a cross-ledger reference points into.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum LedgerRef {
+    Job(JobId),
+    Meta,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct FactRef {
+    pub ledger: LedgerRef,
+    pub fact: FactId,
+}
+
+/// Domain time in ms since the Unix epoch (UTC). Distinct from [`Stamp`], which is
+/// append order: an imported 2025 transcript is stamped today but occurred in 2025.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct UnixMillis(pub i64);
+
+/// Agent-native record id (Claude Code `uuid`). Records form a tree via `parentUuid`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct RecordKey(pub String);
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ToolCallId(pub String);
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ToolName(pub String);
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ModelId(pub String);
+
+/// Hex object id of a git tree or commit (sha1 or sha256 repos). Validated on construction.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct GitOid(String);
+
+impl GitOid {
+    pub fn parse(hex: &str) -> Option<Self> {
+        let ok = matches!(hex.len(), 40 | 64) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+        ok.then(|| GitOid(hex.to_ascii_lowercase()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A tree snapshot of a worktree. Review anchors and checks name trees, not times, so a
+/// result is tied to exactly the content it judged.
+pub type TreeOid = GitOid;
+pub type CommitOid = GitOid;
+
+/// Repo-relative, `/`-separated, normalized, never escaping the repo.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct RepoPath(String);
+
+impl RepoPath {
+    pub fn parse(p: &str) -> Option<Self> {
+        let ok = !p.is_empty()
+            && !p.starts_with('/')
+            && p.split('/').all(|c| !c.is_empty() && c != "..");
+        ok.then(|| RepoPath(p.to_owned()))
+    }
+    /// A path as an agent wrote it (absolute, or relative to its cwd = the worktree),
+    /// made repo-relative. `None` when it points outside the worktree.
+    pub fn within(worktree: &std::path::Path, agent_path: &str) -> Option<Self> {
+        let p = std::path::Path::new(agent_path);
+        let rel = if p.is_absolute() {
+            p.strip_prefix(worktree).ok()?
+        } else {
+            p
+        };
+        RepoPath::parse(rel.to_str()?)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Inclusive 1-based line range, `start <= end` by construction.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct LineRange {
+    start: NonZeroU32,
+    end: NonZeroU32,
+}
+
+impl LineRange {
+    pub fn new(start: u32, end: u32) -> Option<Self> {
+        let (s, e) = (NonZeroU32::new(start)?, NonZeroU32::new(end)?);
+        (s <= e).then_some(LineRange { start: s, end: e })
+    }
+    pub fn start(self) -> u32 {
+        self.start.get()
+    }
+    pub fn end(self) -> u32 {
+        self.end.get()
+    }
+}
+
+/// Kebab-case skill directory name, validated.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct SkillName(String);
+
+impl SkillName {
+    pub fn parse(s: &str) -> Option<Self> {
+        let ok = !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        ok.then(|| SkillName(s.to_owned()))
+    }
+}

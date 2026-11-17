@@ -1,0 +1,4 @@
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order leaks into views and generated output; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order leaks into views and generated output; use BTreeSet" },
+]

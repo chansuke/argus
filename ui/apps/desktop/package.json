@@ -1,0 +1,13 @@
+{
+  "name": "@argus/desktop",
+  "private": true,
+  "type": "module",
+  "description": "React + TS webview for the Tauri v2 shell (crates/argus-app). Screens are designed in Claude Design; data comes only from @argus/client.",
+  "dependencies": {
+    "@argus/client": "workspace:*",
+    "@tauri-apps/api": "^2",
+    "react": "^19",
+    "react-dom": "^19"
+  },
+  "devDependencies": { "vite": "^7", "typescript": "^5" }
+}
