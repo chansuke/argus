@@ -191,4 +191,4 @@ await api.answer_permission({ request_id: requestId(), job, run, answer: "Allow"
 
 ## Next implementation step
 
-`argus-log`, the ledger, the Claude decoder, and the timeline and progress views are done. Next: `Runs` (lifecycle, leases, `due`), then `ReviewBoard` with `review::admit`, then `Checks`, so `JobViews::glance` can be composed.
+`argus-log`, the ledger, the Claude decoder, and the runs, timeline, progress, and review views are done. Next: `Checks` with the TLC and Lean adapters, then `Transcript` and `JobStats`. Until every view in `JobViews` is implemented, `JobViews::apply` panics, so `review::admit` and `glance` can only be tested through a full ledger after that.
