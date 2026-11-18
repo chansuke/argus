@@ -212,8 +212,47 @@ pub struct FeedbackItem<'a> {
 /// The exact text an agent receives for a `RequestChanges` decision: the note, then each
 /// comment with `path:start-end` (the agent has the files, so nothing is quoted). Pure, so
 /// `preview_feedback` shows the human byte-for-byte what delivery will send.
+///
+/// ```text
+/// <note>
+///
+/// - src/a.rs:10-12: first line of the comment
+///   further lines, indented
+/// - [AI review] src/b.rs:3: a promoted finding
+/// - a comment with no code location
+/// ```
 pub fn render_feedback(note: &str, items: &[FeedbackItem<'_>]) -> String {
-    todo!("not implemented")
+    let mut out = String::new();
+    let note = note.trim();
+    if !note.is_empty() {
+        out.push_str(note);
+        out.push('\n');
+        if !items.is_empty() {
+            out.push('\n');
+        }
+    }
+    for item in items {
+        out.push_str("- ");
+        if item.from_finding {
+            out.push_str("[AI review] ");
+        }
+        if let Some((path, lines)) = item.at {
+            out.push_str(path.as_str());
+            match lines.start() == lines.end() {
+                true => out.push_str(&format!(":{}: ", lines.start())),
+                false => out.push_str(&format!(":{}-{}: ", lines.start(), lines.end())),
+            }
+        }
+        let mut body = item.body.trim().lines();
+        out.push_str(body.next().unwrap_or_default());
+        out.push('\n');
+        for line in body {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Read-time configuration of the packet.
