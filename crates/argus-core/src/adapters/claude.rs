@@ -7,25 +7,72 @@ use argus_json::Json;
 use crate::diff::line_hash;
 use crate::event::AgentLaunch;
 use crate::ids::{ModelId, RecordKey, ToolCallId, ToolName, UnixMillis};
-use crate::plan::{CommandSpec, PermissionAnswer, PlanEnv};
+use crate::plan::{CommandSpec, PermissionAnswer, PlanEnv, WatchSpec, Workdir};
 use crate::source::{
     AgentEvent, AgentWhat, Decoded, FileTouch, Observation, PlanItem, PlanOp, PlanStatus,
-    TokenUsage, TouchHow,
+    SourceKind, TokenUsage, TouchHow,
 };
 
 pub(crate) const VERSION: u32 = 1;
 
-/// `claude --session-id <run-uuid> [--model m] --mcp-config <argus-mcp.json> <prompt>`, or
-/// `claude --resume <earlier-run-uuid> ... <prompt>` when `launch.resume` is set (feedback
-/// delivery), under a PTY in the job worktree.
+/// `claude --session-id <run-uuid> [--model m] <prompt>` under a PTY in the job worktree,
+/// or, to deliver feedback (`launch.resume`), `claude --resume <earlier-run-uuid>
+/// --fork-session --session-id <run-uuid> ...`: a copy of the earlier session continues
+/// under this run's id, so each run has its own transcript file.
 ///
 /// The run id is the session id, so the transcript path is known before the process
-/// starts: watch `.claude/projects/*/<uuid>.jsonl` and `.claude/projects/*/<uuid>/subagents/*.jsonl`
-/// (glob on the slug instead of re-deriving Claude's cwd-to-slug rule).
+/// starts: watch `.claude/projects/*/<uuid>.jsonl` and
+/// `.claude/projects/*/<uuid>/subagents/*.jsonl` (glob on the slug instead of re-deriving
+/// Claude's cwd-to-slug rule).
 /// Env: `ARGUS_RUN`, `ARGUS_SOCKET`, so `argus task ...` and `argus hook` inside the agent
 /// know who they speak for.
+///
+/// Flags from Claude Code 2.1.303 `--help`. Unverified: that `--resume` with
+/// `--fork-session` accepts `--session-id`, and that a v8 UUID (derived run ids) is
+/// accepted as a session id. No MCP config is passed yet: the argus MCP server does not
+/// exist.
 pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
-    todo!("not implemented")
+    let run = env.run.0.to_string();
+    let mut args = Vec::new();
+    if let Some(prev) = launch.resume {
+        args.extend([
+            "--resume".to_owned(),
+            prev.0.to_string(),
+            "--fork-session".to_owned(),
+        ]);
+    }
+    args.extend(["--session-id".to_owned(), run.clone()]);
+    if let Some(model) = &launch.model {
+        args.extend(["--model".to_owned(), model.0.clone()]);
+    }
+    args.push(launch.prompt.clone());
+    let watch = |pattern: String| WatchSpec {
+        pattern,
+        kind: SourceKind::ClaudeTranscript,
+    };
+    CommandSpec {
+        program: env.tools.claude.clone(),
+        args,
+        env: vec![
+            ("ARGUS_RUN".to_owned(), run.clone()),
+            (
+                "ARGUS_SOCKET".to_owned(),
+                env.socket.to_string_lossy().into_owned(),
+            ),
+        ],
+        workdir: Workdir::JobWorktree,
+        cwd: None,
+        stdin: None,
+        stdout: SourceKind::PlainText,
+        stderr: SourceKind::PlainText,
+        terminal: true,
+        watch: vec![
+            watch(format!(".claude/projects/*/{run}.jsonl")),
+            watch(format!(".claude/projects/*/{run}/subagents/*.jsonl")),
+        ],
+        artifacts: false,
+        timeout: None,
+    }
 }
 
 /// Unverified: the prompt is a numbered menu (1 yes, 2 yes and don't ask again, 3 no)
