@@ -1,0 +1,4 @@
+⚠ [3/5] Built ArgusProofs.Holey (407ms)
+warning: ArgusProofs/Holey.lean:1:8: declaration uses `sorry`
+✔ [4/5] Built ArgusProofs (350ms)
+Build completed successfully (5 jobs).

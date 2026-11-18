@@ -1,0 +1,1 @@
+{"caption":"","data":"declaration uses `sorry`","endPos":{"column":13,"line":1},"fileName":"ArgusProofs/Holey.lean","isSilent":false,"keepFullRange":false,"kind":"hasSorry","pos":{"column":8,"line":1},"severity":"warning"}

@@ -200,6 +200,27 @@ fn tlc_messages_are_framed_as_blocks() {
     }
 }
 
+/// `lake build` text: a diagnostic and the goal lines under it are one frame; lake's own
+/// progress lines stand alone. Observed with lake 4.35.
+#[test]
+fn lean_diagnostics_are_framed_with_their_continuation_lines() {
+    let out: &[u8] = "✖ [4/6] Building P.Broken (390ms)\nerror: P/Broken.lean:1:40: unsolved goals\nn : Nat\n⊢ False\nwarning: P/Holey.lean:1:8: declaration uses `sorry`\nSome required targets logged failures:\n- P.Broken\n".as_bytes();
+    let expected: Vec<&[u8]> = vec![
+        "✖ [4/6] Building P.Broken (390ms)\n".as_bytes(),
+        "error: P/Broken.lean:1:40: unsolved goals\nn : Nat\n⊢ False\n".as_bytes(),
+        b"warning: P/Holey.lean:1:8: declaration uses `sorry`\n",
+        b"Some required targets logged failures:\n- P.Broken\n",
+    ];
+    let mut rng = Rng(13);
+    for _ in 0..50 {
+        let chunks = split_randomly(&mut rng, out);
+        let frames = frame_all(SourceKind::LeanText, 7, &chunks);
+        let bytes: Vec<&[u8]> = frames.iter().map(|(_, b)| b.as_slice()).collect();
+        assert_eq!(bytes, expected);
+        assert_eq!(frames[0].0, 7);
+    }
+}
+
 #[test]
 fn rfc3339_timestamps_parse_to_unix_millis() {
     use argus_core::ids::UnixMillis;

@@ -1,0 +1,9 @@
+⚠ [3/6] Replayed ArgusProofs.Holey
+warning: ArgusProofs/Holey.lean:1:8: declaration uses `sorry`
+✖ [4/6] Building ArgusProofs.Broken (390ms)
+trace: .> LEAN_PATH=/w/proofs/.lake/build/lib/lean lean /w/proofs/ArgusProofs/Broken.lean --json
+error: ArgusProofs/Broken.lean:1:40: unsolved goals
+n : Nat
+⊢ False
+Some required targets logged failures:
+- ArgusProofs.Broken

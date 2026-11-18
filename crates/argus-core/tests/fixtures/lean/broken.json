@@ -1,0 +1,1 @@
+{"caption":"","data":"unsolved goals\nn : Nat\n⊢ False","endPos":{"column":6,"line":2},"fileName":"ArgusProofs/Broken.lean","isSilent":false,"keepFullRange":false,"kind":"Tactic.unsolvedGoals","pos":{"column":40,"line":1},"severity":"error"}
