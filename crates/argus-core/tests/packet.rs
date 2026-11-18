@@ -70,7 +70,7 @@ fn a_shell_command_explains_what_structured_edits_do_not() {
         edit(1, "src/a.rs", inserted(&["a"])),
         edit(2, "src/a.rs", EditHow::Shell),
     ];
-    assert!(333 < MIN_COVERAGE_PERMILLE);
+    const { assert!(333 < MIN_COVERAGE_PERMILLE) };
     assert_eq!(
         provenance(&h, &edits),
         Provenance::ViaShell {
