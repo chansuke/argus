@@ -27,3 +27,80 @@ fn a_model_choice_reads_as_cli_model_and_effort() {
         "claude:sonnet:max"
     );
 }
+
+fn oid(c: char) -> GitOid {
+    GitOid::parse(&c.to_string().repeat(40)).unwrap()
+}
+
+fn panel_of(request: u128, focus: Option<&str>) -> Vec<(argus_core::ids::RunId, ReviewSpec)> {
+    let models = ModelSet::new([
+        choice(AgentCli::Codex, "gpt-5", Some(Effort::High)),
+        choice(AgentCli::Claude, "opus", None),
+    ])
+    .unwrap();
+    ReviewSpec::panel(
+        Id128(request),
+        &oid('1'),
+        &oid('b'),
+        ReviewLens::Security,
+        focus,
+        &models,
+    )
+    .into_iter()
+    .map(|(run, purpose)| match purpose {
+        RunPurpose::Review(spec) => (run, spec),
+        other => panic!("{other:?}"),
+    })
+    .collect()
+}
+
+#[test]
+fn a_panel_is_one_review_run_per_model_with_derived_ids() {
+    let runs = panel_of(1, None);
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[0].0, runs[1].0);
+    // Asking again (a retry, or the policy deciding twice) gives the same runs.
+    assert_eq!(
+        panel_of(1, None)
+            .iter()
+            .map(|(r, _)| *r)
+            .collect::<Vec<_>>(),
+        runs.iter().map(|(r, _)| *r).collect::<Vec<_>>()
+    );
+    assert_ne!(panel_of(2, None)[0].0, runs[0].0);
+    let models: Vec<String> = runs.iter().map(|(_, s)| s.llm.model.to_string()).collect();
+    assert_eq!(models, vec!["claude:opus", "codex:gpt-5:high"]);
+    for (_, spec) in &runs {
+        assert_eq!(
+            (&spec.tree, &spec.base, spec.lens),
+            (&oid('1'), &oid('b'), ReviewLens::Security)
+        );
+    }
+    // Every model is asked the same question.
+    assert_eq!(runs[0].1.llm.prompt, runs[1].1.llm.prompt);
+}
+
+#[test]
+fn the_review_prompt_names_the_base_the_lens_and_the_output_contract() {
+    let runs = panel_of(1, Some("the lease recovery path"));
+    let prompt = &runs[0].1.llm.prompt;
+    assert!(
+        prompt.contains(&format!("git diff {}", oid('b').as_str())),
+        "{prompt}"
+    );
+    assert!(prompt.contains("security"), "{prompt}");
+    assert!(prompt.contains("the lease recovery path"), "{prompt}");
+    assert!(prompt.contains("```json"), "{prompt}");
+    for field in [
+        "\"path\"",
+        "\"start\"",
+        "\"end\"",
+        "\"severity\"",
+        "\"title\"",
+        "\"body\"",
+    ] {
+        assert!(prompt.contains(field), "{field} missing from {prompt}");
+    }
+    assert!(prompt.contains("high, medium, low, nit"), "{prompt}");
+    assert!(!panel_of(1, None)[0].1.llm.prompt.contains("lease recovery"));
+}
