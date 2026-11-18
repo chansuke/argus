@@ -2,9 +2,9 @@
 //! command differs and the decoder does not.
 
 use crate::event::{CheckRequest, CheckSpec, TlaEngine};
-use crate::ids::FactId;
-use crate::plan::{CommandSpec, PlanEnv};
-use crate::source::{Decoded, Observation, TlcMessage};
+use crate::ids::{FactId, RepoPath};
+use crate::plan::{CommandSpec, PlanEnv, Workdir};
+use crate::source::{Decoded, Observation, SourceKind, TlcMessage};
 use crate::views::checks::CheckVerdict;
 
 pub(crate) const VERSION: u32 = 1;
@@ -13,14 +13,71 @@ pub(crate) const VERSION: u32 = 1;
 ///           [-config C.cfg] Spec.tla`
 /// Tlars:   `tlars -tool [-workers N] [-config C.cfg] Spec.tla`
 /// Workdir: `Snapshot { tree, base }`. stdout: `TlcTool`. stderr: `PlainText`.
+///
+/// Runs in the spec's directory (as `tools/tla-check` does), so the spec and its modules
+/// are found the way TLC finds them when run by hand; a config elsewhere is named
+/// relative to it. `-noGenerateSpecTE`: the trace is in the message stream already.
 pub(crate) fn command(req: &CheckRequest, env: &PlanEnv) -> CommandSpec {
-    let CheckSpec::Tla { engine, .. } = &req.spec else {
+    let CheckSpec::Tla {
+        engine,
+        spec,
+        config,
+        workers,
+    } = &req.spec
+    else {
         unreachable!("plan() dispatches Tla only")
     };
-    match engine {
-        TlaEngine::JavaTlc => todo!("not implemented"),
-        TlaEngine::Tlars => todo!("not implemented"),
+    let (dir, file) = match spec.as_str().rsplit_once('/') {
+        Some((dir, file)) => (RepoPath::parse(dir), file),
+        None => (None, spec.as_str()),
+    };
+    let (program, mut args): (_, Vec<String>) = match engine {
+        TlaEngine::JavaTlc => (
+            env.tools.java.clone(),
+            vec![
+                "-XX:+UseParallelGC".into(),
+                "-cp".into(),
+                env.tools.tla2tools_jar.to_string_lossy().into_owned(),
+                "tlc2.TLC".into(),
+            ],
+        ),
+        TlaEngine::Tlars => (env.tools.tlars.clone(), Vec::new()),
+    };
+    args.extend(["-tool".into(), "-noGenerateSpecTE".into()]);
+    if let Some(n) = workers {
+        args.extend(["-workers".into(), n.to_string()]);
     }
+    if let Some(config) = config {
+        args.extend(["-config".into(), relative(dir.as_ref(), config)]);
+    }
+    args.push(file.to_owned());
+    CommandSpec {
+        program,
+        args,
+        env: Vec::new(),
+        workdir: Workdir::Snapshot {
+            tree: req.tree.clone(),
+            base: req.base.clone(),
+        },
+        cwd: dir,
+        stdin: None,
+        stdout: SourceKind::TlcTool,
+        stderr: SourceKind::PlainText,
+        terminal: false,
+        watch: Vec::new(),
+        artifacts: false,
+        timeout: None,
+    }
+}
+
+/// `to` as seen from directory `from` (`None`: the repository root).
+pub(crate) fn relative(from: Option<&RepoPath>, to: &RepoPath) -> String {
+    let from: Vec<&str> = from.map_or(Vec::new(), |d| d.as_str().split('/').collect());
+    let to: Vec<&str> = to.as_str().split('/').collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&to[common..]);
+    parts.join("/")
 }
 
 /// One `@!@!@STARTMSG code:class @!@!@ ... @!@!@ENDMSG code @!@!@` block (the framer
