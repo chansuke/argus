@@ -50,7 +50,39 @@ pub(crate) fn review(spec: &ReviewSpec, env: &PlanEnv) -> CommandSpec {
 /// Output contract: prose, then one fenced `json` block:
 /// `[{"path","start","end","severity":"high|medium|low|nit","title","body"}]`.
 pub(crate) fn review_prompt(base: &CommitOid, lens: ReviewLens, focus: Option<&str>) -> String {
-    todo!("not implemented")
+    let base = base.as_str();
+    let lens = match lens {
+        ReviewLens::General => "correctness, design, readability, and tests",
+        ReviewLens::Correctness => {
+            "correctness: wrong results, missed edge cases, error handling, and concurrency"
+        }
+        ReviewLens::Security => {
+            "security: injection, leaked secrets, missing authorization, and unchecked input"
+        }
+        ReviewLens::Tests => "tests: missing cases, weak assertions, and tests that cannot fail",
+    };
+    let mut out = format!(
+        "Review the change in this checkout against commit {base}. \
+         Run `git diff {base}` to see it and read any file you need. Do not edit files.\n\n\
+         Look at {lens}.\n"
+    );
+    if let Some(focus) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+        out.push_str(&format!(
+            "The author asks you to look closely at: {focus}\n"
+        ));
+    }
+    out.push_str(
+        "\nWrite your review as prose. End it with exactly one fenced json block that lists \
+         your findings, like this:\n\n\
+         ```json\n\
+         [{\"path\": \"src/lib.rs\", \"start\": 10, \"end\": 12, \"severity\": \"high\", \
+         \"title\": \"one line\", \"body\": \"why it is wrong and what to do\"}]\n\
+         ```\n\n\
+         `severity` is one of high, medium, low, nit. `path` is relative to the repository \
+         root, and lines are in the new version of the file. Use null for path, start, and \
+         end when a finding has no location. Use [] when you find nothing.\n",
+    );
+    out
 }
 
 /// Findings from the final `Result` text. `None` when the block is missing or malformed:
@@ -103,4 +135,22 @@ pub(crate) fn parse_candidates(
     result_text: &str,
 ) -> Option<Vec<crate::views::insights::RawCandidate>> {
     todo!("not implemented")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::review::Severity;
+
+    #[test]
+    fn the_example_in_the_review_prompt_is_what_the_parser_reads() {
+        let base = CommitOid::parse(&"b".repeat(40)).unwrap();
+        let prompt = review_prompt(&base, ReviewLens::General, None);
+        let findings = parse_findings(&prompt).expect("the example block parses");
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f.path.as_ref().map(|p| p.as_str()), Some("src/lib.rs"));
+        assert_eq!(f.lines, LineRange::new(10, 12));
+        assert_eq!(f.severity, Severity::High);
+    }
 }
