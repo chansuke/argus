@@ -247,9 +247,18 @@ pub struct HeadMoved;
 
 /// Anchors of every hunk of every snapshot that received a decision (any verdict).
 pub fn seen_anchors(board: &ReviewBoard) -> BTreeSet<&HunkAnchor> {
-    // TODO: decided trees = board.decisions()[].tree; for snapshots with those trees,
-    //       collect `snapshot.files[].hunks`.
-    todo!("not implemented")
+    let decided: BTreeSet<&TreeOid> = board
+        .decisions()
+        .iter()
+        .filter_map(|d| d.tree.as_ref())
+        .collect();
+    board
+        .snapshots()
+        .iter()
+        .filter(|s| decided.contains(&s.snapshot.tree))
+        .flat_map(|s| &s.snapshot.files)
+        .flat_map(|f| &f.hunks)
+        .collect()
 }
 
 /// One comment as it goes to the agent.
