@@ -4,9 +4,10 @@
 use crate::event::{LlmCall, ReviewLens, ReviewSpec};
 use argus_json::Json;
 
-use crate::ids::{CommitOid, LineRange, RepoPath};
+use crate::ids::{CommitOid, LineRange, RepoPath, UnixMillis};
 use crate::models::AgentCli;
 use crate::plan::{CommandSpec, PlanEnv, Workdir};
+use crate::views::timeline::{Item, ItemKind, Lane, Window};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolAccess {
@@ -129,6 +130,46 @@ fn last_json_block(text: &str) -> Option<&str> {
     let body = body.strip_prefix('\n')?;
     let close = body.find("```")?;
     Some(&body[..close])
+}
+
+/// The prompt of a `Summarize` run: the window's items, one line each, oldest first.
+pub(crate) fn summary_prompt<'a>(
+    window: &Window,
+    items: impl Iterator<Item = (UnixMillis, &'a Item)>,
+) -> String {
+    let clock = |t: UnixMillis| {
+        let s = t.0.div_euclid(1000).rem_euclid(86_400);
+        format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    };
+    let mut out = format!(
+        "Summarize this part of a coding session, {} to {} UTC, in three to five short \
+         sentences for someone who was away: what was done, what failed, and what is \
+         waiting. Use only the events below.\n\nEvents:\n",
+        clock(window.start),
+        clock(window.end()),
+    );
+    for (at, item) in items {
+        let lane = match &item.lane {
+            Lane::Agent(run) => format!("agent {}", short(&run.0)),
+            Lane::Run(run) => format!("run {}", short(&run.0)),
+            Lane::Human => "human".into(),
+            Lane::Host => "host".into(),
+        };
+        let kind = match &item.kind {
+            ItemKind::ToolCall { name, ok } => match ok {
+                Some(false) => format!("tool {} failed", name.0),
+                _ => format!("tool {}", name.0),
+            },
+            other => format!("{other:?}").to_lowercase(),
+        };
+        out.push_str(&format!("{} [{lane}] {kind}: {}\n", clock(at), item.title));
+    }
+    out
+}
+
+/// The first 8 hex digits of an id: enough to tell lanes apart in a prompt.
+fn short(id: &crate::ids::Id128) -> String {
+    id.to_string()[..8].to_owned()
 }
 
 pub(crate) fn parse_candidates(
