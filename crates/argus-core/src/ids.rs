@@ -114,6 +114,15 @@ id_newtype! {
     DecisionId;
 }
 
+impl DecisionId {
+    /// The run that delivers this decision's feedback to the agent. Derived, so a
+    /// delivery is requested at most once per decision (`policy::decide`), and the glance
+    /// can find it.
+    pub fn delivery_run(self) -> RunId {
+        todo!("not implemented")
+    }
+}
+
 /// Retry number of a run. Every attempt that starts also finishes exactly once
 /// (possibly as `Abandoned` after a host crash).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
