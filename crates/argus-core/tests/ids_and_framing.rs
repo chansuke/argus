@@ -243,3 +243,12 @@ fn rfc3339_timestamps_parse_to_unix_millis() {
         assert_eq!(p(bad), None, "{bad}");
     }
 }
+
+#[test]
+fn a_decision_has_one_delivery_run() {
+    use argus_core::ids::DecisionId;
+    let d = DecisionId(Id128(7));
+    assert_eq!(d.delivery_run(), d.delivery_run());
+    assert_ne!(d.delivery_run(), DecisionId(Id128(8)).delivery_run());
+    assert_ne!(d.delivery_run().0, d.0);
+}

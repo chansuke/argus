@@ -119,7 +119,7 @@ impl DecisionId {
     /// delivery is requested at most once per decision (`policy::decide`), and the glance
     /// can find it.
     pub fn delivery_run(self) -> RunId {
-        todo!("not implemented")
+        RunId(Id128::derive("deliver", &self.0.0.to_le_bytes()))
     }
 }
 
