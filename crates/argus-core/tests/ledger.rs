@@ -428,6 +428,100 @@ fn real_transcripts_replay_equal_to_live() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Timeline and progress over every real transcript: nothing panics, every closed call
+/// matches a result, and each agent's plan share stays in range.
+#[derive(Default)]
+struct ScreenViews {
+    timeline: argus_core::views::timeline::Timeline,
+    progress: argus_core::views::progress::Progress,
+}
+
+impl ViewSet for ScreenViews {
+    const KIND: LedgerKind = LedgerKind::Job;
+    fn wants(source: &SourceMeta) -> bool {
+        source.kind.family() == SourceFamily::AgentSession
+    }
+    fn apply(&mut self, fact: &Fact<'_>) {
+        self.timeline.apply(fact);
+        self.progress.apply(fact);
+    }
+    fn admit(&self, _: &Author, _: &Event) -> Result<(), Rejected> {
+        Ok(())
+    }
+    fn take_reads(&self) -> ViewMask {
+        ViewMask::default()
+    }
+    fn stamp(&self, _: ViewMask) -> ViewStamp {
+        ViewStamp::default()
+    }
+}
+
+#[test]
+#[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]
+fn real_transcripts_fill_the_timeline_and_progress() {
+    use argus_core::ids::UnixMillis;
+    use argus_core::views::progress::PlanNode;
+    use argus_core::views::timeline::{BucketWidth, ItemKind};
+
+    let root = std::env::var_os("ARGUS_TRANSCRIPTS").expect("set ARGUS_TRANSCRIPTS");
+    let dir = scratch("real-screens");
+    let mut files = Vec::new();
+    collect_jsonl(Path::new(&root), &mut files);
+    files.sort();
+    let mut ledger = Ledger::<ScreenViews>::open(&dir).unwrap();
+    for (i, file) in files.iter().enumerate() {
+        let r = run(i as u128 + 1);
+        ledger
+            .submit(Author::Human, agent_request(i as u128 + 1))
+            .unwrap();
+        let meta = transcript(r, file.to_str().unwrap());
+        ledger.open_source(meta.clone()).unwrap();
+        let mut framer = SourceKind::ClaudeTranscript.framer(0);
+        let mut frames = framer.push(&fs::read(file).unwrap());
+        frames.extend(framer.finish());
+        ledger.observe(meta.id, frames).unwrap();
+    }
+    let views = ledger.views();
+    let all: Vec<_> = views
+        .timeline
+        .range(UnixMillis(i64::MIN), UnixMillis(i64::MAX))
+        .collect();
+    let calls = all
+        .iter()
+        .filter(|(_, _, i)| matches!(i.kind, ItemKind::ToolCall { .. }));
+    let (closed, open): (Vec<_>, Vec<_>) = calls.partition(|(_, _, i)| i.ended_at.is_some());
+    for (at, _, item) in &closed {
+        assert!(
+            item.ended_at.unwrap() >= *at,
+            "a result before its call: {item:?}"
+        );
+        assert!(matches!(item.kind, ItemKind::ToolCall { ok: Some(_), .. }));
+    }
+    let hours = views.timeline.buckets(
+        BucketWidth::H1,
+        UnixMillis(i64::MIN / 2),
+        UnixMillis(i64::MAX / 2),
+    );
+    let plans = views
+        .progress
+        .tree()
+        .roots
+        .iter()
+        .filter(|n| matches!(n, PlanNode::Observed { .. }))
+        .count();
+    let share = views.progress.share().get();
+    eprintln!(
+        "{} items, {} calls closed, {} open, {} active hours, {} observed plans, share {share:.3}",
+        all.len(),
+        closed.len(),
+        open.len(),
+        hours.len(),
+        plans
+    );
+    assert!((0.0..=1.0).contains(&share));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
