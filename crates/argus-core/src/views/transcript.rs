@@ -6,9 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::fact::Fact;
+use crate::event::Event;
+use crate::fact::{Fact, FactBody};
 use crate::ids::*;
-use crate::source::SourceFamily;
+use crate::source::{AgentWhat, Observation, SourceFamily, TouchHow};
 use crate::views::Projection;
 
 #[derive(Default, Debug)]
@@ -33,6 +34,10 @@ pub struct Node {
     pub parent: Option<RecordKey>,
     pub at: UnixMillis,
     pub sidechain: bool,
+    /// A prompt, reply, thinking, or tool call: conversation that can branch. Tool results
+    /// and bookkeeping records cannot. Parallel tool calls give a call two children (the
+    /// next call and the first result), which is not a branch.
+    pub can_branch: bool,
     /// Every observation decoded from this record, in order.
     pub facts: Vec<FactId>,
 }
@@ -58,12 +63,39 @@ pub enum EditHow {
 
 impl Transcript {
     /// Root-to-leaf path ending at `leaf` (default: `run`'s latest record).
+    /// A parent that was never seen, or a parent loop, ends the walk.
     pub fn thread(&self, run: &RunId, leaf: Option<&RecordKey>) -> Vec<&RecordKey> {
-        todo!("not implemented")
+        let Some(mut at) = leaf.or_else(|| self.latest.get(run)) else {
+            return Vec::new();
+        };
+        let mut seen = BTreeSet::new();
+        let mut path = Vec::new();
+        while let Some((key, node)) = self.nodes.get_key_value(at) {
+            if !seen.insert(key) {
+                break;
+            }
+            path.push(key);
+            match &node.parent {
+                Some(parent) => at = parent,
+                None => break,
+            }
+        }
+        path.reverse();
+        path
     }
-    /// Records with more than one child: where the human rewound or edited.
+    /// Records with more than one child that can branch: where the human rewound or
+    /// edited, or a reply was regenerated.
     pub fn branch_points(&self) -> BTreeSet<&RecordKey> {
-        todo!("not implemented")
+        self.children
+            .iter()
+            .filter(|(_, kids)| {
+                let branching = kids
+                    .iter()
+                    .filter(|k| self.nodes.get(*k).is_some_and(|n| n.can_branch));
+                branching.count() > 1
+            })
+            .map(|(key, _)| key)
+            .collect()
     }
     pub fn latest_turn_end(&self, run: &RunId) -> Option<&FactId> {
         self.latest_turn_end.get(run)
@@ -86,11 +118,86 @@ impl Projection for Transcript {
         SourceFamily::AgentHook,
     ];
     fn apply(&mut self, fact: &Fact<'_>) -> bool {
-        // TODO: JobOpened -> worktree. Observed agent events of `source.run` -> insert a
-        //       node on first sight of a record key, else push the fact onto it (parts of
-        //       one frame); TurnEnded -> latest_turn_end[run]; ToolCall touches ->
-        //       `RepoPath::within(worktree, path)` -> push EditTrace (paths outside the
-        //       worktree are ignored).
-        todo!("not implemented")
+        let (source, event) = match &fact.body {
+            FactBody::Authored {
+                event: Event::JobOpened(info),
+                ..
+            } => {
+                self.worktree = Some(info.worktree.clone());
+                return true;
+            }
+            FactBody::Authored { .. } => return false,
+            FactBody::Observed {
+                source,
+                obs: Observation::Agent(event),
+                ..
+            } => (source, event),
+            FactBody::Observed { .. } => return false,
+        };
+        let run = source.run;
+        match &event.record {
+            Some(key) => match self.nodes.get_mut(key) {
+                Some(node) => node.facts.push(fact.id.clone()),
+                None => {
+                    let can_branch = matches!(
+                        event.what,
+                        AgentWhat::Prompt { .. }
+                            | AgentWhat::Reply { .. }
+                            | AgentWhat::Thinking { .. }
+                            | AgentWhat::ToolCall { .. }
+                    );
+                    let node = Node {
+                        run,
+                        parent: event.parent.clone(),
+                        at: event.at.unwrap_or(fact.at),
+                        sidechain: event.sidechain,
+                        can_branch,
+                        facts: vec![fact.id.clone()],
+                    };
+                    self.nodes.insert(key.clone(), node);
+                    if let Some(parent) = &event.parent {
+                        self.children
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(key.clone());
+                    }
+                    if !event.sidechain {
+                        self.latest.insert(run, key.clone());
+                    }
+                }
+            },
+            None => self.loose.push(fact.id.clone()),
+        }
+        match &event.what {
+            AgentWhat::TurnEnded { .. } => {
+                self.latest_turn_end.insert(run, fact.id.clone());
+            }
+            AgentWhat::ToolCall { touches, .. } => {
+                let Some(worktree) = &self.worktree else {
+                    return true;
+                };
+                for touch in touches {
+                    // Paths outside the worktree are not part of the job's diff.
+                    let Some(path) = RepoPath::within(worktree, &touch.path) else {
+                        continue;
+                    };
+                    let how = match &touch.how {
+                        TouchHow::Inserted(lines) => EditHow::Structured {
+                            inserted: lines.clone(),
+                        },
+                        TouchHow::Shell => EditHow::Shell,
+                    };
+                    self.edits.push(EditTrace {
+                        fact: fact.id.clone(),
+                        stamp: fact.stamp,
+                        run,
+                        path,
+                        how,
+                    });
+                }
+            }
+            _ => {}
+        }
+        true
     }
 }
