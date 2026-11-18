@@ -199,3 +199,26 @@ fn tlc_messages_are_framed_as_blocks() {
         assert_eq!(bytes, expected);
     }
 }
+
+#[test]
+fn rfc3339_timestamps_parse_to_unix_millis() {
+    use argus_core::ids::UnixMillis;
+    let p = |s| UnixMillis::parse_rfc3339(s).map(|m| m.0);
+    assert_eq!(p("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(p("2026-10-24T03:16:30.255Z"), Some(1_792_811_790_255));
+    assert_eq!(p("2026-10-24T12:16:30.255+09:00"), Some(1_792_811_790_255));
+    assert_eq!(p("2026-10-24t03:16:30.255123z"), Some(1_792_811_790_255));
+    assert_eq!(p("2024-02-29T00:00:00Z"), Some(1_709_164_800_000));
+    assert_eq!(p("1969-12-31T23:59:59.999Z"), Some(-1));
+    for bad in [
+        "",
+        "2026-10-24",
+        "2026-13-01T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+        "2026-10-24T03:16:30",
+        "2026-10-24T25:00:00Z",
+        "2026-10-24T03:16:30.Z",
+    ] {
+        assert_eq!(p(bad), None, "{bad}");
+    }
+}

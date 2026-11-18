@@ -172,6 +172,82 @@ pub struct FactRef {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct UnixMillis(pub i64);
 
+impl UnixMillis {
+    /// RFC 3339 date-time (`2026-10-24T03:16:30.255Z`, `...+09:00`). Fractions beyond
+    /// milliseconds are truncated.
+    pub fn parse_rfc3339(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        let num = |r: std::ops::Range<usize>| -> Option<i64> {
+            let d = b.get(r)?;
+            d.iter()
+                .all(u8::is_ascii_digit)
+                .then(|| d.iter().fold(0, |n, &c| n * 10 + i64::from(c - b'0')))
+        };
+        let sep = |i: usize, c: u8| b.get(i).is_some_and(|x| x.eq_ignore_ascii_case(&c));
+        if !(sep(4, b'-') && sep(7, b'-') && sep(10, b'T') && sep(13, b':') && sep(16, b':')) {
+            return None;
+        }
+        let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+        let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let month_days = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        if !(1..=12).contains(&month)
+            || day < 1
+            || day > month_days[month as usize - 1]
+            || hour > 23
+            || minute > 59
+            || second > 60
+        {
+            return None;
+        }
+        let mut i = 19;
+        let mut millis = 0;
+        if sep(i, b'.') {
+            i += 1;
+            let start = i;
+            while b.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            let digits = &s[start..i.min(start + 3)];
+            millis = digits.parse::<i64>().ok()? * 10_i64.pow(3 - digits.len() as u32);
+        }
+        let offset_min = match b.get(i)? {
+            b'Z' | b'z' if b.len() == i + 1 => 0,
+            sign @ (b'+' | b'-') if b.len() == i + 6 && b[i + 3] == b':' => {
+                let m = num(i + 1..i + 3)? * 60 + num(i + 4..i + 6)?;
+                if *sign == b'+' { m } else { -m }
+            }
+            _ => return None,
+        };
+        // Days since 1970-01-01 in the proleptic Gregorian calendar (H. Hinnant).
+        let y = if month <= 2 { year - 1 } else { year };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = (month + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        let secs = days * 86_400 + hour * 3600 + minute * 60 + second - offset_min * 60;
+        Some(UnixMillis(secs * 1000 + millis))
+    }
+}
+
 /// Agent-native record id (Claude Code `uuid`). Records form a tree via `parentUuid`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RecordKey(pub String);
