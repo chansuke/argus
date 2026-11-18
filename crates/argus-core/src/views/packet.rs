@@ -16,7 +16,7 @@ use crate::event::ApprovedHead;
 use crate::ids::*;
 use crate::models::ModelChoice;
 use crate::views::review::{Finding, ReviewBoard, Severity, SnapshotEntry, Thread};
-use crate::views::transcript::EditTrace;
+use crate::views::transcript::{EditHow, EditTrace};
 use crate::views::{GateState, JobViews};
 
 /// Path globs whose hunks are `Suspicious` by themselves (specs, CI, lockfiles, Nix).
@@ -150,15 +150,66 @@ pub enum Provenance {
 
 pub const MIN_COVERAGE_PERMILLE: u16 = 600;
 
-/// Pure. `edits` are every edit up to head's cut, newest first preferred.
+/// Pure. `edits` are every edit up to head's cut, in stamp order.
 ///
-/// TODO: candidates = edits on `hunk.anchor.path`; covered = `hunk.added` hashes found in
-/// the union of Structured `inserted`; facts = candidates contributing >= 1 line, in stamp
-/// order. coverage >= MIN -> Direct; else any Shell candidate -> ViaShell; else partial
-/// structured -> Direct (low coverage, shown as such); else Unexplained. A hunk with no
-/// added lines (pure deletion) is Direct when a structured edit on the path exists.
+/// Candidates are the edits of the hunk's file. Structured candidates that inserted at
+/// least one of the hunk's added lines explain it; coverage is the share of added lines
+/// some candidate inserted.
+/// - coverage >= [`MIN_COVERAGE_PERMILLE`] -> `Direct`.
+/// - else a shell command named the file -> `ViaShell`.
+/// - else partial coverage -> `Direct` with that coverage (shown as weak).
+/// - else `Unexplained`.
+///
+/// A pure deletion has no added lines: any structured edit of the file explains it, then
+/// any shell command.
 pub fn provenance(hunk: &DiffHunk, edits: &[EditTrace]) -> Provenance {
-    todo!("not implemented")
+    let on_path = || edits.iter().filter(|e| e.path == hunk.anchor.path);
+    let shell: Vec<FactId> = on_path()
+        .filter(|e| matches!(e.how, EditHow::Shell))
+        .map(|e| e.fact.clone())
+        .collect();
+    let structured = on_path().filter_map(|e| match &e.how {
+        EditHow::Structured { inserted } => Some((e, inserted)),
+        EditHow::Shell => None,
+    });
+    let (facts, coverage_permille) = if hunk.added.is_empty() {
+        (
+            structured.map(|(e, _)| e.fact.clone()).collect::<Vec<_>>(),
+            1000,
+        )
+    } else {
+        let wanted: BTreeSet<u64> = hunk.added.iter().copied().collect();
+        let mut covered = BTreeSet::new();
+        let mut facts = Vec::new();
+        for (e, inserted) in structured {
+            let hits: Vec<u64> = inserted
+                .iter()
+                .copied()
+                .filter(|h| wanted.contains(h))
+                .collect();
+            if !hits.is_empty() {
+                covered.extend(hits);
+                facts.push(e.fact.clone());
+            }
+        }
+        let lines = hunk.added.iter().filter(|h| covered.contains(h)).count();
+        (facts, (lines * 1000 / hunk.added.len()) as u16)
+    };
+    if !facts.is_empty() && coverage_permille >= MIN_COVERAGE_PERMILLE {
+        Provenance::Direct {
+            facts,
+            coverage_permille,
+        }
+    } else if !shell.is_empty() {
+        Provenance::ViaShell { facts: shell }
+    } else if !facts.is_empty() {
+        Provenance::Direct {
+            facts,
+            coverage_permille,
+        }
+    } else {
+        Provenance::Unexplained
+    }
 }
 
 pub struct FindingRef<'a> {
