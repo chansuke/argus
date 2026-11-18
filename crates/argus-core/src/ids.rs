@@ -15,11 +15,77 @@ impl Id128 {
     /// Wall time + pid + counter + `/dev/urandom`. Formats as a UUID so an agent run's
     /// id doubles as the Claude Code `--session-id`.
     pub fn mint() -> Self {
-        todo!("not implemented")
+        use std::io::Read;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let mut random = [0u8; 16];
+        // Without /dev/urandom the id is still unique: time, pid and counter go in too.
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut random));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut key = Vec::with_capacity(16 + 16 + 4 + 8);
+        key.extend_from_slice(&random);
+        key.extend_from_slice(&now.to_le_bytes());
+        key.extend_from_slice(&std::process::id().to_le_bytes());
+        key.extend_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        Id128(uuid_bits(
+            fnv1a_128(&[&key]) ^ u128::from_le_bytes(random),
+            4,
+        ))
     }
     pub fn derive(namespace: &str, key: &[u8]) -> Self {
-        todo!("not implemented")
+        let len = (namespace.len() as u64).to_le_bytes();
+        Id128(uuid_bits(fnv1a_128(&[&len, namespace.as_bytes(), key]), 8))
     }
+    /// The UUID text form, `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (either case).
+    pub fn parse(s: &str) -> Option<Self> {
+        let b = s.as_bytes();
+        if b.len() != 36 || [8, 13, 18, 23].iter().any(|&i| b[i] != b'-') {
+            return None;
+        }
+        let mut n = 0u128;
+        for (i, &c) in b.iter().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                continue;
+            }
+            n = n << 4 | u128::from((c as char).to_digit(16)?);
+        }
+        Some(Id128(n))
+    }
+}
+
+impl std::fmt::Display for Id128 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.0;
+        write!(
+            f,
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            n >> 96,
+            n >> 80 & 0xFFFF,
+            n >> 64 & 0xFFFF,
+            n >> 48 & 0xFFFF,
+            n & 0xFFFF_FFFF_FFFF
+        )
+    }
+}
+
+/// Sets the RFC 9562 version nibble and variant bits, so every id is a valid UUID.
+fn uuid_bits(n: u128, version: u128) -> u128 {
+    let n = n & !(0xF << 76) | version << 76;
+    n & !(0x3 << 62) | 0x2 << 62
+}
+
+fn fnv1a_128(parts: &[&[u8]]) -> u128 {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013B;
+    let mut h = OFFSET;
+    for &b in parts.iter().flat_map(|p| p.iter()) {
+        h ^= u128::from(b);
+        h = h.wrapping_mul(PRIME);
+    }
+    h
 }
 
 macro_rules! id_newtype {

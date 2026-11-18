@@ -31,7 +31,21 @@ impl SourceMeta {
     /// Deterministic id: reopening the same stream of the same attempt after a host
     /// restart resolves to the same log, so ingestion resumes instead of duplicating.
     pub fn derive_id(run: RunId, attempt: Attempt, origin: &SourceOrigin) -> SourceId {
-        todo!("not implemented")
+        use std::os::unix::ffi::OsStrExt;
+        let mut key = Vec::new();
+        key.extend_from_slice(&run.0.0.to_le_bytes());
+        key.extend_from_slice(&attempt.0.to_le_bytes());
+        let (tag, path): (u8, &[u8]) = match origin {
+            SourceOrigin::Stdout => (0, b""),
+            SourceOrigin::Stderr => (1, b""),
+            SourceOrigin::Terminal => (2, b""),
+            SourceOrigin::Stdin => (3, b""),
+            SourceOrigin::File(p) => (4, p.as_os_str().as_bytes()),
+            SourceOrigin::Hook => (5, b""),
+        };
+        key.push(tag);
+        key.extend_from_slice(path);
+        SourceId(Id128::derive("source", &key))
     }
 }
 
@@ -131,6 +145,8 @@ impl SourceKind {
             framing,
             next_offset: resume_at,
             pending: Vec::new(),
+            scanned: 0,
+            in_block: false,
         }
     }
 
@@ -182,10 +198,39 @@ pub enum RawFrame {
 impl RawFrame {
     /// Stored payload: a one-byte tag, then the offset or lengths, then the bytes verbatim.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        todo!("not implemented")
+        match self {
+            RawFrame::Bytes { offset, bytes } => {
+                let mut out = Vec::with_capacity(9 + bytes.len());
+                out.push(0);
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.extend_from_slice(bytes);
+                out
+            }
+            RawFrame::Discontinuity {
+                stored_end,
+                file_len,
+            } => {
+                let mut out = Vec::with_capacity(17);
+                out.push(1);
+                out.extend_from_slice(&stored_end.to_le_bytes());
+                out.extend_from_slice(&file_len.to_le_bytes());
+                out
+            }
+        }
     }
     pub(crate) fn decode(payload: &[u8]) -> Option<RawFrame> {
-        todo!("not implemented")
+        let u64_at = |i: usize| Some(u64::from_le_bytes(payload.get(i..i + 8)?.try_into().ok()?));
+        match payload.first()? {
+            0 => Some(RawFrame::Bytes {
+                offset: u64_at(1)?,
+                bytes: payload[9..].to_vec(),
+            }),
+            1 if payload.len() == 17 => Some(RawFrame::Discontinuity {
+                stored_end: u64_at(1)?,
+                file_len: u64_at(9)?,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -205,15 +250,69 @@ pub struct Framer {
     framing: Framing,
     next_offset: u64,
     pending: Vec<u8>,
+    /// `pending[..scanned]` holds whole lines already looked at (an open TLC block).
+    scanned: usize,
+    in_block: bool,
 }
+
+const TLC_START: &[u8] = b"@!@!@STARTMSG";
+const TLC_END: &[u8] = b"@!@!@ENDMSG";
 
 impl Framer {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<RawFrame> {
-        todo!("not implemented")
+        if let Framing::Chunks = self.framing {
+            return self.emit(bytes).into_iter().collect();
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+        let mut start = 0;
+        while let Some(nl) = self.pending[self.scanned..]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
+            let line_start = self.scanned;
+            let line_end = line_start + nl + 1;
+            self.scanned = line_end;
+            let line = &self.pending[line_start..line_end];
+            let ends_frame = match self.framing {
+                Framing::Lines | Framing::Chunks => true,
+                Framing::TlcMessages if self.in_block => {
+                    self.in_block = !line.starts_with(TLC_END);
+                    !self.in_block
+                }
+                Framing::TlcMessages => {
+                    self.in_block = line.starts_with(TLC_START);
+                    !self.in_block
+                }
+            };
+            if ends_frame {
+                let bytes = self.pending[start..line_end].to_vec();
+                frames.extend(self.emit(&bytes));
+                start = line_end;
+            }
+        }
+        self.pending.drain(..start);
+        self.scanned -= start;
+        frames
     }
     /// End of stream: the incomplete remainder (a last line without `\n`) becomes a frame.
     pub fn finish(&mut self) -> Option<RawFrame> {
-        todo!("not implemented")
+        let rest = std::mem::take(&mut self.pending);
+        self.scanned = 0;
+        self.in_block = false;
+        self.emit(&rest)
+    }
+
+    fn emit(&mut self, bytes: &[u8]) -> Option<RawFrame> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let offset = self.next_offset;
+        self.next_offset += bytes.len() as u64;
+        Some(RawFrame::Bytes {
+            offset,
+            bytes: bytes.to_vec(),
+        })
     }
 }
 
@@ -399,4 +498,44 @@ pub enum LeanSeverity {
 pub struct DeviceAction {
     pub action: String,
     pub detail: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_frames_round_trip_through_their_stored_form() {
+        let frames = [
+            RawFrame::Bytes {
+                offset: 0,
+                bytes: Vec::new(),
+            },
+            RawFrame::Bytes {
+                offset: u64::MAX - 3,
+                bytes: b"{\"type\":\"user\"}\n".to_vec(),
+            },
+            RawFrame::Discontinuity {
+                stored_end: 4096,
+                file_len: 12,
+            },
+        ];
+        for f in frames {
+            assert_eq!(RawFrame::decode(&f.encode()), Some(f));
+        }
+    }
+
+    #[test]
+    fn a_malformed_stored_frame_is_rejected() {
+        assert_eq!(RawFrame::decode(b""), None);
+        assert_eq!(RawFrame::decode(&[0, 1, 2]), None);
+        assert_eq!(RawFrame::decode(&[9; 20]), None);
+        let mut disc = RawFrame::Discontinuity {
+            stored_end: 1,
+            file_len: 2,
+        }
+        .encode();
+        disc.push(0);
+        assert_eq!(RawFrame::decode(&disc), None);
+    }
 }
