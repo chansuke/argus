@@ -193,4 +193,4 @@ await api.answer_permission({ request_id: requestId(), job, run, answer: "Allow"
 
 ## Next implementation step
 
-Every view in `JobViews` folds facts, and `review::admit` is tested through a job ledger. Next: `JobViews::glance` and the review packet (`diff::parse_unified`, `packet`), then `policy::decide` and `plan`, so the host can run a job end to end. `JobStats` checkpoints, `Analytics::slice`, and `Period::parse` wait for the analytics screen.
+Every view in `JobViews` folds facts, `review::admit` is tested through a job ledger, and the glance and the review packet are composed from them. Next: `policy::decide` and `plan`, so the host can run a job end to end. `JobStats` checkpoints, `Analytics::slice`, and `Period::parse` wait for the analytics screen.
