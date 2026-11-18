@@ -179,7 +179,9 @@ await api.answer_permission({ request_id: requestId(), job, run, answer: "Allow"
 - Should AI review run automatically on every new head (`review_on_snapshot`, off by default because each run costs money), and with which preset?
 - Feedback to an agent still sitting at its prompt: end it and `--resume` (current design), or type the feedback into its terminal?
 - Merge moves the target ref with a compare-and-swap. If you have the target branch checked out with local changes, should argus refuse, or push a branch / open a PR instead?
-- Unverified: does `claude --resume` copy earlier records (same `uuid`s) into a new file? The record rule handles both answers. Also unverified: the keystrokes that answer Claude Code's permission prompt in the current version.
+- Verified on 92 local transcripts (2026-11-18): 479 record `uuid`s appear in more than one file and none repeats inside one file, so `--resume` does copy history and the record rule is needed. Importing them all applied 109,420 facts, dropped 750 repeated observations, and replayed equal to live. Still unverified: the keystrokes that answer Claude Code's permission prompt in the current version.
+- Claude Code splits one API message into one record per content block and repeats `usage` in each, growing while it streams (1,450 of 9,378 messages differ between records). `AgentWhat::Usage` is therefore keyed by message id and views keep the latest value; adding them would double-count tokens.
+- About 85% of stored thinking blocks (9,129 of 10,713) have an empty `thinking` and only a signature. The raw view can show that the model thought, but not what, for those turns. Is there a Claude Code setting that keeps the text, or is this a hard limit for feature 5?
 - Insight prompts over long periods will exceed context. Should they be chunked per job and then merged (two-stage runs)?
 - Should argus reuse tlars' message catalog (`tlars-msg`) through a cross-repo path dependency, or vendor the few TLC codes it needs?
 - Which agent comes next: Codex's real adapter, OpenCode, Gemini, or ACP as a common protocol?
