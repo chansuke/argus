@@ -399,7 +399,14 @@ pub enum AgentWhat {
     PermissionWait {
         message: String,
     },
-    Usage(TokenUsage),
+    /// Token usage of one API message, keyed by its id. Claude Code splits a message into
+    /// one record per content block and repeats the usage in each, growing while the
+    /// message streams; the last value for a message is its total. So this is an
+    /// assignment: views keep the latest per message and never add repeats.
+    Usage {
+        message: Option<String>,
+        usage: TokenUsage,
+    },
     /// The agent's own plan, observed without any cooperation from the agent.
     Plan(PlanOp),
     TurnEnded {
