@@ -66,6 +66,10 @@ impl LogReader {
     pub fn last_stamp(&self) -> Option<Stamp> {
         self.last_stamp
     }
+    /// Every stored position, oldest first; `.rev()` walks back from the newest frame.
+    pub fn seqs(&self) -> impl DoubleEndedIterator<Item = Seq> + use<> {
+        (0..self.len()).map(Seq::from_persisted)
+    }
     pub fn get(&self, seq: Seq) -> Result<Frame, LogError> {
         let Some(&offset) = self.offsets.get(seq.get() as usize) else {
             return Err(LogError::NotFound(EventId {

@@ -371,6 +371,8 @@ fn a_reader_sees_frames_appended_after_it_opened() {
     }
     assert_eq!(reader.refresh().unwrap(), 3);
     assert_eq!(reader.len(), 5);
+    let seqs: Vec<u64> = reader.seqs().rev().map(Seq::get).collect();
+    assert_eq!(seqs, vec![4, 3, 2, 1, 0]);
     let fifth = EventId::parse("agent-1:4").unwrap();
     assert_eq!(reader.get(fifth.seq).unwrap().payload, b"five");
 }
