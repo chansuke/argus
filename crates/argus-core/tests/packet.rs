@@ -115,3 +115,87 @@ fn a_pure_deletion_is_explained_by_any_edit_of_its_file() {
         }
     );
 }
+
+mod common;
+
+#[test]
+fn hunks_of_decided_snapshots_count_as_seen() {
+    use argus_core::diff::HunkAnchor;
+    use argus_core::event::{Author, Decision, Event, FileState, RunOutcome, RunPurpose, Snapshot};
+    use argus_core::ids::{Attempt, DecisionId, GitOid};
+    use argus_core::views::packet::seen_anchors;
+    use argus_core::views::review::ReviewBoard;
+
+    let anchor = |f: u64| HunkAnchor {
+        path: RepoPath::parse("src/a.rs").unwrap(),
+        fingerprint: f,
+    };
+    let oid = |c: char| GitOid::parse(&c.to_string().repeat(40)).unwrap();
+    let mut board = ReviewBoard::default();
+    let mut feed = common::Feed::default();
+    let snapshot =
+        |board: &mut ReviewBoard, feed: &mut common::Feed, n: u128, tree: char, anchors: &[u64]| {
+            let run = RunId(Id128(n));
+            let requested = Event::RunRequested {
+                run,
+                purpose: RunPurpose::Snapshot { after: None },
+            };
+            feed.authored(board, 1, Author::Policy, requested);
+            let started = Event::RunStarted {
+                run,
+                attempt: Attempt(0),
+                pid: None,
+            };
+            feed.authored(board, 2, Author::Host, started);
+            let snapshot = Snapshot {
+                tree: oid(tree),
+                base: oid('b'),
+                previous: None,
+                delta: Vec::new(),
+                files: vec![FileState {
+                    path: RepoPath::parse("src/a.rs").unwrap(),
+                    blob: None,
+                    hunks: anchors.iter().map(|f| anchor(*f)).collect(),
+                }],
+                withheld: Vec::new(),
+            };
+            let finished = Event::RunFinished {
+                run,
+                attempt: Attempt(0),
+                outcome: RunOutcome::Snapshot(snapshot),
+            };
+            feed.authored(board, 3, Author::Host, finished);
+        };
+    let decided = |d: u128, tree: Option<char>, verdict| Event::Decided {
+        decision: DecisionId(Id128(d)),
+        tree: tree.map(oid),
+        verdict,
+        note: String::new(),
+    };
+
+    snapshot(&mut board, &mut feed, 1, '1', &[1, 2]);
+    assert!(seen_anchors(&board).is_empty());
+    feed.authored(
+        &mut board,
+        4,
+        Author::Human,
+        decided(1, Some('1'), Decision::RequestChanges),
+    );
+    snapshot(&mut board, &mut feed, 2, '2', &[2, 3]);
+    let seen: Vec<u64> = seen_anchors(&board)
+        .into_iter()
+        .map(|a| a.fingerprint)
+        .collect();
+    assert_eq!(seen, vec![1, 2]);
+    feed.authored(
+        &mut board,
+        5,
+        Author::Human,
+        decided(2, Some('2'), Decision::Approve),
+    );
+    let seen: Vec<u64> = seen_anchors(&board)
+        .into_iter()
+        .map(|a| a.fingerprint)
+        .collect();
+    assert_eq!(seen, vec![1, 2, 3]);
+}
