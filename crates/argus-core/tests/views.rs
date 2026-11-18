@@ -1,4 +1,4 @@
-//! Timeline and progress, fed facts directly: what the Glance and timeline screens show
+//! Runs, timeline and progress, fed facts directly: what the Glance and timeline screens show
 //! for a given sequence of authored events and observed agent records.
 
 use std::num::NonZeroU32;
@@ -19,6 +19,7 @@ use argus_core::source::{
 };
 use argus_core::views::Projection;
 use argus_core::views::progress::{Activity, PlanNode, Progress, WaitReason};
+use argus_core::views::runs::{Due, MAX_ATTEMPTS, Runs};
 use argus_core::views::timeline::{BucketWidth, ItemKind, Lane, Timeline, Window};
 
 /// Hands facts to a projection with fresh ids and increasing stamps, the way the ledger does.
@@ -847,4 +848,254 @@ fn plan_staleness_counts_tool_calls_since_the_plan_last_changed() {
     feed.agent(&mut p, &src, T0 + 3, todo(&[("x", PlanStatus::Pending)]));
     feed.agent(&mut p, &src, T0 + 4, call("c", "Read"));
     assert_eq!(p.staleness().collect::<Vec<_>>(), vec![(&run(1), 1)]);
+}
+
+// ---------------------------------------------------------------- runs
+
+fn snapshot_requested(n: u128) -> Event {
+    Event::RunRequested {
+        run: run(n),
+        purpose: RunPurpose::Snapshot { after: None },
+    }
+}
+
+fn attempt_started(n: u128, attempt: u16) -> Event {
+    Event::RunStarted {
+        run: run(n),
+        attempt: Attempt(attempt),
+        pid: Some(4242),
+    }
+}
+
+fn attempt_finished(n: u128, attempt: u16, outcome: RunOutcome) -> Event {
+    Event::RunFinished {
+        run: run(n),
+        attempt: Attempt(attempt),
+        outcome,
+    }
+}
+
+fn live(runs: &[u128]) -> std::collections::BTreeSet<RunId> {
+    runs.iter().map(|n| run(*n)).collect()
+}
+
+#[test]
+fn a_requested_run_is_due_to_start_until_it_starts() {
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    feed.authored(&mut r, T0, Author::Human, agent_requested(1));
+    let state = r.get(&run(1)).unwrap();
+    assert_eq!(state.requested_by, Author::Human);
+    assert_eq!(state.requested_at, UnixMillis(T0));
+    assert_eq!(
+        r.due(&live(&[])),
+        vec![Due::Start {
+            run: run(1),
+            attempt: Attempt(0)
+        }]
+    );
+    // The host is already starting it.
+    assert_eq!(r.due(&live(&[1])), vec![]);
+
+    feed.authored(&mut r, T0 + 1, Author::Host, attempt_started(1, 0));
+    assert_eq!(r.due(&live(&[1])), vec![]);
+    feed.authored(
+        &mut r,
+        T0 + 2,
+        Author::Host,
+        attempt_finished(1, 0, RunOutcome::Exited { code: 0 }),
+    );
+    assert_eq!(r.due(&live(&[])), vec![]);
+    let attempt = &r.get(&run(1)).unwrap().attempts[0];
+    assert_eq!(attempt.pid, Some(4242));
+    assert_eq!(
+        attempt.finished,
+        Some((UnixMillis(T0 + 2), RunOutcome::Exited { code: 0 }))
+    );
+}
+
+#[test]
+fn a_host_crash_abandons_the_attempt_and_retries_only_what_is_safe() {
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    feed.authored(&mut r, T0, Author::Human, agent_requested(1));
+    feed.authored(&mut r, T0, Author::Policy, snapshot_requested(2));
+    feed.authored(&mut r, T0 + 1, Author::Host, attempt_started(1, 0));
+    feed.authored(&mut r, T0 + 1, Author::Host, attempt_started(2, 0));
+    // After a restart nothing is live.
+    assert_eq!(
+        r.due(&live(&[])),
+        vec![
+            Due::Abandon {
+                run: run(1),
+                attempt: Attempt(0)
+            },
+            Due::Abandon {
+                run: run(2),
+                attempt: Attempt(0)
+            },
+        ]
+    );
+    feed.authored(
+        &mut r,
+        T0 + 2,
+        Author::Host,
+        attempt_finished(1, 0, RunOutcome::Abandoned),
+    );
+    feed.authored(
+        &mut r,
+        T0 + 2,
+        Author::Host,
+        attempt_finished(2, 0, RunOutcome::Abandoned),
+    );
+    // The agent has conversational state and waits for a human; the snapshot retries.
+    assert_eq!(
+        r.due(&live(&[])),
+        vec![Due::Start {
+            run: run(2),
+            attempt: Attempt(1)
+        }]
+    );
+}
+
+#[test]
+fn retries_stop_after_the_last_attempt() {
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    feed.authored(&mut r, T0, Author::Policy, snapshot_requested(2));
+    for a in 0..MAX_ATTEMPTS {
+        feed.authored(&mut r, T0 + 1, Author::Host, attempt_started(2, a));
+        feed.authored(
+            &mut r,
+            T0 + 2,
+            Author::Host,
+            attempt_finished(2, a, RunOutcome::Abandoned),
+        );
+    }
+    assert_eq!(
+        r.get(&run(2)).unwrap().attempts.len(),
+        usize::from(MAX_ATTEMPTS)
+    );
+    assert_eq!(r.due(&live(&[])), vec![]);
+}
+
+#[test]
+fn a_cancel_kills_a_live_run_and_keeps_an_unstarted_one_from_starting() {
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    feed.authored(&mut r, T0, Author::Human, agent_requested(1));
+    feed.authored(&mut r, T0, Author::Human, agent_requested(3));
+    feed.authored(&mut r, T0 + 1, Author::Host, attempt_started(1, 0));
+    feed.authored(
+        &mut r,
+        T0 + 2,
+        Author::Human,
+        Event::RunCancelRequested { run: run(1) },
+    );
+    feed.authored(
+        &mut r,
+        T0 + 2,
+        Author::Human,
+        Event::RunCancelRequested { run: run(3) },
+    );
+    assert!(r.get(&run(1)).unwrap().cancel_requested);
+    assert_eq!(r.due(&live(&[1])), vec![Due::Kill { run: run(1) }]);
+    let killed = RunOutcome::Killed {
+        signal: 15,
+        cancelled: true,
+    };
+    feed.authored(&mut r, T0 + 3, Author::Host, attempt_finished(1, 0, killed));
+    assert_eq!(r.due(&live(&[])), vec![]);
+}
+
+#[test]
+fn an_open_lease_without_a_live_run_is_released() {
+    use argus_core::event::{DevicePlatform, LeaseEnd, LeaseProvider};
+    use argus_core::ids::LeaseId;
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    let lease = LeaseId(Id128(7));
+    feed.authored(&mut r, T0, Author::Policy, snapshot_requested(2));
+    feed.authored(&mut r, T0 + 1, Author::Host, attempt_started(2, 0));
+    feed.authored(
+        &mut r,
+        T0 + 2,
+        Author::Host,
+        Event::LeaseOpened {
+            lease,
+            run: run(2),
+            attempt: Attempt(0),
+            provider: LeaseProvider::EasSimulator {
+                platform: DevicePlatform::Ios,
+            },
+            name: "argus-2-0".into(),
+        },
+    );
+    feed.authored(
+        &mut r,
+        T0 + 3,
+        Author::Host,
+        Event::LeaseBound {
+            lease,
+            remote_id: "sim-1".into(),
+            preview_url: Some("https://example.invalid/p".into()),
+        },
+    );
+    assert_eq!(r.due(&live(&[2])), vec![]);
+    assert_eq!(r.unclosed_leases().count(), 1);
+    assert_eq!(r.lease(&lease).unwrap().remote_id.as_deref(), Some("sim-1"));
+    assert!(r.due(&live(&[])).contains(&Due::Release { lease }));
+
+    feed.authored(
+        &mut r,
+        T0 + 4,
+        Author::Host,
+        Event::LeaseClosed {
+            lease,
+            how: LeaseEnd::Stopped,
+        },
+    );
+    assert_eq!(r.unclosed_leases().count(), 0);
+    assert!(!r.due(&live(&[])).contains(&Due::Release { lease }));
+}
+
+#[test]
+fn artifacts_and_the_latest_agent_are_kept_per_run() {
+    use argus_core::ids::BlobId;
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    assert!(r.latest_agent().is_none());
+    feed.authored(&mut r, T0, Author::Human, agent_requested(1));
+    feed.authored(&mut r, T0 + 1, Author::Policy, snapshot_requested(2));
+    feed.authored(&mut r, T0 + 2, Author::Human, agent_requested(3));
+    feed.authored(&mut r, T0 + 3, Author::Policy, snapshot_requested(4));
+    // Request order, not id order, decides.
+    assert_eq!(r.latest_agent().map(|(id, _)| *id), Some(run(3)));
+
+    let (fact, changed) = feed.authored(
+        &mut r,
+        T0 + 4,
+        Author::Host,
+        Event::ArtifactCaptured {
+            run: run(2),
+            attempt: Attempt(0),
+            blob: BlobId([1; 32]),
+            name: "screen.png".into(),
+            media_type: "image/png".into(),
+            len: 10,
+        },
+    );
+    assert!(changed);
+    let artifacts = &r.get(&run(2)).unwrap().artifacts;
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        (artifacts[0].name.as_str(), &artifacts[0].fact),
+        ("screen.png", &fact)
+    );
+    // Events that are not about runs change nothing here.
+    assert!(
+        !feed
+            .authored(&mut r, T0 + 5, Author::Human, set(1, None, 1, DONE))
+            .1
+    );
 }
