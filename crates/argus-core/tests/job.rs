@@ -861,3 +861,226 @@ fn a_finding_on_a_changed_file_is_not_carried_forward() {
     assert!(packet.unattached.is_empty());
     assert!(packet.headline.ai.is_empty());
 }
+
+// ---------------------------------------------------------------- policy
+
+use argus_core::event::{CheckRequest, CheckSpec, LeanMode, TlaEngine};
+use argus_core::models::ModelSet;
+use argus_core::policy::{PolicyConfig, decide};
+use argus_core::views::timeline::BucketWidth;
+
+impl Job {
+    /// Decides, submits what was decided, and returns it.
+    fn decide(&mut self, cfg: &PolicyConfig, now: i64) -> Vec<Event> {
+        let events = decide(self.ledger.views(), cfg, UnixMillis(now));
+        for e in &events {
+            self.ok(Author::Policy, e.clone());
+        }
+        events
+    }
+}
+
+fn requested_purposes(events: &[Event]) -> Vec<&RunPurpose> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::RunRequested { purpose, .. } => Some(purpose),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_turn_end_is_snapshotted_once() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.transcript(1, &[turn_end("a1", T)]);
+    let off = PolicyConfig::default();
+    assert!(decide(job.ledger.views(), &off, UnixMillis(T)).is_empty());
+
+    let cfg = PolicyConfig {
+        snapshot_on_turn_end: true,
+        ..PolicyConfig::default()
+    };
+    let turn_end_fact = job
+        .ledger
+        .views()
+        .transcript()
+        .latest_turn_end(&run(1))
+        .cloned();
+    let first = job.decide(&cfg, T);
+    assert!(
+        matches!(requested_purposes(&first).as_slice(), [RunPurpose::Snapshot { after }] if *after == turn_end_fact),
+        "{first:?}"
+    );
+    assert!(job.decide(&cfg, T).is_empty());
+    // The next turn end is a new snapshot.
+    job.transcript(1, &[turn_end("a2", T + 5000)]);
+    assert_eq!(job.decide(&cfg, T).len(), 1);
+}
+
+#[test]
+fn a_new_head_gets_the_configured_review_and_the_checks_it_can_affect() {
+    let mut job = Job::open();
+    let models = ModelSet::new([model("opus"), model("sonnet")]).unwrap();
+    let lean = CheckSpec::Lean {
+        root: repo("proofs"),
+        mode: LeanMode::LakeBuild,
+    };
+    let tla = CheckSpec::Tla {
+        spec: repo("specs/tla/Lease.tla"),
+        config: None,
+        engine: TlaEngine::JavaTlc,
+        workers: None,
+    };
+    let cfg = PolicyConfig {
+        review_on_snapshot: Some((models, ReviewLens::General)),
+        checks_on_snapshot: vec![lean.clone(), tla],
+        ..PolicyConfig::default()
+    };
+    assert!(job.decide(&cfg, T).is_empty());
+    let mut changed = files('a');
+    changed.push(FileState {
+        path: repo("proofs/ArgusProofs/Replay.lean"),
+        blob: Some(oid('e')),
+        hunks: Vec::new(),
+    });
+    job.snapshot_of(10, oid('1'), None, changed);
+    let events = job.decide(&cfg, T);
+    let purposes = requested_purposes(&events);
+    let reviews: Vec<_> = purposes
+        .iter()
+        .filter_map(|p| match p {
+            RunPurpose::Review(spec) => Some((spec.tree.clone(), spec.llm.model.to_string())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reviews,
+        vec![
+            (oid('1'), "claude:opus".to_owned()),
+            (oid('1'), "claude:sonnet".to_owned())
+        ]
+    );
+    // Only the Lean package changed; the TLA+ spec did not.
+    let checks: Vec<_> = purposes
+        .iter()
+        .filter_map(|p| match p {
+            RunPurpose::Check(CheckRequest { tree, spec, .. }) => {
+                Some((tree.clone(), spec.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checks, vec![(oid('1'), lean)]);
+    assert!(job.decide(&cfg, T).is_empty());
+}
+
+#[test]
+fn feedback_waits_for_the_turn_then_resumes_the_agent_with_exactly_the_preview() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.transcript(1, &[tool_call("a1", T)]);
+    job.snapshot_of(10, oid('1'), None, files('a'));
+    let anchor = Anchor::Code {
+        tree: oid('1'),
+        path: repo("src/a.rs"),
+        lines: LineRange::new(2, 2).unwrap(),
+    };
+    job.ok(
+        Author::Human,
+        Event::ThreadOpened {
+            thread: ThreadId(Id128(1)),
+            comment: CommentId(Id128(100)),
+            anchor,
+            body: "keep the old name".into(),
+        },
+    );
+    let preview = job.ledger.views().preview_feedback("Almost.");
+    let decision = Event::Decided {
+        decision: DecisionId(Id128(1)),
+        tree: Some(oid('1')),
+        verdict: Decision::RequestChanges,
+        note: "Almost.".into(),
+    };
+    job.ok(Author::Human, decision);
+    let cfg = PolicyConfig::default();
+
+    // Mid-turn: nothing yet.
+    assert!(job.decide(&cfg, T).is_empty());
+    // At its prompt: ask it to exit, once.
+    job.transcript(1, &[turn_end("a2", T + 1000)]);
+    assert_eq!(
+        job.decide(&cfg, T),
+        vec![Event::RunCancelRequested { run: run(1) }]
+    );
+    assert!(job.decide(&cfg, T).is_empty());
+    // Gone: resume it with the feedback.
+    job.finish(
+        1,
+        RunOutcome::Killed {
+            signal: 15,
+            cancelled: true,
+        },
+    );
+    let events = job.decide(&cfg, T);
+    let [
+        Event::RunRequested {
+            run: delivery,
+            purpose: RunPurpose::Agent(launch),
+        },
+    ] = events.as_slice()
+    else {
+        panic!("{events:?}")
+    };
+    assert_eq!(*delivery, DecisionId(Id128(1)).delivery_run());
+    assert_eq!(launch.resume, Some(run(1)));
+    assert_eq!(launch.cli, AgentCli::Claude);
+    assert_eq!(launch.prompt, preview);
+    assert!(launch.prompt.contains("- src/a.rs:2: keep the old name"));
+    assert!(job.decide(&cfg, T).is_empty());
+}
+
+#[test]
+fn abandoning_a_job_stops_every_live_run() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.agent(2);
+    job.finish(2, RunOutcome::Exited { code: 0 });
+    job.snapshot_of(10, oid('1'), None, files('a'));
+    job.ok(Author::Human, decided(1, Some(oid('1')), Decision::Abandon));
+    let cfg = PolicyConfig::default();
+    assert_eq!(
+        job.decide(&cfg, T),
+        vec![Event::RunCancelRequested { run: run(1) }]
+    );
+    assert!(job.decide(&cfg, T).is_empty());
+}
+
+#[test]
+fn every_ended_window_with_activity_is_summarized_once() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.transcript(1, &[tool_call("a1", T), turn_end("a2", T + 20_000)]);
+    let cfg = PolicyConfig {
+        summaries: Some((BucketWidth::M15, model("haiku"))),
+        ..PolicyConfig::default()
+    };
+    let later = T + 3 * 60 * 60 * 1000;
+    let events = job.decide(&cfg, later);
+    let windows: Vec<_> = requested_purposes(&events)
+        .into_iter()
+        .filter_map(|p| match p {
+            RunPurpose::Summarize { window, llm } => Some((*window, llm.clone())),
+            _ => None,
+        })
+        .collect();
+    // The agent's records, and the job's own events (stamped now) in a window not yet ended.
+    assert_eq!(windows.len(), 1, "{events:?}");
+    let (window, llm) = &windows[0];
+    assert_eq!(window.width, BucketWidth::M15);
+    assert!(window.start.0 <= T && T < window.end().0);
+    assert_eq!(llm.model.to_string(), "claude:haiku");
+    assert!(llm.prompt.contains("Bash"), "{}", llm.prompt);
+    assert!(job.decide(&cfg, later).is_empty());
+}
