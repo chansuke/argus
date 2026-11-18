@@ -170,8 +170,9 @@ impl Progress {
     }
 
     /// The job's share: the weighted share of the top-level tasks and of every counted
-    /// observed plan (weight 1 each). 0 with nothing to count.
-    pub fn share(&self) -> Share {
+    /// observed plan (weight 1 each). `None` with nothing to count: most agents never
+    /// write a plan, and "no plan" must not read as "nothing done".
+    pub fn share(&self) -> Option<Share> {
         let tree = self.tree();
         let parts = tree.roots.iter().filter_map(|node| match node {
             PlanNode::Task { node, share, .. } => {
@@ -179,7 +180,7 @@ impl Progress {
             }
             PlanNode::Observed { share, counted, .. } => counted.then_some((1, *share)),
         });
-        weighted(parts).unwrap_or(Share::new(0.0))
+        weighted(parts)
     }
 
     fn task_node<'a>(

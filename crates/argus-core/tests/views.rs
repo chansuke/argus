@@ -505,7 +505,7 @@ fn the_agents_own_plan_tool_gives_progress_without_cooperation() {
     ]);
     assert!(feed.agent(&mut p, &src, T0 + 1, plan).1);
     // Deleted items leave the denominator.
-    assert_eq!(p.share().get(), 0.5);
+    assert_eq!(p.share().unwrap().get(), 0.5);
     assert_eq!(observed_share(&p), vec![(run(1), 0.5, true)]);
 
     let upsert = AgentWhat::Plan(PlanOp::Upsert {
@@ -520,7 +520,37 @@ fn the_agents_own_plan_tool_gives_progress_without_cooperation() {
     };
     let subjects: Vec<_> = plan.items.values().map(|(s, _)| s.as_str()).collect();
     assert_eq!(subjects, vec!["Ground", "Sketch", "Gone", "Ship"]);
-    assert!((p.share().get() - 2.0 / 3.0).abs() < 1e-9);
+    assert!((p.share().unwrap().get() - 2.0 / 3.0).abs() < 1e-9);
+}
+
+#[test]
+fn no_plan_is_not_the_same_as_nothing_done() {
+    let mut p = Progress::default();
+    let mut feed = Feed::default();
+    feed.authored(&mut p, T0, Author::Human, agent_requested(1));
+    feed.agent(&mut p, &transcript(run(1)), T0 + 1, call("t1", "Bash"));
+    assert_eq!(p.share(), None);
+    // A plan whose every item was deleted, or every task dropped, measures nothing either.
+    feed.agent(
+        &mut p,
+        &transcript(run(1)),
+        T0 + 2,
+        todo(&[("gone", PlanStatus::Deleted)]),
+    );
+    feed.authored(
+        &mut p,
+        T0 + 3,
+        Author::Human,
+        set(1, None, 1, TaskState::Dropped),
+    );
+    assert_eq!(p.share(), None);
+    feed.authored(
+        &mut p,
+        T0 + 4,
+        Author::Human,
+        set(2, None, 1, TaskState::Pending),
+    );
+    assert_eq!(p.share().map(|s| s.get()), Some(0.0));
 }
 
 #[test]
@@ -542,7 +572,7 @@ fn self_reported_tasks_replace_the_observed_plan_of_that_run() {
         set(2, None, 1, TaskState::InProgress),
     );
     // Counted once, from the self-report; the observed plan is still listed.
-    assert_eq!(p.share().get(), 0.5);
+    assert_eq!(p.share().unwrap().get(), 0.5);
     assert_eq!(observed_share(&p), vec![(run(1), 1.0, false)]);
 }
 
@@ -564,7 +594,7 @@ fn a_human_plan_is_the_skeleton_and_subtasks_split_their_parents_share() {
         Author::Human,
         set(3, None, 5, TaskState::Dropped),
     );
-    assert_eq!(p.share().get(), 0.75);
+    assert_eq!(p.share().unwrap().get(), 0.75);
 
     // The agent attaches work under the human's second task: done + pending halves it.
     feed.authored(
@@ -593,7 +623,7 @@ fn a_human_plan_is_the_skeleton_and_subtasks_split_their_parents_share() {
         T0 + 6,
         todo(&[("x", PlanStatus::Completed)]),
     );
-    assert_eq!(p.share().get(), 0.875);
+    assert_eq!(p.share().unwrap().get(), 0.875);
     assert_eq!(observed_share(&p), vec![(run(1), 1.0, false)]);
 
     let tree = p.tree();
@@ -640,7 +670,7 @@ fn task_patches_assign_only_the_fields_they_carry() {
         },
     };
     feed.authored(&mut p, T0 + 2, Author::Human, done);
-    assert_eq!(p.share().get(), 1.0);
+    assert_eq!(p.share().unwrap().get(), 1.0);
 
     // `Some(None)` moves the task to the top level; its title is kept.
     let detach = Event::TaskSet {
@@ -651,7 +681,7 @@ fn task_patches_assign_only_the_fields_they_carry() {
         },
     };
     feed.authored(&mut p, T0 + 3, Author::Human, detach);
-    assert_eq!(p.share().get(), 0.5);
+    assert_eq!(p.share().unwrap().get(), 0.5);
     let tree = p.tree();
     let PlanNode::Task { node, .. } = &tree.roots[1] else {
         panic!("{tree:#?}")
@@ -683,7 +713,7 @@ fn a_parent_cycle_neither_hangs_nor_counts_a_task_twice() {
     tree.roots.iter().for_each(|n| walk(n, &mut seen));
     seen.sort();
     assert_eq!(seen, vec![task(1), task(2), task(3)]);
-    let share = p.share().get();
+    let share = p.share().unwrap().get();
     assert!((0.0..=1.0).contains(&share), "{share}");
 }
 
@@ -802,7 +832,7 @@ fn only_agent_runs_have_activity() {
     );
     assert_eq!(p.activities().count(), 0);
     // The imported plan still counts toward progress.
-    assert_eq!(p.share().get(), 1.0);
+    assert_eq!(p.share().unwrap().get(), 1.0);
 }
 
 #[test]

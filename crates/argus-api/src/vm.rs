@@ -72,9 +72,9 @@ vm_enum! { /// Why the human is needed, in urgency order (the overview sorts by 
 vm_struct! { AgentNow { run: String, agent: Agent, model: Option<String>, activity: Activity, calls_since_plan_change: u32 } }
 
 vm_struct! { /// One row of the overview: everything needed to decide where to look next.
-    /// `share` is in 0..=1.
+    /// `share` is in 0..=1, or absent when the job has no plan to measure against.
     JobCard {
-        job: String, title: String, group: Option<String>, state: JobState, share: f64, agents: Vec<AgentNow>,
+        job: String, title: String, group: Option<String>, state: JobState, share: Option<f64>, agents: Vec<AgentNow>,
         review: Gate, checks: Gate, open_leases: u32, attention: Vec<Attention>, updated_ms: i64,
 } }
 

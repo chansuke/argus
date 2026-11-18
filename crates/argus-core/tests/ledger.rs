@@ -509,16 +509,16 @@ fn real_transcripts_fill_the_timeline_and_progress() {
         .iter()
         .filter(|n| matches!(n, PlanNode::Observed { .. }))
         .count();
-    let share = views.progress.share().get();
+    let share = views.progress.share().map(|s| s.get());
     eprintln!(
-        "{} items, {} calls closed, {} open, {} active hours, {} observed plans, share {share:.3}",
+        "{} items, {} calls closed, {} open, {} active hours, {} observed plans, share {share:?}",
         all.len(),
         closed.len(),
         open.len(),
         hours.len(),
         plans
     );
-    assert!((0.0..=1.0).contains(&share));
+    assert!(share.is_none_or(|s| (0.0..=1.0).contains(&s)));
     fs::remove_dir_all(&dir).unwrap();
 }
 

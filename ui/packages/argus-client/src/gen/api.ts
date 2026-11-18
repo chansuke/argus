@@ -260,7 +260,7 @@ export interface JobCard {
   title: string;
   group: string | null;
   state: JobState;
-  share: number;
+  share: number | null;
   agents: Array<AgentNow>;
   review: Gate;
   checks: Gate;

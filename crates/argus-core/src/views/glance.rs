@@ -8,7 +8,8 @@ use crate::views::{GateState, JobViews};
 #[derive(Clone, Debug)]
 pub struct Glance {
     pub state: JobState,
-    pub share: Share,
+    /// `None`: the job has no plan to measure against.
+    pub share: Option<Share>,
     pub now: Vec<(RunId, Activity)>,
     pub review: GateState,
     pub checks: GateState,
