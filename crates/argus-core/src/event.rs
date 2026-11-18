@@ -395,9 +395,16 @@ impl CheckTarget {
     /// "run this check on a snapshot that touched it" (policy) and "an older verdict still
     /// holds at head because none of its files changed" (`Applicability::CarriedForward`).
     pub fn depends_on(&self, path: &RepoPath) -> bool {
-        // TODO: Tla: path == spec || Some(path) == config; Lean: under root (any file of
-        //       the package); Device: under project.
-        todo!("not implemented")
+        let under = |dir: &RepoPath| {
+            path.as_str()
+                .strip_prefix(dir.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
+        match self {
+            CheckTarget::Tla { spec, config } => path == spec || config.as_ref() == Some(path),
+            CheckTarget::Lean { root } => under(root),
+            CheckTarget::Device { project, .. } => under(project),
+        }
     }
 }
 
