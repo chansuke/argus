@@ -68,6 +68,12 @@ impl Checks {
             .iter()
             .filter_map(|(t, r)| self.runs.get(r).map(|c| (t, c)))
     }
+    /// The latest run of each target, with its id.
+    pub fn latest_runs(&self) -> impl Iterator<Item = (&RunId, &CheckRun)> {
+        self.latest
+            .values()
+            .filter_map(|r| self.runs.get_key_value(r))
+    }
     /// Same target and tree, different engines, different verdicts (TLC vs tlars).
     /// Verdict kinds are compared, not their text: two engines word a counterexample
     /// differently.
