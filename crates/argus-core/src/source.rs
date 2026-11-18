@@ -138,6 +138,7 @@ impl SourceKind {
     pub fn framer(self, resume_at: u64) -> Framer {
         let framing = match self {
             SourceKind::TlcTool => Framing::TlcMessages,
+            SourceKind::LeanText => Framing::LeanDiagnostics,
             SourceKind::Terminal => Framing::Chunks,
             _ => Framing::Lines,
         };
@@ -239,6 +240,9 @@ enum Framing {
     Lines,
     /// `@!@!@STARTMSG code:class @!@!@ ... @!@!@ENDMSG code @!@!@` blocks; stray lines alone.
     TlcMessages,
+    /// `lake build` text: a line that starts a diagnostic or a lake status line begins a
+    /// frame; any other line continues the frame before it (a goal state under an error).
+    LeanDiagnostics,
     /// Arbitrary chunks as read (terminal bytes have no record structure).
     Chunks,
 }
@@ -258,6 +262,23 @@ pub struct Framer {
 const TLC_START: &[u8] = b"@!@!@STARTMSG";
 const TLC_END: &[u8] = b"@!@!@ENDMSG";
 
+/// How lake 4.35 starts a line of its own: a diagnostic, a status line, or a summary.
+const LEAN_STARTS: &[&str] = &[
+    "error: ",
+    "warning: ",
+    "info: ",
+    "trace: ",
+    "✔ ",
+    "⚠ ",
+    "✖ ",
+    "Build completed",
+    "Some required targets",
+];
+
+fn starts_lean_frame(line: &[u8]) -> bool {
+    LEAN_STARTS.iter().any(|p| line.starts_with(p.as_bytes()))
+}
+
 impl Framer {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<RawFrame> {
         if let Framing::Chunks = self.framing {
@@ -274,8 +295,17 @@ impl Framer {
             let line_end = line_start + nl + 1;
             self.scanned = line_end;
             let line = &self.pending[line_start..line_end];
+            if let Framing::LeanDiagnostics = self.framing {
+                // The frame before this line is complete once a new one starts.
+                if line_start > start && starts_lean_frame(&self.pending[line_start..line_end]) {
+                    let bytes = self.pending[start..line_start].to_vec();
+                    frames.extend(self.emit(&bytes));
+                    start = line_start;
+                }
+                continue;
+            }
             let ends_frame = match self.framing {
-                Framing::Lines | Framing::Chunks => true,
+                Framing::Lines | Framing::Chunks | Framing::LeanDiagnostics => true,
                 Framing::TlcMessages if self.in_block => {
                     self.in_block = !line.starts_with(TLC_END);
                     !self.in_block
