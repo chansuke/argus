@@ -12,13 +12,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::adapters::llm;
 use crate::diff::DiffRequest;
 use crate::event::{
-    Anchor, ApprovedHead, Author, Decision, Event, Rejected, ReviewSpec, RunPurpose, Snapshot,
+    Anchor, ApprovedHead, Author, Decision, Event, Rejected, ReviewSpec, RunOutcome, RunPurpose,
+    Snapshot,
 };
-use crate::fact::Fact;
+use crate::fact::{Fact, FactBody};
 use crate::ids::*;
-use crate::source::SourceFamily;
+use crate::source::{AgentWhat, Observation, SourceFamily, SourceMeta};
 use crate::views::packet::FeedbackItem;
 use crate::views::{GateState, JobViews, Projection};
 
@@ -168,15 +170,113 @@ impl ReviewBoard {
     }
     /// What `RequestChanges` would send now (`decision = None`, the preview), or what
     /// decision `d` did send (delivery). One function, so preview and delivery agree.
+    ///
+    /// Threads in the order they were opened, comments in order. A resolved thread's
+    /// drafts are not sent. `at` is the thread's code anchor carried to the head, `None`
+    /// when an edit touched those lines or the anchor is not code.
     pub fn feedback(&self, decision: Option<DecisionId>) -> Vec<FeedbackItem<'_>> {
-        // TODO: every comment with `sent_by == decision`, in thread order; `at` = the
-        //       thread's code anchor re-anchored to head (`reanchor`), `None` if outdated.
-        todo!("not implemented")
+        let head = self.head().map(|h| &h.snapshot.tree);
+        let mut threads: Vec<&Thread> = self.threads.values().collect();
+        threads.sort_by_key(|t| t.comments.first().map(|c| c.at));
+        let mut out = Vec::new();
+        for thread in threads {
+            if decision.is_none() && thread.resolved {
+                continue;
+            }
+            let at = match (&thread.anchor, head) {
+                (Anchor::Code { tree, path, lines }, Some(head)) => {
+                    self.reanchor(tree, head, path, *lines).map(|l| (path, l))
+                }
+                _ => None,
+            };
+            out.extend(
+                thread
+                    .comments
+                    .iter()
+                    .filter(|c| c.sent_by == decision)
+                    .map(|c| FeedbackItem {
+                        at,
+                        body: &c.body,
+                        from_finding: matches!(thread.origin, ThreadOrigin::Promoted(_)),
+                    }),
+            );
+        }
+        out
     }
+
     /// Green iff a review of `head` finished and no High/Medium finding or sent thread is
     /// open on it.
+    ///
+    /// - `NotConfigured`: no head, or no review was ever requested.
+    /// - `Stale`: reviews exist, none of them of `head`.
+    /// - `Pending`: a review of `head` is running and none has finished.
+    /// - `Red { open }`: open High/Medium findings (not dismissed, not promoted: a promoted
+    ///   finding counts once, as its thread) plus sent unresolved threads, plus one per
+    ///   unstructured answer, which only a human can judge. `open: 0` means every review of
+    ///   `head` failed.
     pub fn gate(&self, head: Option<&TreeOid>) -> GateState {
-        todo!("not implemented")
+        let Some(head) = head else {
+            return GateState::NotConfigured;
+        };
+        if self.reviews.is_empty() {
+            return GateState::NotConfigured;
+        }
+        let of_head: Vec<&ReviewRun> = self
+            .reviews
+            .values()
+            .filter(|r| &r.spec.tree == head)
+            .collect();
+        if of_head.is_empty() {
+            return GateState::Stale;
+        }
+        let promoted: BTreeSet<&FindingId> = self
+            .threads
+            .values()
+            .filter_map(|t| match &t.origin {
+                ThreadOrigin::Promoted(f) => Some(f),
+                ThreadOrigin::Human => None,
+            })
+            .collect();
+        let mut finished = false;
+        let mut open = 0u32;
+        for review in &of_head {
+            match &review.output {
+                ReviewOutput::Running | ReviewOutput::Failed { .. } => {}
+                ReviewOutput::Unstructured { .. } => {
+                    finished = true;
+                    open += 1;
+                }
+                ReviewOutput::Findings(findings) => {
+                    finished = true;
+                    let blocking = findings.iter().filter(|f| {
+                        f.severity <= Severity::Medium
+                            && !self.dismissed.contains(&f.id)
+                            && !promoted.contains(&f.id)
+                    });
+                    open += blocking.count() as u32;
+                }
+            }
+        }
+        if !finished {
+            return if of_head
+                .iter()
+                .any(|r| matches!(r.output, ReviewOutput::Running))
+            {
+                GateState::Pending
+            } else {
+                GateState::Red { open: 0 }
+            };
+        }
+        let sent_open = self
+            .threads
+            .values()
+            .filter(|t| !t.resolved && t.comments.iter().any(|c| c.sent_by.is_some()));
+        open += sent_open.count() as u32;
+        if open == 0 {
+            GateState::Green
+        } else {
+            GateState::Red { open }
+        }
     }
 
     /// Maps `lines` in tree `from` to tree `to` through the snapshot chain's `delta` hunk
@@ -189,8 +289,271 @@ impl ReviewBoard {
         path: &RepoPath,
         lines: LineRange,
     ) -> Option<LineRange> {
-        todo!("not implemented")
+        if from == to {
+            return Some(lines);
+        }
+        let start = self
+            .snapshots
+            .iter()
+            .position(|s| &s.snapshot.tree == from)?;
+        let mut range = (i64::from(lines.start()), i64::from(lines.end()));
+        for entry in &self.snapshots[start + 1..] {
+            let delta = &entry.snapshot.delta;
+            // A rename would need the new path in the answer; the thread is outdated.
+            if delta.iter().any(|d| d.renamed_from.as_ref() == Some(path)) {
+                return None;
+            }
+            if let Some(file) = delta.iter().find(|d| &d.path == path) {
+                range = shift(range, &file.hunks)?;
+            }
+            if &entry.snapshot.tree == to {
+                let start = u32::try_from(range.0).ok()?;
+                let end = u32::try_from(range.1).ok()?;
+                return LineRange::new(start, end);
+            }
+        }
+        None
     }
+
+    fn observed(&mut self, fact: &Fact<'_>, source: &SourceMeta, obs: &Observation) -> bool {
+        let Some(review) = self.reviews.get_mut(&source.run) else {
+            return false;
+        };
+        let mut changed = false;
+        if !review.sources.contains(&source.id) {
+            review.sources.push(source.id);
+            changed = true;
+        }
+        let Observation::Agent(event) = obs else {
+            return changed;
+        };
+        let AgentWhat::Result { text, is_error } = &event.what else {
+            return changed;
+        };
+        review.output = if *is_error {
+            ReviewOutput::Failed {
+                reason: text.clone(),
+            }
+        } else {
+            match llm::parse_findings(text) {
+                Some(raw) => ReviewOutput::Findings(
+                    raw.into_iter()
+                        .enumerate()
+                        .map(|(i, f)| Finding {
+                            id: FindingId {
+                                fact: fact.id.clone(),
+                                index: i as u16,
+                            },
+                            anchor: f.path.zip(f.lines).map(|(path, lines)| Anchor::Code {
+                                tree: review.spec.tree.clone(),
+                                path,
+                                lines,
+                            }),
+                            severity: f.severity,
+                            title: f.title,
+                            body: f.body,
+                        })
+                        .collect(),
+                ),
+                None => ReviewOutput::Unstructured {
+                    text: text.clone(),
+                    fact: fact.id.clone(),
+                },
+            }
+        };
+        true
+    }
+
+    fn finding(&self, id: &FindingId) -> Option<&Finding> {
+        self.reviews.values().find_map(|r| match &r.output {
+            ReviewOutput::Findings(fs) => fs.iter().find(|f| &f.id == id),
+            _ => None,
+        })
+    }
+
+    fn authored(&mut self, fact: &Fact<'_>, event: &Event) -> bool {
+        let at = fact.at;
+        let comment = |id: CommentId, body: &str| Comment {
+            id,
+            at,
+            body: body.to_owned(),
+            sent_by: None,
+        };
+        match event {
+            Event::JobOpened(info) => {
+                self.base = Some(info.base.clone());
+                true
+            }
+            Event::RunRequested { run, purpose } => match purpose {
+                RunPurpose::Snapshot { .. } => {
+                    self.starting.insert(*run, fact.stamp);
+                    false
+                }
+                RunPurpose::Review(spec) => {
+                    let review = ReviewRun {
+                        spec: spec.clone(),
+                        output: ReviewOutput::Running,
+                        sources: Vec::new(),
+                    };
+                    self.reviews.entry(*run).or_insert(review);
+                    true
+                }
+                _ => false,
+            },
+            Event::RunStarted { run, .. } => match self.starting.get_mut(run) {
+                Some(cut) => {
+                    *cut = fact.stamp;
+                    false
+                }
+                None => false,
+            },
+            Event::RunFinished { run, outcome, .. } => {
+                if let RunOutcome::Snapshot(snapshot) = outcome {
+                    let Some(cut) = self.starting.remove(run) else {
+                        return false;
+                    };
+                    if self.head().map(|h| &h.snapshot.tree) == Some(&snapshot.tree) {
+                        return false;
+                    }
+                    self.snapshots.push(SnapshotEntry {
+                        run: *run,
+                        at,
+                        cut,
+                        snapshot: snapshot.clone(),
+                    });
+                    return true;
+                }
+                match self.reviews.get_mut(run) {
+                    Some(review) if matches!(review.output, ReviewOutput::Running) => {
+                        review.output = ReviewOutput::Failed {
+                            reason: format!("the reviewer ended without an answer: {outcome:?}"),
+                        };
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Event::ThreadOpened {
+                thread,
+                comment: id,
+                anchor,
+                body,
+            } => {
+                if self.threads.contains_key(thread) {
+                    return false;
+                }
+                let new = Thread {
+                    anchor: anchor.clone(),
+                    origin: ThreadOrigin::Human,
+                    comments: vec![comment(*id, body)],
+                    resolved: false,
+                };
+                self.threads.insert(*thread, new);
+                true
+            }
+            Event::Replied {
+                comment: id,
+                thread,
+                body,
+            } => match self.threads.get_mut(thread) {
+                Some(t) => {
+                    t.comments.push(comment(*id, body));
+                    true
+                }
+                None => false,
+            },
+            Event::FindingPromoted {
+                finding,
+                thread,
+                comment: id,
+            } => {
+                if self.threads.contains_key(thread) {
+                    return false;
+                }
+                let Some(f) = self.finding(finding) else {
+                    return false;
+                };
+                let anchor = f
+                    .anchor
+                    .clone()
+                    .unwrap_or(Anchor::Fact(finding.fact.clone()));
+                let body = match f.body.is_empty() {
+                    true => f.title.clone(),
+                    false => format!("{}\n\n{}", f.title, f.body),
+                };
+                let new = Thread {
+                    anchor,
+                    origin: ThreadOrigin::Promoted(finding.clone()),
+                    comments: vec![comment(*id, &body)],
+                    resolved: false,
+                };
+                self.threads.insert(*thread, new);
+                true
+            }
+            Event::ThreadResolved { thread, resolved } => match self.threads.get_mut(thread) {
+                Some(t) if t.resolved != *resolved => {
+                    t.resolved = *resolved;
+                    true
+                }
+                _ => false,
+            },
+            Event::FindingDismissed { finding, dismissed } => match dismissed {
+                true => self.dismissed.insert(finding.clone()),
+                false => self.dismissed.remove(finding),
+            },
+            Event::Decided {
+                decision,
+                tree,
+                verdict,
+                note,
+            } => {
+                if *verdict == Decision::RequestChanges {
+                    let drafts = self
+                        .threads
+                        .values_mut()
+                        .filter(|t| !t.resolved)
+                        .flat_map(|t| t.comments.iter_mut())
+                        .filter(|c| c.sent_by.is_none());
+                    for c in drafts {
+                        c.sent_by = Some(*decision);
+                    }
+                }
+                self.decisions.push(DecisionEntry {
+                    id: *decision,
+                    fact: fact.id.clone(),
+                    at,
+                    tree: tree.clone(),
+                    verdict: *verdict,
+                    note: note.clone(),
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Carries an inclusive line range of the old file through one file's hunks (old-side
+/// numbers, ascending). `None` when a hunk overlaps the range, or inserts inside it.
+fn shift((start, end): (i64, i64), hunks: &[crate::event::Hunk]) -> Option<(i64, i64)> {
+    let mut offset = 0i64;
+    for h in hunks {
+        let (old_start, old_len) = (i64::from(h.old_start), i64::from(h.old_len));
+        let grew = i64::from(h.new_len) - old_len;
+        if old_len == 0 {
+            // A pure insertion after line `old_start`.
+            if old_start < start {
+                offset += grew;
+            } else if old_start < end {
+                return None;
+            }
+        } else if old_start + old_len - 1 < start {
+            offset += grew;
+        } else if old_start <= end {
+            return None;
+        }
+    }
+    Some((start + offset, end + offset))
 }
 
 /// `ViewSet::admit` for job ledgers (see the module doc). Reads the field directly, so an
@@ -228,17 +591,9 @@ impl Projection for ReviewBoard {
     const VERSION: u32 = 1;
     const READS: &'static [SourceFamily] = &[SourceFamily::AgentHeadless];
     fn apply(&mut self, fact: &Fact<'_>) -> bool {
-        // TODO:
-        // - JobOpened -> base. RunRequested(Snapshot) + RunStarted -> starting[run] = stamp;
-        //   RunFinished(Snapshot(s)) -> push SnapshotEntry unless s.tree == head's tree.
-        // - RunRequested(Review) -> reviews[run] = Running. `Result` observed from a review
-        //   run's source -> parse_findings -> Findings (ids = result fact + index, code
-        //   anchors on spec.tree) or, when None, Unstructured { text, fact }.
-        //   RunFinished without a result -> Failed.
-        // - ThreadOpened / Replied -> draft comments. FindingPromoted -> a thread with
-        //   origin Promoted, anchor = the finding's anchor (or Fact(finding fact)), body =
-        //   title + body. ThreadResolved, FindingDismissed -> assignments.
-        // - Decided -> push; RequestChanges sets `sent_by` on every draft comment.
-        todo!("not implemented")
+        match &fact.body {
+            FactBody::Authored { event, .. } => self.authored(fact, event),
+            FactBody::Observed { source, obs, .. } => self.observed(fact, source, obs),
+        }
     }
 }
