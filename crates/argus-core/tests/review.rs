@@ -469,3 +469,37 @@ fn a_thread_follows_its_lines_through_later_snapshots_until_they_change() {
     );
     assert_eq!(at(&board), None);
 }
+
+#[test]
+fn feedback_text_is_the_note_then_one_located_item_per_comment() {
+    use argus_core::views::packet::{FeedbackItem, render_feedback};
+    let a = path("src/a.rs");
+    let items = [
+        FeedbackItem {
+            at: Some((&a, lines(10, 12))),
+            body: "check the bounds\nand the error path",
+            from_finding: false,
+        },
+        FeedbackItem {
+            at: Some((&a, lines(40, 40))),
+            body: "step failures are masked",
+            from_finding: true,
+        },
+        FeedbackItem {
+            at: None,
+            body: "split this task",
+            from_finding: false,
+        },
+    ];
+    assert_eq!(
+        render_feedback("  Almost there.\n", &items),
+        "Almost there.\n\
+         \n\
+         - src/a.rs:10-12: check the bounds\n  and the error path\n\
+         - [AI review] src/a.rs:40: step failures are masked\n\
+         - split this task\n"
+    );
+    assert_eq!(render_feedback("", &items[2..]), "- split this task\n");
+    assert_eq!(render_feedback("Looks wrong.", &[]), "Looks wrong.\n");
+    assert_eq!(render_feedback(" ", &[]), "");
+}
