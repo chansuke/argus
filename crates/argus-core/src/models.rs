@@ -44,6 +44,28 @@ pub struct ModelChoice {
     pub effort: Option<Effort>,
 }
 
+impl std::fmt::Display for ModelChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cli = match self.cli {
+            AgentCli::Claude => "claude",
+            AgentCli::Codex => "codex",
+        };
+        write!(f, "{cli}:{}", self.model.0)?;
+        match self.effort {
+            None => Ok(()),
+            Some(effort) => {
+                let effort = match effort {
+                    Effort::Low => "low",
+                    Effort::Medium => "medium",
+                    Effort::High => "high",
+                    Effort::Max => "max",
+                };
+                write!(f, ":{effort}")
+            }
+        }
+    }
+}
+
 /// Non-empty, sorted, deduplicated. A review asked of zero models is unrepresentable.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ModelSet {
