@@ -5,8 +5,9 @@ use crate::event::{LlmCall, ReviewLens, ReviewSpec};
 use argus_json::Json;
 
 use crate::ids::{CommitOid, LineRange, RepoPath, UnixMillis};
-use crate::models::AgentCli;
+use crate::models::{AgentCli, Effort};
 use crate::plan::{CommandSpec, PlanEnv, Workdir};
+use crate::source::SourceKind;
 use crate::views::timeline::{Item, ItemKind, Lane, Window};
 
 #[derive(Clone, Copy, Debug)]
@@ -16,9 +17,15 @@ pub(crate) enum ToolAccess {
     ReadOnly,
 }
 
-/// Claude: `claude -p --model <m> --output-format stream-json --verbose
-///          [--allowedTools ...]`, prompt on stdin, stdout `ClaudeStreamJson`.
-/// Codex:  `codex exec --model <m> --json -`, stdout `CodexExec`.
+/// Claude: `claude -p --model <m> [--effort e] --output-format stream-json --verbose
+///          --no-session-persistence --tools <set> [--allowedTools ...]`, prompt on
+///          stdin, stdout `ClaudeStreamJson`. The stdout stream is the run's raw log, so
+///          the session is not also saved under `~/.claude/projects`.
+///          `ToolAccess::None` is `--tools ""`; `ReadOnly` is the read tools plus Bash
+///          limited to `git diff`/`git log`/`git show`. Flags from Claude Code 2.1.303
+///          `--help`; unverified: that print mode denies a Bash call outside the allowed
+///          patterns instead of waiting for an answer.
+/// Codex:  `codex exec --model <m> --json -`, stdout `CodexExec` (not written yet).
 pub(crate) fn headless(
     call: &LlmCall,
     access: ToolAccess,
@@ -26,7 +33,54 @@ pub(crate) fn headless(
     env: &PlanEnv,
 ) -> CommandSpec {
     match call.model.cli {
-        AgentCli::Claude => todo!("not implemented"),
+        AgentCli::Claude => {
+            let mut args: Vec<String> =
+                vec!["-p".into(), "--model".into(), call.model.model.0.clone()];
+            if let Some(effort) = call.model.effort {
+                let effort = match effort {
+                    Effort::Low => "low",
+                    Effort::Medium => "medium",
+                    Effort::High => "high",
+                    Effort::Max => "max",
+                };
+                args.extend(["--effort".into(), effort.into()]);
+            }
+            args.extend(
+                [
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--no-session-persistence",
+                ]
+                .map(String::from),
+            );
+            match access {
+                ToolAccess::None => args.extend(["--tools".into(), String::new()]),
+                ToolAccess::ReadOnly => args.extend(
+                    [
+                        "--tools",
+                        "Read,Grep,Glob,Bash",
+                        "--allowedTools",
+                        "Bash(git diff:*),Bash(git log:*),Bash(git show:*)",
+                    ]
+                    .map(String::from),
+                ),
+            }
+            CommandSpec {
+                program: env.tools.claude.clone(),
+                args,
+                env: Vec::new(),
+                workdir,
+                cwd: None,
+                stdin: Some(call.prompt.clone().into_bytes()),
+                stdout: SourceKind::ClaudeStreamJson,
+                stderr: SourceKind::PlainText,
+                terminal: false,
+                watch: Vec::new(),
+                artifacts: false,
+                timeout: None,
+            }
+        }
         AgentCli::Codex => todo!("not implemented"),
     }
 }
