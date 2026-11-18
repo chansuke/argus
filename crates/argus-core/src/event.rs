@@ -308,10 +308,27 @@ impl ReviewSpec {
         focus: Option<&str>,
         models: &ModelSet,
     ) -> Vec<(RunId, RunPurpose)> {
-        // TODO: for m in models: run = RunId(Id128::derive("review", request ++ m));
-        //       prompt = adapters::llm::review_prompt(base, lens, focus);
-        //       (run, Review(ReviewSpec { tree, base, lens, llm: LlmCall { model: m, prompt } }))
-        todo!("not implemented")
+        let prompt = crate::adapters::llm::review_prompt(base, lens, focus);
+        models
+            .iter()
+            .map(|model| {
+                let mut key = request.0.to_le_bytes().to_vec();
+                key.extend_from_slice(model.to_string().as_bytes());
+                let spec = ReviewSpec {
+                    tree: tree.clone(),
+                    base: base.clone(),
+                    lens,
+                    llm: LlmCall {
+                        model: model.clone(),
+                        prompt: prompt.clone(),
+                    },
+                };
+                (
+                    RunId(Id128::derive("review", &key)),
+                    RunPurpose::Review(spec),
+                )
+            })
+            .collect()
     }
 }
 
