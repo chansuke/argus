@@ -551,3 +551,313 @@ fn failing_checks_on_the_head_need_attention() {
         g.attention
     );
 }
+
+// ---------------------------------------------------------------- review packet
+
+use argus_core::diff::{DiffRequest, HeadDiff, parse_unified};
+use argus_core::event::{Anchor, FileState, LlmCall, ReviewLens, ReviewSpec};
+use argus_core::ids::{CommentId, LineRange, RepoPath, ThreadId};
+use argus_core::models::ModelChoice;
+use argus_core::views::packet::{
+    Applicability, PacketConfig, Provenance, SENSITIVE_DEFAULT, Signal, Tier,
+};
+
+fn repo(p: &str) -> RepoPath {
+    RepoPath::parse(p).unwrap()
+}
+
+fn head_diff(tree: char) -> HeadDiff {
+    let text = include_str!("fixtures/git/head.diff");
+    HeadDiff {
+        request: DiffRequest {
+            base: oid('b'),
+            tree: oid(tree),
+        },
+        hunks: parse_unified(text),
+    }
+}
+
+/// The head's files as `Snapshot::files` records them: blob ids and the hunk anchors of
+/// the fixture diff.
+fn files(blob_of_a: char) -> Vec<FileState> {
+    let diff = head_diff('1');
+    let blob = |path: &str| match path {
+        "src/a.rs" => Some(oid(blob_of_a)),
+        "tools/old.sh" => None,
+        _ => Some(oid('f')),
+    };
+    let mut out: Vec<FileState> = Vec::new();
+    for h in &diff.hunks {
+        let path = h.anchor.path.as_str();
+        match out.iter_mut().find(|f| f.path.as_str() == path) {
+            Some(f) => f.hunks.push(h.anchor.clone()),
+            None => out.push(FileState {
+                path: repo(path),
+                blob: blob(path),
+                hunks: vec![h.anchor.clone()],
+            }),
+        }
+    }
+    out
+}
+
+fn model(name: &str) -> ModelChoice {
+    ModelChoice {
+        cli: AgentCli::Claude,
+        model: argus_core::ids::ModelId(name.into()),
+        effort: None,
+    }
+}
+
+impl Job {
+    fn snapshot_of(
+        &mut self,
+        n: u128,
+        tree: TreeOid,
+        previous: Option<TreeOid>,
+        files: Vec<FileState>,
+    ) {
+        let requested = Event::RunRequested {
+            run: run(n),
+            purpose: RunPurpose::Snapshot { after: None },
+        };
+        self.ok(Author::Policy, requested);
+        self.start(n);
+        let snapshot = Snapshot {
+            tree,
+            base: oid('b'),
+            previous,
+            delta: Vec::new(),
+            files,
+            withheld: vec![repo(".env")],
+        };
+        self.finish(n, RunOutcome::Snapshot(snapshot));
+    }
+
+    /// A review of `tree` by `model` that answers with `findings` (the JSON array).
+    fn review(&mut self, n: u128, tree: char, model_name: &str, findings: &str) {
+        let spec = ReviewSpec {
+            tree: oid(tree),
+            base: oid('b'),
+            lens: ReviewLens::General,
+            llm: LlmCall {
+                model: model(model_name),
+                prompt: "review".into(),
+            },
+        };
+        self.ok(
+            Author::Human,
+            Event::RunRequested {
+                run: run(n),
+                purpose: RunPurpose::Review(spec),
+            },
+        );
+        self.start(n);
+        let text = format!("Notes.\n\n```json\n{findings}\n```\n");
+        let mut line = String::from(r#"{"type":"result","is_error":false,"result":"#);
+        line.push_str(&json_string(&text));
+        line.push('}');
+        self.feed(
+            n,
+            SourceKind::ClaudeStreamJson,
+            SourceOrigin::Stdout,
+            &[line],
+        );
+        self.finish(n, RunOutcome::Exited { code: 0 });
+    }
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn edit_call(uuid: &str, path: &str, new_string: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","uuid":"{uuid}","timestamp":"{}","message":{{"id":"m-{uuid}","content":[{{"type":"tool_use","id":"t-{uuid}","name":"Edit","input":{{"file_path":"{path}","old_string":"x","new_string":"{new_string}"}}}}],"stop_reason":"tool_use"}}}}"#,
+        stamp_of(T)
+    )
+}
+
+const FINDINGS_1: &str = r#"[
+  {"path":"src/a.rs","start":1,"end":3,"severity":"high","title":"renamed a line","body":""},
+  {"path":"src/new.rs","start":1,"end":1,"severity":"low","title":"empty main","body":""},
+  {"path":null,"start":null,"end":null,"severity":"medium","title":"no tests","body":""}
+]"#;
+const FINDINGS_2: &str = r#"[{"path":"src/a.rs","start":2,"end":2,"severity":"high","title":"line2 is wrong","body":""}]"#;
+
+fn cfg() -> PacketConfig {
+    PacketConfig {
+        sensitive: SENSITIVE_DEFAULT
+            .iter()
+            .map(|s| s.to_string())
+            .chain(["*.txt".to_owned()])
+            .collect(),
+    }
+}
+
+#[test]
+fn the_first_round_puts_agreed_findings_first_and_explains_hunks_from_the_transcript() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.transcript(1, &[edit_call("a1", "/w/jobs/1/src/a.rs", "line2 changed")]);
+    job.snapshot_of(10, oid('1'), None, files('a'));
+    job.review(5, '1', "opus", FINDINGS_1);
+    job.review(6, '1', "sonnet", FINDINGS_2);
+
+    let diff = head_diff('1');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    assert_eq!(packet.round, 1);
+    let h = &packet.headline;
+    assert_eq!((h.files, h.added, h.removed, h.withheld), (4, 4, 4, 1));
+    assert_eq!(h.pending_reviews, 0);
+    assert_eq!(h.ai.len(), 2);
+    assert_eq!(
+        h.ai.iter().map(|t| t.by_severity).collect::<Vec<_>>(),
+        vec![[1, 1, 1, 0], [1, 0, 0, 0]]
+    );
+
+    let first = &packet.agenda[0];
+    assert_eq!(
+        (first.hunk.anchor.path.as_str(), first.hunk.header.new_start),
+        ("src/a.rs", 1)
+    );
+    assert_eq!(first.tier, Tier::Blocking);
+    assert!(first.signals.contains(&Signal::Finding {
+        severity: argus_core::views::review::Severity::High,
+        agreeing_models: 2
+    }));
+    assert!(matches!(
+        &first.provenance,
+        Provenance::Direct {
+            coverage_permille: 1000,
+            ..
+        }
+    ));
+    assert_eq!(first.findings.len(), 2);
+    assert!(
+        first
+            .findings
+            .iter()
+            .all(|f| f.applicability == Applicability::Current && f.agreeing_models == 2)
+    );
+
+    // Every hunk is on the agenda once, ordered by tier.
+    assert_eq!(packet.agenda.len(), 5);
+    let tiers: Vec<Tier> = packet.agenda.iter().map(|a| a.tier).collect();
+    let mut sorted = tiers.clone();
+    sorted.sort();
+    assert_eq!(tiers, sorted);
+    let tail = packet
+        .agenda
+        .iter()
+        .find(|a| a.hunk.anchor.path.as_str() == "tools/tail.txt")
+        .unwrap();
+    assert!(tail.signals.contains(&Signal::SensitivePath));
+    let added = packet
+        .agenda
+        .iter()
+        .find(|a| a.hunk.header.new_start == 8)
+        .unwrap();
+    assert_eq!(added.provenance, Provenance::Unexplained);
+    assert_eq!(added.tier, Tier::Suspicious);
+    assert_eq!(h.unexplained, 4);
+
+    // The unlocated finding is shown, not dropped.
+    assert_eq!(packet.unattached.len(), 1);
+    assert_eq!(packet.unattached[0].finding.title, "no tests");
+    assert!(packet.approved.is_none());
+}
+
+#[test]
+fn a_packet_for_an_old_head_is_refused() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, files('a'));
+    job.snapshot_of(11, oid('2'), Some(oid('1')), files('a'));
+    let stale = head_diff('1');
+    assert!(job.ledger.views().review_packet(&stale, &cfg()).is_err());
+    assert!(
+        job.ledger
+            .views()
+            .review_packet(&head_diff('2'), &cfg())
+            .is_ok()
+    );
+}
+
+#[test]
+fn the_second_round_is_an_interdiff_with_unaddressed_threads_first() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.snapshot_of(10, oid('1'), None, files('a'));
+    job.review(5, '1', "opus", FINDINGS_2);
+    let anchor = Anchor::Code {
+        tree: oid('1'),
+        path: repo("src/a.rs"),
+        lines: LineRange::new(2, 2).unwrap(),
+    };
+    let thread = Event::ThreadOpened {
+        thread: ThreadId(Id128(1)),
+        comment: CommentId(Id128(100)),
+        anchor,
+        body: "keep the old name".into(),
+    };
+    job.ok(Author::Human, thread);
+    job.ok(
+        Author::Human,
+        decided(1, Some(oid('1')), Decision::RequestChanges),
+    );
+    // The agent produced a new tree but left src/a.rs as it was.
+    job.snapshot_of(11, oid('2'), Some(oid('1')), files('a'));
+
+    let diff = head_diff('2');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    assert_eq!(packet.round, 2);
+    assert_eq!(packet.headline.unaddressed, 1);
+    let first = &packet.agenda[0];
+    assert_eq!(first.hunk.header.new_start, 1);
+    assert!(
+        first
+            .signals
+            .contains(&Signal::Unaddressed(ThreadId(Id128(1))))
+    );
+    assert_eq!(first.tier, Tier::Blocking);
+    assert_eq!(first.threads.len(), 1);
+    assert_eq!(first.threads[0].at, LineRange::new(2, 2));
+    // The old review still holds: the file is byte-identical at head.
+    assert_eq!(first.findings.len(), 1);
+    assert_eq!(
+        first.findings[0].applicability,
+        Applicability::CarriedForward { from: oid('1') }
+    );
+
+    // A hunk the human already decided on, with nothing new about it, is collapsed.
+    let tail = packet
+        .agenda
+        .iter()
+        .find(|a| a.hunk.anchor.path.as_str() == "tools/tail.txt")
+        .unwrap();
+    assert_eq!(tail.tier, Tier::Collapsed);
+    assert_eq!(packet.agenda.last().unwrap().tier, Tier::Collapsed);
+}
+
+#[test]
+fn a_finding_on_a_changed_file_is_not_carried_forward() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, files('a'));
+    job.review(5, '1', "opus", FINDINGS_2);
+    job.snapshot_of(11, oid('2'), Some(oid('1')), files('c'));
+    let diff = head_diff('2');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    assert!(packet.agenda.iter().all(|a| a.findings.is_empty()));
+    assert!(packet.unattached.is_empty());
+    assert!(packet.headline.ai.is_empty());
+}
