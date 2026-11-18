@@ -28,6 +28,14 @@ pub struct Feed {
 }
 
 impl Feed {
+    /// The stamp of the fact handed over last.
+    pub fn last_stamp(&self) -> Stamp {
+        Stamp {
+            wall_ns: self.n,
+            logical: 0,
+        }
+    }
+
     pub fn next_id(&mut self) -> (FactId, Stamp) {
         self.n += 1;
         let id = FactId {
