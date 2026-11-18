@@ -491,3 +491,63 @@ fn blocked_tasks_and_open_leases_are_listed() {
     assert_eq!(g.open_leases, 1);
     assert_eq!(g.share.map(|s| s.get()), Some(0.0));
 }
+
+#[test]
+fn failing_checks_on_the_head_need_attention() {
+    use argus_core::event::{CheckRequest, CheckSpec, LeanMode};
+    use argus_core::ids::RepoPath;
+    let mut job = Job::open();
+    job.snapshot(10, oid('1'));
+    let check = |n: u128, job: &mut Job, out: &str, code: i32| {
+        let request = CheckRequest {
+            tree: oid('1'),
+            base: oid('b'),
+            spec: CheckSpec::Lean {
+                root: RepoPath::parse(&format!("proofs{n}")).unwrap(),
+                mode: LeanMode::LakeBuild,
+            },
+        };
+        job.ok(
+            Author::Policy,
+            Event::RunRequested {
+                run: run(n),
+                purpose: RunPurpose::Check(request),
+            },
+        );
+        job.start(n);
+        let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+        job.feed(n, SourceKind::LeanText, SourceOrigin::Stdout, &lines);
+        job.finish(n, RunOutcome::Exited { code });
+    };
+    let fixture = |name| {
+        std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lean/").to_owned() + name,
+        )
+        .unwrap()
+    };
+    check(20, &mut job, &fixture("sorry.txt"), 0);
+    check(21, &mut job, "error: no such file or directory", 1);
+    let g = job.glance(T);
+    assert_eq!(g.checks, GateState::Red { open: 2 });
+    let kinds: Vec<_> = g
+        .attention
+        .iter()
+        .filter(|a| {
+            matches!(
+                a,
+                Attention::Counterexample { .. } | Attention::ChecksFailing { .. }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            kinds.as_slice(),
+            [
+                Attention::Counterexample { .. },
+                Attention::ChecksFailing { .. }
+            ]
+        ),
+        "{:?}",
+        g.attention
+    );
+}
