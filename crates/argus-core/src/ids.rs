@@ -338,4 +338,7 @@ impl SkillName {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
         ok.then(|| SkillName(s.to_owned()))
     }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }

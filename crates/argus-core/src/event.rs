@@ -721,9 +721,4 @@ impl Event {
 /// Stored payload codec (JSON via argus-json; human-inspectable with `argus raw`).
 /// The author is not in the payload: it is the identity of the log the event lives in.
 /// References to frames use `FactId`'s one text form.
-pub(crate) fn encode(event: &Event) -> Vec<u8> {
-    todo!("not implemented")
-}
-pub(crate) fn decode(bytes: &[u8]) -> Result<Event, argus_json::JsonError> {
-    todo!("not implemented")
-}
+pub(crate) use crate::codec::{decode, encode};

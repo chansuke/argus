@@ -26,6 +26,7 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 
 mod adapters;
+mod codec;
 pub mod diff;
 pub mod event;
 pub mod fact;
