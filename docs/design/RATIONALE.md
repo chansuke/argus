@@ -183,6 +183,8 @@ await api.answer_permission({ request_id: requestId(), job, run, answer: "Allow"
 - Claude Code splits one API message into one record per content block and repeats `usage` in each, growing while it streams (1,450 of 9,378 messages differ between records). `AgentWhat::Usage` is therefore keyed by message id and views keep the latest value; adding them would double-count tokens.
 - About 85% of stored thinking blocks (9,129 of 10,713) have an empty `thinking` and only a signature. The raw view can show that the model thought, but not what, for those turns. Is there a Claude Code setting that keeps the text, or is this a hard limit for feature 5?
 - Observed plans are rare in practice: of 92 local transcripts, one uses `TaskCreate`/`TaskUpdate` and none uses `TodoWrite`. Without a human or self-reported plan, `Progress::share` is 0 for most jobs, which reads as "nothing done". Should Glance show "no plan" instead, which means `share()` returns `Option<Share>`? The same run gave 21,117 timeline items, with 9,830 tool calls closed by their results and 3 left open by interrupted sessions.
+- Branch points: in 92 local transcripts, 114 records have more than one child, and 99 of them are parallel tool calls (a `tool_use` record whose children are the next `tool_use` and the first `tool_result`). `Transcript::branch_points` therefore counts only children that are conversation (prompt, reply, thinking, tool call), which leaves 8. Unverified: whether all 8 are rewinds or regenerated replies.
+- Token totals: every job view over a copy of the same 92 files counted 9,257,869 output tokens, equal to an independent count of the last usage per message per file in Python.
 - Insight prompts over long periods will exceed context. Should they be chunked per job and then merged (two-stage runs)?
 - Should argus reuse tlars' message catalog (`tlars-msg`) through a cross-repo path dependency, or vendor the few TLC codes it needs?
 - Which agent comes next: Codex's real adapter, OpenCode, Gemini, or ACP as a common protocol?
@@ -191,4 +193,4 @@ await api.answer_permission({ request_id: requestId(), job, run, answer: "Allow"
 
 ## Next implementation step
 
-`argus-log`, the ledger, the Claude decoder, and the runs, timeline, progress, and review views are done. Next: `Checks` with the TLC and Lean adapters, then `Transcript` and `JobStats`. Until every view in `JobViews` is implemented, `JobViews::apply` panics, so `review::admit` and `glance` can only be tested through a full ledger after that.
+Every view in `JobViews` folds facts, and `review::admit` is tested through a job ledger. Next: `JobViews::glance` and the review packet (`diff::parse_unified`, `packet`), then `policy::decide` and `plan`, so the host can run a job end to end. `JobStats` checkpoints, `Analytics::slice`, and `Period::parse` wait for the analytics screen.
