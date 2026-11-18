@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::event::*;
-use crate::fact::Fact;
+use crate::fact::{Fact, FactBody};
 use crate::ids::*;
 use crate::source::SourceFamily;
 use crate::views::Projection;
@@ -17,6 +17,8 @@ pub const MAX_ATTEMPTS: u16 = 3;
 pub struct Runs {
     runs: BTreeMap<RunId, RunState>,
     leases: BTreeMap<LeaseId, LeaseState>,
+    /// The agent run requested last (request order, not id order).
+    latest_agent: Option<RunId>,
 }
 
 #[derive(Debug)]
@@ -26,7 +28,6 @@ pub struct RunState {
     pub requested_at: UnixMillis,
     pub attempts: Vec<AttemptState>,
     pub cancel_requested: bool,
-    pub sources: Vec<SourceId>,
     pub artifacts: Vec<ArtifactRef>,
 }
 
@@ -94,19 +95,61 @@ impl Runs {
     }
     /// The job's most recently requested agent run: what a feedback delivery resumes.
     pub fn latest_agent(&self) -> Option<(&RunId, &RunState)> {
-        todo!("not implemented")
+        self.runs.get_key_value(self.latest_agent.as_ref()?)
     }
 
-    /// TODO, per run:
-    /// - no attempts -> Start(0)
-    /// - last attempt unfinished and run not in `live` -> Abandon(last)
-    /// - last attempt Abandoned, purpose.on_interrupt() == Retry, attempts < MAX -> Start(next)
-    /// - cancel_requested and run in `live` -> Kill
+    /// What the host owes, given the runs it is executing right now (`live`; empty after a
+    /// restart). Per run:
+    /// - not live, no attempts, not cancelled -> `Start(0)`
+    /// - not live, last attempt unfinished -> `Abandon(last)`
+    /// - not live, last attempt `Abandoned`, `on_interrupt() == Retry`, fewer than
+    ///   [`MAX_ATTEMPTS`], not cancelled -> `Start(next)`
+    /// - live, cancel requested, last attempt unfinished -> `Kill`
     ///
-    /// Per lease: unclosed and lease.run not in `live` -> Release.
-    /// Deterministic order (BTreeMap), so two calls in a row agree.
+    /// Per lease: unclosed and its run not live -> `Release`. Ordered by id, so two calls
+    /// in a row agree.
     pub fn due(&self, live: &BTreeSet<RunId>) -> Vec<Due> {
-        todo!("not implemented")
+        let mut out = Vec::new();
+        for (run, state) in &self.runs {
+            let last = state.attempts.last();
+            let running = last.is_some_and(|a| a.finished.is_none());
+            if live.contains(run) {
+                if state.cancel_requested && running {
+                    out.push(Due::Kill { run: *run });
+                }
+                continue;
+            }
+            match last {
+                None if !state.cancel_requested => out.push(Due::Start {
+                    run: *run,
+                    attempt: Attempt(0),
+                }),
+                Some(a) if a.finished.is_none() => out.push(Due::Abandon {
+                    run: *run,
+                    attempt: a.attempt,
+                }),
+                Some(AttemptState {
+                    attempt,
+                    finished: Some((_, RunOutcome::Abandoned)),
+                    ..
+                }) if !state.cancel_requested
+                    && state.purpose.on_interrupt() == OnInterrupt::Retry
+                    && state.attempts.len() < usize::from(MAX_ATTEMPTS) =>
+                {
+                    out.push(Due::Start {
+                        run: *run,
+                        attempt: Attempt(attempt.0 + 1),
+                    })
+                }
+                _ => {}
+            }
+        }
+        out.extend(
+            self.unclosed_leases()
+                .filter(|(_, l)| !live.contains(&l.run))
+                .map(|(lease, _)| Due::Release { lease: *lease }),
+        );
+        out
     }
 }
 
@@ -116,8 +159,127 @@ impl Projection for Runs {
     /// Lifecycle comes from authored events; source ids come from log headers at open.
     const READS: &'static [SourceFamily] = &[];
     fn apply(&mut self, fact: &Fact<'_>) -> bool {
-        // TODO: RunRequested -> insert; RunStarted -> push attempt; RunFinished -> close it;
-        //       RunCancelRequested -> flag; Lease* -> leases; ArtifactCaptured -> artifacts.
-        todo!("not implemented")
+        let FactBody::Authored { author, event } = &fact.body else {
+            return false;
+        };
+        let at = fact.at;
+        match event {
+            Event::RunRequested { run, purpose } => {
+                if self.runs.contains_key(run) {
+                    return false;
+                }
+                if let RunPurpose::Agent(_) = purpose {
+                    self.latest_agent = Some(*run);
+                }
+                self.runs.insert(
+                    *run,
+                    RunState {
+                        purpose: purpose.clone(),
+                        requested_by: (*author).clone(),
+                        requested_at: at,
+                        attempts: Vec::new(),
+                        cancel_requested: false,
+                        artifacts: Vec::new(),
+                    },
+                );
+                true
+            }
+            Event::RunStarted { run, attempt, pid } => {
+                let Some(state) = self.runs.get_mut(run) else {
+                    return false;
+                };
+                if state.attempts.iter().any(|a| a.attempt == *attempt) {
+                    return false;
+                }
+                state.attempts.push(AttemptState {
+                    attempt: *attempt,
+                    started_at: at,
+                    pid: *pid,
+                    finished: None,
+                });
+                true
+            }
+            Event::RunFinished {
+                run,
+                attempt,
+                outcome,
+            } => {
+                let found = self
+                    .runs
+                    .get_mut(run)
+                    .and_then(|s| s.attempts.iter_mut().find(|a| a.attempt == *attempt));
+                match found {
+                    Some(a) if a.finished.is_none() => {
+                        a.finished = Some((at, outcome.clone()));
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Event::RunCancelRequested { run } => match self.runs.get_mut(run) {
+                Some(state) if !state.cancel_requested => {
+                    state.cancel_requested = true;
+                    true
+                }
+                _ => false,
+            },
+            Event::LeaseOpened {
+                lease,
+                run,
+                provider,
+                name,
+                ..
+            } => {
+                let state = LeaseState {
+                    run: *run,
+                    provider: provider.clone(),
+                    name: name.clone(),
+                    remote_id: None,
+                    preview_url: None,
+                    closed: None,
+                };
+                self.leases.insert(*lease, state).is_none()
+            }
+            Event::LeaseBound {
+                lease,
+                remote_id,
+                preview_url,
+            } => match self.leases.get_mut(lease) {
+                Some(state) => {
+                    state.remote_id = Some(remote_id.clone());
+                    state.preview_url = preview_url.clone();
+                    true
+                }
+                None => false,
+            },
+            Event::LeaseClosed { lease, how } => match self.leases.get_mut(lease) {
+                Some(state) if state.closed.is_none() => {
+                    state.closed = Some(*how);
+                    true
+                }
+                _ => false,
+            },
+            Event::ArtifactCaptured {
+                run,
+                blob,
+                name,
+                media_type,
+                len,
+                ..
+            } => match self.runs.get_mut(run) {
+                Some(state) => {
+                    state.artifacts.push(ArtifactRef {
+                        blob: *blob,
+                        name: name.clone(),
+                        media_type: media_type.clone(),
+                        len: *len,
+                        fact: fact.id.clone(),
+                    });
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        }
     }
 }
