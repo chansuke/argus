@@ -4,8 +4,11 @@ use argus_json::Json;
 
 use crate::event::{CheckRequest, CheckSpec, LeanMode};
 use crate::ids::FactId;
-use crate::plan::{CommandSpec, PlanEnv};
-use crate::source::{Decoded, LeanMessage, LeanSeverity, Observation};
+use std::path::PathBuf;
+
+use crate::adapters::tlc;
+use crate::plan::{CommandSpec, PlanEnv, Workdir};
+use crate::source::{Decoded, LeanMessage, LeanSeverity, Observation, SourceKind};
 use crate::views::checks::CheckVerdict;
 
 pub(crate) const VERSION: u32 = 1;
@@ -13,15 +16,58 @@ pub(crate) const VERSION: u32 = 1;
 /// `LakeBuild`: `lake build` in `root` (stdout `LeanText`).
 /// `Files`: `lake env lean --json <file>` per file, run sequentially by a wrapper script
 /// (stdout `LeanJson`).
+///
+/// Both run in the package directory, so the paths Lean prints are package-relative
+/// (`Checks::located` adds the root back). `Files` exits with the largest exit code of
+/// its files, so one failing file fails the check.
 pub(crate) fn command(req: &CheckRequest, env: &PlanEnv) -> CommandSpec {
-    let CheckSpec::Lean { mode, .. } = &req.spec else {
+    let CheckSpec::Lean { mode, root } = &req.spec else {
         unreachable!("plan() dispatches Lean only")
     };
-    match mode {
-        LeanMode::LakeBuild => todo!("not implemented"),
-        LeanMode::Files(_) => todo!("not implemented"),
+    let (program, args, vars, stdout) = match mode {
+        LeanMode::LakeBuild => (
+            env.tools.lake.clone(),
+            vec!["build".to_owned()],
+            Vec::new(),
+            SourceKind::LeanText,
+        ),
+        LeanMode::Files(files) => {
+            let mut args = vec!["-c".to_owned(), FILES_SCRIPT.to_owned(), "sh".to_owned()];
+            args.extend(files.iter().map(|f| tlc::relative(Some(root), f)));
+            let lake = (
+                "LAKE".to_owned(),
+                env.tools.lake.to_string_lossy().into_owned(),
+            );
+            (PathBuf::from("sh"), args, vec![lake], SourceKind::LeanJson)
+        }
+    };
+    CommandSpec {
+        program,
+        args,
+        env: vars,
+        workdir: Workdir::Snapshot {
+            tree: req.tree.clone(),
+            base: req.base.clone(),
+        },
+        cwd: Some(root.clone()),
+        stdin: None,
+        stdout,
+        stderr: SourceKind::PlainText,
+        terminal: false,
+        watch: Vec::new(),
+        artifacts: false,
+        timeout: None,
     }
 }
+
+/// `sh -c FILES_SCRIPT sh <file>...`: every file is checked, and the worst exit is kept.
+const FILES_SCRIPT: &str = r#"worst=0
+for f do
+  "$LAKE" env lean --json "$f"
+  code=$?
+  [ "$code" -gt "$worst" ] && worst=$code
+done
+exit "$worst""#;
 
 /// One frame of `lake build` output: `severity: path:line:col: text` plus the lines under
 /// it, as lake 4.35 prints them. Lake's own lines, and diagnostics without a location
