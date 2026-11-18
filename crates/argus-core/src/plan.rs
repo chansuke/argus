@@ -45,6 +45,8 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Workdir,
+    /// A directory inside the workdir to run in (a spec's directory, a Lean package).
+    pub cwd: Option<RepoPath>,
     /// Written to the process and also captured verbatim as a `Stdin` source.
     pub stdin: Option<Vec<u8>>,
     pub stdout: SourceKind,
