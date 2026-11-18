@@ -1,0 +1,45 @@
+diff --git a/logo.png b/logo.png
+index bdc955b..8835708 100644
+Binary files a/logo.png and b/logo.png differ
+diff --git a/src/a.rs b/src/a.rs
+index a82bf91..bbea038 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,5 +1,5 @@
+ line1
+-line2
++line2 changed
+ line3
+ line4
+ line5
+@@ -8,5 +8,6 @@ line7
+ line8
+ line9
+ line10
++  inserted  
+ line11
+ line12
+diff --git a/src/new.rs b/src/new.rs
+new file mode 100644
+index 0000000..f328e4d
+--- /dev/null
++++ b/src/new.rs
+@@ -0,0 +1 @@
++fn main() {}
+diff --git a/tools/old.sh b/tools/old.sh
+deleted file mode 100644
+index 988cd72..0000000
+--- a/tools/old.sh
++++ /dev/null
+@@ -1,2 +0,0 @@
+-gone1
+-gone2
+diff --git a/tools/tail.txt b/tools/tail.txt
+index 20cbb4d..d89bf6c 100644
+--- a/tools/tail.txt
++++ b/tools/tail.txt
+@@ -1 +1 @@
+-no newline
+\ No newline at end of file
++no newline, edited
+\ No newline at end of file
