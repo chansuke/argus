@@ -428,37 +428,11 @@ fn real_transcripts_replay_equal_to_live() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Timeline and progress over every real transcript: nothing panics, every closed call
-/// matches a result, and each agent's plan share stays in range.
-#[derive(Default)]
-struct ScreenViews {
-    timeline: argus_core::views::timeline::Timeline,
-    progress: argus_core::views::progress::Progress,
-}
-
-impl ViewSet for ScreenViews {
-    const KIND: LedgerKind = LedgerKind::Job;
-    fn wants(source: &SourceMeta) -> bool {
-        source.kind.family() == SourceFamily::AgentSession
-    }
-    fn apply(&mut self, fact: &Fact<'_>) {
-        self.timeline.apply(fact);
-        self.progress.apply(fact);
-    }
-    fn admit(&self, _: &Author, _: &Event) -> Result<(), Rejected> {
-        Ok(())
-    }
-    fn take_reads(&self) -> ViewMask {
-        ViewMask::default()
-    }
-    fn stamp(&self, _: ViewMask) -> ViewStamp {
-        ViewStamp::default()
-    }
-}
-
+/// Every job view over every real transcript: nothing panics, every closed call matches a
+/// result, the plan share stays in range, and token totals count each message once.
 #[test]
 #[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]
-fn real_transcripts_fill_the_timeline_and_progress() {
+fn real_transcripts_fill_every_job_view() {
     use argus_core::ids::UnixMillis;
     use argus_core::views::progress::PlanNode;
     use argus_core::views::timeline::{BucketWidth, ItemKind};
@@ -468,7 +442,7 @@ fn real_transcripts_fill_the_timeline_and_progress() {
     let mut files = Vec::new();
     collect_jsonl(Path::new(&root), &mut files);
     files.sort();
-    let mut ledger = Ledger::<ScreenViews>::open(&dir).unwrap();
+    let mut ledger = Ledger::<argus_core::views::JobViews>::open(&dir).unwrap();
     for (i, file) in files.iter().enumerate() {
         let r = run(i as u128 + 1);
         ledger
@@ -483,7 +457,7 @@ fn real_transcripts_fill_the_timeline_and_progress() {
     }
     let views = ledger.views();
     let all: Vec<_> = views
-        .timeline
+        .timeline()
         .range(UnixMillis(i64::MIN), UnixMillis(i64::MAX))
         .collect();
     let calls = all
@@ -497,21 +471,30 @@ fn real_transcripts_fill_the_timeline_and_progress() {
         );
         assert!(matches!(item.kind, ItemKind::ToolCall { ok: Some(_), .. }));
     }
-    let hours = views.timeline.buckets(
+    let hours = views.timeline().buckets(
         BucketWidth::H1,
         UnixMillis(i64::MIN / 2),
         UnixMillis(i64::MAX / 2),
     );
     let plans = views
-        .progress
+        .progress()
         .tree()
         .roots
         .iter()
         .filter(|n| matches!(n, PlanNode::Observed { .. }))
         .count();
-    let share = views.progress.share().map(|s| s.get());
+    let share = views.progress().share().map(|s| s.get());
+    let (mut output, mut runs_with_edits) = (0u64, 0usize);
+    for stats in views.stats().runs.values() {
+        output += stats.hours.values().map(|c| c.output_tokens).sum::<u64>();
+    }
+    for (r, _) in views.runs().iter() {
+        runs_with_edits += usize::from(!views.transcript().thread(r, None).is_empty());
+    }
+    let branches = views.transcript().branch_points().len();
     eprintln!(
-        "{} items, {} calls closed, {} open, {} active hours, {} observed plans, share {share:?}",
+        "{} items, {} calls closed, {} open, {} active hours, {} observed plans, share {share:?}, \
+         {output} output tokens, {runs_with_edits} runs with a thread, {branches} branch points",
         all.len(),
         closed.len(),
         open.len(),
