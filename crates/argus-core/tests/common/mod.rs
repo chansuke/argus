@@ -11,8 +11,8 @@ use argus_core::event::{
 };
 use argus_core::fact::{Fact, FactBody};
 use argus_core::ids::{
-    Attempt, EventId, FactId, Id128, ModelId, RunId, Stamp, TaskKey, ToolCallId, ToolName,
-    UnixMillis,
+    Attempt, EventId, FactId, Id128, ModelId, RecordKey, RunId, Stamp, TaskKey, ToolCallId,
+    ToolName, UnixMillis,
 };
 use argus_core::models::{AgentCli, ModelChoice};
 use argus_core::source::{
@@ -88,6 +88,28 @@ impl Feed {
             },
         };
         (id, view.apply(&fact))
+    }
+
+    /// An agent event carried by record `key` under `parent`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record<P: Projection>(
+        &mut self,
+        view: &mut P,
+        source: &SourceMeta,
+        at: i64,
+        key: &str,
+        parent: Option<&str>,
+        sidechain: bool,
+        what: AgentWhat,
+    ) -> (FactId, bool) {
+        let obs = Observation::Agent(AgentEvent {
+            record: Some(RecordKey(key.into())),
+            parent: parent.map(|p| RecordKey(p.into())),
+            at: Some(UnixMillis(at)),
+            sidechain,
+            what,
+        });
+        self.observed(view, source, at, obs)
     }
 
     pub fn agent<P: Projection>(

@@ -1,4 +1,4 @@
-//! Runs, timeline and progress, fed facts directly: what the Glance and timeline screens show
+//! Runs, timeline, progress, transcript and stats, fed facts directly: what the Glance and timeline screens show
 //! for a given sequence of authored events and observed agent records.
 
 use std::path::PathBuf;
@@ -884,5 +884,319 @@ fn artifacts_and_the_latest_agent_are_kept_per_run() {
         !feed
             .authored(&mut r, T0 + 5, Author::Human, set(1, None, 1, DONE))
             .1
+    );
+}
+
+// ---------------------------------------------------------------- transcript
+
+fn job_opened(worktree: &str) -> Event {
+    use argus_core::event::{JobInfo, JobOrigin};
+    use argus_core::ids::{GitOid, JobId};
+    Event::JobOpened(JobInfo {
+        job: JobId(Id128(1)),
+        title: "fix the gate".into(),
+        repo: PathBuf::from("/w/argus"),
+        base: GitOid::parse(&"b".repeat(40)).unwrap(),
+        target: "main".into(),
+        worktree: PathBuf::from(worktree),
+        group: None,
+        origin: JobOrigin::Launched,
+    })
+}
+
+fn prompt(text: &str) -> AgentWhat {
+    AgentWhat::Prompt { text: text.into() }
+}
+
+fn keys(thread: Vec<&argus_core::ids::RecordKey>) -> Vec<&str> {
+    thread.into_iter().map(|k| k.0.as_str()).collect()
+}
+
+#[test]
+fn a_thread_runs_from_the_root_to_the_runs_latest_record() {
+    use argus_core::views::transcript::Transcript;
+    let mut t = Transcript::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.record(&mut t, &src, T0, "u1", None, false, prompt("fix the gate"));
+    // One assistant record decodes to several facts: they belong to one node.
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 1,
+        "a1",
+        Some("u1"),
+        false,
+        reply("looking"),
+    );
+    let (end, _) = feed.record(
+        &mut t,
+        &src,
+        T0 + 1,
+        "a1",
+        Some("u1"),
+        false,
+        AgentWhat::TurnEnded {
+            stop_reason: Some("end_turn".into()),
+        },
+    );
+    // A subagent's records are not the main thread's leaf.
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 2,
+        "s1",
+        Some("a1"),
+        true,
+        prompt("subtask"),
+    );
+    assert_eq!(keys(t.thread(&run(1), None)), vec!["u1", "a1"]);
+    assert_eq!(
+        keys(t.thread(&run(1), Some(&argus_core::ids::RecordKey("s1".into())))),
+        vec!["u1", "a1", "s1"]
+    );
+    assert_eq!(t.latest_turn_end(&run(1)), Some(&end));
+    assert!(t.thread(&run(9), None).is_empty());
+}
+
+#[test]
+fn a_rewind_is_a_branch_point_and_parallel_tool_calls_are_not() {
+    use argus_core::views::transcript::Transcript;
+    let mut t = Transcript::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.record(&mut t, &src, T0, "u1", None, false, prompt("go"));
+    // Two tool calls in one message: the second call and the first result share a parent.
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 1,
+        "a1",
+        Some("u1"),
+        false,
+        call("t1", "Read"),
+    );
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 2,
+        "a2",
+        Some("a1"),
+        false,
+        call("t2", "Read"),
+    );
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 3,
+        "r1",
+        Some("a1"),
+        false,
+        result("t1", false),
+    );
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 4,
+        "r2",
+        Some("a2"),
+        false,
+        result("t2", false),
+    );
+    assert!(t.branch_points().is_empty());
+    // The human rewinds to `r2` and asks twice.
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 5,
+        "u2",
+        Some("r2"),
+        false,
+        prompt("first try"),
+    );
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 6,
+        "u3",
+        Some("r2"),
+        false,
+        prompt("second try"),
+    );
+    let points: Vec<_> = t
+        .branch_points()
+        .into_iter()
+        .map(|k| k.0.as_str())
+        .collect();
+    assert_eq!(points, vec!["r2"]);
+    assert_eq!(
+        keys(t.thread(&run(1), None)),
+        vec!["u1", "a1", "a2", "r2", "u3"]
+    );
+}
+
+#[test]
+fn a_parent_loop_in_a_transcript_ends_the_thread() {
+    use argus_core::views::transcript::Transcript;
+    let mut t = Transcript::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.record(&mut t, &src, T0, "x", Some("y"), false, prompt("a"));
+    feed.record(&mut t, &src, T0 + 1, "y", Some("x"), false, prompt("b"));
+    let thread = keys(t.thread(&run(1), None));
+    assert_eq!(thread, vec!["x", "y"]);
+}
+
+#[test]
+fn edits_inside_the_worktree_are_kept_in_stamp_order() {
+    use argus_core::source::{FileTouch, TouchHow};
+    use argus_core::views::transcript::{EditHow, Transcript};
+    let mut t = Transcript::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.authored(&mut t, T0, Author::Host, job_opened("/w/jobs/1"));
+    let edit = |touches: Vec<FileTouch>| AgentWhat::ToolCall {
+        call: argus_core::ids::ToolCallId("t".into()),
+        name: ToolName("Edit".into()),
+        input_json: "{}".into(),
+        touches,
+    };
+    let touch = |path: &str, how: TouchHow| FileTouch {
+        path: path.into(),
+        how,
+    };
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 1,
+        "a1",
+        None,
+        false,
+        edit(vec![
+            touch("/w/jobs/1/tools/gate", TouchHow::Inserted(vec![7, 8])),
+            touch("/etc/hosts", TouchHow::Shell),
+        ]),
+    );
+    let first = feed.last_stamp();
+    feed.record(
+        &mut t,
+        &src,
+        T0 + 2,
+        "a2",
+        None,
+        false,
+        edit(vec![touch("src/lib.rs", TouchHow::Shell)]),
+    );
+    let second = feed.last_stamp();
+
+    let all = t.edits_between(None, second);
+    let paths: Vec<_> = all.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec!["tools/gate", "src/lib.rs"]);
+    assert!(matches!(&all[0].how, EditHow::Structured { inserted } if inserted == &vec![7, 8]));
+    assert!(matches!(all[1].how, EditHow::Shell));
+    assert_eq!(all[0].run, run(1));
+    // A revision window is `(after, until]`.
+    assert_eq!(t.edits_between(Some(first), second).len(), 1);
+    assert_eq!(t.edits_between(None, first).len(), 1);
+}
+
+// ---------------------------------------------------------------- stats
+
+#[test]
+fn stats_count_per_run_and_hour_and_never_double_count_usage() {
+    use argus_core::period::HourBucket;
+    use argus_core::views::stats::JobStats;
+    let mut s = JobStats::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.authored(&mut s, T0, Author::Host, job_opened("/w/jobs/1"));
+    feed.authored(&mut s, T0, Author::Human, agent_requested(1));
+    feed.agent(&mut s, &src, T0 + 1, prompt("go"));
+    let usage = |message: &str, input, output| AgentWhat::Usage {
+        message: Some(message.into()),
+        usage: TokenUsage {
+            input,
+            output,
+            cache_read: 100,
+            cache_write: 10,
+        },
+    };
+    // Claude Code repeats a message's usage per content block, growing while it streams.
+    feed.agent(&mut s, &src, T0 + 2, usage("msg_1", 5, 1));
+    feed.agent(&mut s, &src, T0 + 3, usage("msg_1", 5, 40));
+    feed.agent(&mut s, &src, T0 + 4, usage("msg_2", 7, 2));
+    feed.agent(
+        &mut s,
+        &src,
+        T0 + 5,
+        AgentWhat::Reply {
+            text: "done".into(),
+            model: Some(argus_core::ids::ModelId("claude-opus-5-5".into())),
+        },
+    );
+    feed.agent(&mut s, &src, T0 + 6, call("t1", "Bash"));
+    feed.agent(&mut s, &src, T0 + 7, result("t1", true));
+    feed.agent(&mut s, &src, T0 + 3_600_000, call("t2", "Bash"));
+    let wait = AgentWhat::PermissionWait {
+        message: "needs permission".into(),
+    };
+    feed.agent(&mut s, &hook(run(1)), T0 + 3_600_001, wait);
+    let input = Event::RunInput {
+        input: argus_core::ids::InputId(Id128(1)),
+        run: run(1),
+        bytes: b"y\n".to_vec(),
+    };
+    feed.authored(&mut s, T0 + 3_600_002, Author::Human, input);
+
+    assert_eq!(s.job, Some(argus_core::ids::JobId(Id128(1))));
+    let r = &s.runs[&run(1)];
+    assert_eq!(r.cli, Some(AgentCli::Claude));
+    assert_eq!(
+        r.models.iter().map(|m| m.0.as_str()).collect::<Vec<_>>(),
+        vec!["claude-opus-5-5"]
+    );
+    assert_eq!(r.tools[&ToolName("Bash".into())], 2);
+    let first = r.hours[&HourBucket::of(UnixMillis(T0))];
+    assert_eq!(
+        (
+            first.prompts,
+            first.replies,
+            first.tool_calls,
+            first.tool_errors
+        ),
+        (1, 1, 1, 1)
+    );
+    assert_eq!((first.input_tokens, first.output_tokens), (12, 42));
+    assert_eq!(
+        (first.cache_read_tokens, first.cache_write_tokens),
+        (200, 20)
+    );
+    let second = r.hours[&HourBucket::of(UnixMillis(T0 + 3_600_000))];
+    assert_eq!((second.tool_calls, second.human_inputs), (1, 2));
+}
+
+#[test]
+fn a_usage_update_that_arrives_an_hour_later_stays_in_its_messages_hour() {
+    use argus_core::period::HourBucket;
+    use argus_core::views::stats::JobStats;
+    let mut s = JobStats::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    let usage = |output| AgentWhat::Usage {
+        message: Some("msg_1".into()),
+        usage: TokenUsage {
+            output,
+            ..TokenUsage::default()
+        },
+    };
+    feed.agent(&mut s, &src, T0 + 3_599_999, usage(3));
+    feed.agent(&mut s, &src, T0 + 3_600_000, usage(9));
+    let r = &s.runs[&run(1)];
+    assert_eq!(r.hours[&HourBucket::of(UnixMillis(T0))].output_tokens, 9);
+    assert_eq!(
+        r.hours
+            .get(&HourBucket::of(UnixMillis(T0 + 3_600_000)))
+            .map_or(0, |c| c.output_tokens),
+        0
     );
 }
