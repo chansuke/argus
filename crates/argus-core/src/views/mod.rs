@@ -46,7 +46,7 @@ pub trait Projection: Default {
     fn apply(&mut self, fact: &Fact<'_>) -> bool;
 }
 
-fn reads<P: Projection>(source: &SourceMeta) -> bool {
+pub(crate) fn reads<P: Projection>(source: &SourceMeta) -> bool {
     P::READS.contains(&source.kind.family())
 }
 

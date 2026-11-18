@@ -15,9 +15,20 @@ use argus_json::{Json, JsonError, Number};
 use crate::diff::HunkAnchor;
 use crate::event::*;
 use crate::ids::*;
+use crate::ledger::ActorHeader;
 use crate::models::{AgentCli, Effort, ModelChoice};
 use crate::period::Period;
+use crate::source::{SourceKind, SourceMeta, SourceOrigin};
 use crate::views::timeline::{BucketWidth, Window};
+
+pub(crate) fn encode_header(header: &ActorHeader) -> Vec<u8> {
+    argus_json::write(&header.to_json()).into_bytes()
+}
+
+pub(crate) fn decode_header(bytes: &[u8]) -> Result<ActorHeader, JsonError> {
+    let v = argus_json::parse(bytes)?;
+    ActorHeader::from_json(&v).map_err(|what| JsonError { at: 0, what })
+}
 
 pub(crate) fn encode(event: &Event) -> Vec<u8> {
     argus_json::write(&event.to_json()).into_bytes()
@@ -369,9 +380,41 @@ wire_struct! {
     FindingId { fact, index }
     Period { from, to }
     Window { width, start }
+    SourceMeta { id, run, attempt, kind, origin }
 }
 
 wire_enum! {
+    ActorHeader {
+        Author(author),
+        Source(meta),
+    }
+    Author {
+        Human {},
+        Agent(run),
+        Host {},
+        Policy {},
+    }
+    SourceKind {
+        ClaudeTranscript {},
+        ClaudeStreamJson {},
+        ClaudeHook {},
+        CodexRollout {},
+        CodexExec {},
+        Terminal {},
+        TlcTool {},
+        LeanText {},
+        LeanJson {},
+        EasEvents {},
+        PlainText {},
+    }
+    SourceOrigin {
+        Stdout {},
+        Stderr {},
+        Terminal {},
+        Stdin {},
+        File(path),
+        Hook {},
+    }
     Event {
         JobOpened(info),
         RunRequested { run, purpose },
