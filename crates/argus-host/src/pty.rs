@@ -47,7 +47,10 @@ mod tests {
 
     #[test]
     fn arguments_reach_the_program_unchanged() {
-        let (out, code) = run("printf", &["%s|", "a b", "it's", "$HOME", "-x", "", "\"q\""]);
+        let (out, code) = run(
+            "printf",
+            &["%s|", "a b", "it's", "$HOME", "-x", "", "\"q\""],
+        );
         assert_eq!(String::from_utf8_lossy(&out), "a b|it's|$HOME|-x||\"q\"|");
         assert_eq!(code, Some(0));
     }
