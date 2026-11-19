@@ -6,14 +6,22 @@
 
 use std::path::{Path, PathBuf};
 
-/// The program and arguments that run `program args...` under a PTY.
+/// The program and arguments that run `program args...` under a PTY. `script` hands the
+/// command to `sh -c`, so every word is quoted, and `exec` lets the program replace that
+/// shell (a signal to the session reaches the program itself).
 pub(crate) fn wrap(script: &Path, program: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
-    todo!("not implemented")
+    let mut command = format!("exec {}", shell_quote(&program.to_string_lossy()));
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    let args = vec!["-qfec".to_owned(), command, "/dev/null".to_owned()];
+    (script.to_path_buf(), args)
 }
 
 /// One word for `sh -c`: single-quoted, with `'` written as `'\''`.
 fn shell_quote(word: &str) -> String {
-    todo!("not implemented")
+    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
