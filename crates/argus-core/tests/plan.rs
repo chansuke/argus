@@ -30,6 +30,7 @@ fn env() -> PlanEnv {
             tlars: PathBuf::from("/bin/tlars"),
             lake: PathBuf::from("/bin/lake"),
             eas: PathBuf::from("/bin/eas"),
+            script: PathBuf::from("/bin/script"),
         },
         snapshot_deny: SNAPSHOT_DENY.iter().map(|s| s.to_string()).collect(),
     }

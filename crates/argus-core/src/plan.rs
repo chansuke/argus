@@ -146,6 +146,9 @@ pub struct ToolPaths {
     pub lake: PathBuf,
     /// `eas` (eas-cli); authenticated via `eas login` or `EXPO_TOKEN`.
     pub eas: PathBuf,
+    /// util-linux `script`: `script -qfec <command> /dev/null` gives a process a PTY
+    /// without FFI (`CommandSpec::terminal`).
+    pub script: PathBuf,
 }
 
 /// Untracked files a snapshot never stages, on top of git's own ignore rules (secrets an
