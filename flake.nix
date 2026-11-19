@@ -51,6 +51,10 @@
         pkgs.librsvg
       ];
 
+      # The host runs agents under a PTY with util-linux `script -qfec` (BSD `script` on
+      # macOS takes other flags).
+      hostTools = pkgs: pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.util-linux ];
+
       lintTools = pkgs: [
         pkgs.git
         pkgs.ripgrep
@@ -65,7 +69,12 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages =
-            rustTools pkgs ++ formalTools pkgs ++ frontendTools pkgs ++ lintTools pkgs ++ [ pkgs.pkg-config ];
+            rustTools pkgs
+            ++ formalTools pkgs
+            ++ frontendTools pkgs
+            ++ hostTools pkgs
+            ++ lintTools pkgs
+            ++ [ pkgs.pkg-config ];
           buildInputs = tauriLibs pkgs;
         };
       });
