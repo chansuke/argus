@@ -21,6 +21,7 @@ mod handler;
 mod lease;
 mod ledger_thread;
 mod pulse;
+mod pty;
 mod runner;
 mod tail;
 mod transport;
