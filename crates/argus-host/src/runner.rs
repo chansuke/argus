@@ -1,13 +1,20 @@
 //! Executes an `Invocation` and reports back as facts. Knows how to run a process; knows
 //! nothing about any particular tool (that is `argus_core::adapters`, reached via `plan`).
 
+use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::mpsc::Sender;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use argus_core::ids::{Attempt, RunId};
+use argus_core::ids::{Attempt, RunId, SourceId};
+use argus_core::ledger::SourceCursor;
 use argus_core::plan::{CommandSpec, Effect, Invocation, PlanEnv};
+use argus_core::source::{RawFrame, SourceKind, SourceMeta, SourceOrigin};
 
 use crate::ledger_thread::Cmd;
+use crate::pty;
 
 pub(crate) struct Running {
     pub run: RunId,
@@ -59,7 +66,141 @@ pub(crate) fn spawn_capture(
     env: &PlanEnv,
     ledger: &Sender<Cmd>,
 ) -> std::io::Result<std::process::ExitStatus> {
-    todo!("not implemented")
+    let (program, args) = match spec.terminal {
+        true => pty::wrap(&env.tools.script, &spec.program, &spec.args),
+        false => (spec.program.clone(), spec.args.clone()),
+    };
+    let workdir = match &spec.cwd {
+        Some(cwd) => dir.join(cwd.as_str()),
+        None => dir.to_path_buf(),
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(workdir)
+        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // A PTY's input stays open for what the human types (`RunInput`).
+        .stdin(match spec.stdin.is_some() || spec.terminal {
+            true => Stdio::piped(),
+            false => Stdio::null(),
+        });
+
+    // What the process is fed is on record before it is written.
+    let fed = match &spec.stdin {
+        Some(bytes) => {
+            let cursor = open_source(ledger, env, SourceOrigin::Stdin, SourceKind::PlainText)?;
+            let mut framer = SourceKind::PlainText.framer(cursor.resume_at);
+            let mut frames = framer.push(bytes);
+            frames.extend(framer.finish());
+            observe(ledger, cursor.meta.id, frames);
+            Some(bytes.clone())
+        }
+        None => None,
+    };
+    let (out_origin, out_kind) = match spec.terminal {
+        true => (SourceOrigin::Terminal, SourceKind::Terminal),
+        false => (SourceOrigin::Stdout, spec.stdout),
+    };
+    let out = open_source(ledger, env, out_origin, out_kind)?;
+    let err = open_source(ledger, env, SourceOrigin::Stderr, spec.stderr)?;
+
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take();
+    let writer = fed.zip(stdin.take()).map(|(bytes, mut pipe)| {
+        // A thread, so a process that writes before it reads cannot deadlock the host.
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        })
+    });
+    let readers = [
+        pump(child.stdout.take(), out, ledger.clone()),
+        pump(child.stderr.take(), err, ledger.clone()),
+    ];
+
+    let status = match spec.timeout {
+        None => child.wait()?,
+        Some(limit) => {
+            let started = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if started.elapsed() >= limit {
+                    child.kill()?;
+                    break child.wait()?;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    drop(stdin);
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    for reader in readers.into_iter().flatten() {
+        let _ = reader.join();
+    }
+    Ok(status)
+}
+
+fn open_source(
+    ledger: &Sender<Cmd>,
+    env: &PlanEnv,
+    origin: SourceOrigin,
+    kind: SourceKind,
+) -> std::io::Result<SourceCursor> {
+    let meta = SourceMeta {
+        id: SourceMeta::derive_id(env.run, env.attempt, &origin),
+        run: env.run,
+        attempt: env.attempt,
+        kind,
+        origin,
+    };
+    let (reply, answer) = mpsc::channel();
+    let gone = || std::io::Error::other("the ledger thread stopped");
+    ledger
+        .send(Cmd::OpenSource { meta, reply })
+        .map_err(|_| gone())?;
+    answer
+        .recv()
+        .map_err(|_| gone())?
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
+fn observe(ledger: &Sender<Cmd>, source: SourceId, frames: Vec<RawFrame>) {
+    if !frames.is_empty() {
+        // A stopped ledger thread means the host is shutting down; the bytes are lost
+        // with the process, as they would be with a crash.
+        let _ = ledger.send(Cmd::Observe { source, frames });
+    }
+}
+
+/// Reads `stream` to its end, observing complete frames as they arrive.
+fn pump(
+    stream: Option<impl Read + Send + 'static>,
+    cursor: SourceCursor,
+    ledger: Sender<Cmd>,
+) -> Option<JoinHandle<()>> {
+    let mut stream = stream?;
+    Some(std::thread::spawn(move || {
+        let mut framer = cursor.meta.kind.framer(cursor.resume_at);
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => observe(&ledger, cursor.meta.id, framer.push(&buf[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        observe(
+            &ledger,
+            cursor.meta.id,
+            framer.finish().into_iter().collect(),
+        );
+    }))
 }
 
 pub(crate) fn run_effect(effect: Effect, env: &PlanEnv, ledger: &Sender<Cmd>) {
