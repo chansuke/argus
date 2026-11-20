@@ -1391,3 +1391,121 @@ fn snapshots_check_errors_and_run_titles_are_items() {
         ]
     );
 }
+
+// ---------------------------------------------------------------- runs, progress, found by mutation testing
+
+#[test]
+fn a_repeated_finish_cancel_or_lease_close_changes_nothing() {
+    use argus_core::event::{DevicePlatform, LeaseEnd, LeaseProvider};
+    use argus_core::ids::LeaseId;
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    feed.authored(&mut r, T0, Author::Human, agent_requested(1));
+    feed.authored(&mut r, T0 + 1, Author::Host, started(1));
+    assert!(
+        feed.authored(&mut r, T0 + 2, Author::Host, finished(1, 0))
+            .1
+    );
+    assert!(
+        !feed
+            .authored(&mut r, T0 + 3, Author::Host, finished(1, 7))
+            .1
+    );
+    assert_eq!(
+        r.get(&run(1)).unwrap().attempts[0].finished,
+        Some((UnixMillis(T0 + 2), RunOutcome::Exited { code: 0 }))
+    );
+
+    assert!(
+        feed.authored(
+            &mut r,
+            T0 + 4,
+            Author::Human,
+            Event::RunCancelRequested { run: run(1) }
+        )
+        .1
+    );
+    assert!(
+        !feed
+            .authored(
+                &mut r,
+                T0 + 5,
+                Author::Human,
+                Event::RunCancelRequested { run: run(1) }
+            )
+            .1
+    );
+
+    let lease = LeaseId(Id128(7));
+    let opened = Event::LeaseOpened {
+        lease,
+        run: run(1),
+        attempt: Attempt(0),
+        provider: LeaseProvider::EasSimulator {
+            platform: DevicePlatform::Ios,
+        },
+        name: "l".into(),
+    };
+    feed.authored(&mut r, T0 + 6, Author::Host, opened);
+    assert!(
+        feed.authored(
+            &mut r,
+            T0 + 7,
+            Author::Host,
+            Event::LeaseClosed {
+                lease,
+                how: LeaseEnd::Stopped
+            }
+        )
+        .1
+    );
+    assert!(
+        !feed
+            .authored(
+                &mut r,
+                T0 + 8,
+                Author::Host,
+                Event::LeaseClosed {
+                    lease,
+                    how: LeaseEnd::Gone
+                }
+            )
+            .1
+    );
+    assert_eq!(r.lease(&lease).unwrap().closed, Some(LeaseEnd::Stopped));
+}
+
+#[test]
+fn one_agent_s_self_report_does_not_hide_another_agent_s_plan() {
+    let mut p = Progress::default();
+    let mut feed = Feed::default();
+    feed.authored(&mut p, T0, Author::Human, agent_requested(1));
+    feed.authored(&mut p, T0, Author::Human, agent_requested(2));
+    feed.authored(&mut p, T0 + 1, Author::Agent(run(1)), set(1, None, 1, DONE));
+    feed.agent(
+        &mut p,
+        &transcript(run(2)),
+        T0 + 2,
+        todo(&[("x", PlanStatus::Pending)]),
+    );
+    // Run 2's observed plan still counts; run 1 reported for itself only.
+    assert_eq!(p.share().unwrap().get(), 0.5);
+}
+
+#[test]
+fn only_agent_runs_show_what_they_are_doing() {
+    let mut p = Progress::default();
+    let mut feed = Feed::default();
+    let snapshot = Event::RunRequested {
+        run: run(2),
+        purpose: RunPurpose::Snapshot { after: None },
+    };
+    feed.authored(&mut p, T0, Author::Policy, snapshot);
+    feed.authored(&mut p, T0 + 1, Author::Host, started(2));
+    assert!(
+        !feed
+            .authored(&mut p, T0 + 2, Author::Host, finished(2, 0))
+            .1
+    );
+    assert_eq!(p.activities().count(), 0);
+}
