@@ -120,7 +120,13 @@ fn execute(
             }
         }
         Invocation::Leased { .. } => failed("device checks are not supported yet".into()),
-        Invocation::InProcess(Effect::Merge(_)) => failed("merging is not supported yet".into()),
+        Invocation::InProcess(Effect::Merge(approved)) => {
+            let (tree, base) = (approved.tree(), approved.base());
+            match git::merge(&ws.repo, ws.job, tree, base, &ws.target) {
+                Ok(commit) => RunOutcome::Merged { commit },
+                Err(reason) => failed(reason),
+            }
+        }
         Invocation::InProcess(Effect::WriteSkill(_)) => {
             failed("writing skills is not supported yet".into())
         }
