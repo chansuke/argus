@@ -82,3 +82,21 @@ fn an_anchor_depends_on_content_not_position() {
     let other = parse_unified("diff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -3,1 +3,1 @@\n-x\n+y\n");
     assert_ne!(other[0].anchor, at(3, "x", "y"));
 }
+
+/// Anchors are stored in snapshots and compared with later ones ("seen in a decided
+/// snapshot"), so the fingerprint may never change: a new hash would unsee every hunk.
+#[test]
+fn a_hunk_fingerprint_is_stable_across_versions() {
+    let hunk =
+        parse_unified("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -3,1 +3,1 @@\n-x\n+y\n").remove(0);
+    assert_eq!(hunk.anchor.fingerprint, 2_677_277_135_115_442_241);
+}
+
+#[test]
+fn a_hunk_that_only_removes_lines_has_no_new_lines() {
+    let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -5,2 +4,0 @@\n-gone\n-also gone\n";
+    let hunk = parse_unified(text).remove(0);
+    assert_eq!(hunk.header.new_start, 4);
+    assert_eq!(hunk.new_lines, None);
+    assert_eq!(hunk.removed_count, 2);
+}
