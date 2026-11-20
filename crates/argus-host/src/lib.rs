@@ -27,16 +27,24 @@ mod runner;
 mod tail;
 mod transport;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use argus_api::{ApiError, Caller};
+use argus_core::Store;
+use argus_core::ids::JobId;
 use argus_core::models::ModelPresets;
 use argus_core::period::UtcOffset;
 use argus_core::plan::ToolPaths;
+use argus_core::plan::{Invocation, PlanEnv};
 use argus_core::policy::PolicyConfig;
 use argus_core::views::packet::PacketConfig;
 use argus_json::Json;
+
+use ledger_thread::{Cmd, Launcher, LedgerHandle};
 
 pub use transport::{PairedDevice, PhoneAccess, PhoneListen, serve_socket, serve_websocket};
 
@@ -74,8 +82,28 @@ pub struct Host {
 }
 
 pub(crate) struct HostInner {
-    // store, config, ledger thread handles by JobId, pulse::Registry (behind a short
-    // mutex: marking dirty never waits on a ledger), git::DiffCache, live run set.
+    pub(crate) config: HostConfig,
+    pub(crate) store: Store,
+    /// One loop per open job: the handle to reach it and the thread that runs it.
+    pub(crate) jobs: Mutex<BTreeMap<JobId, (LedgerHandle, JoinHandle<()>)>>,
+    /// Behind a short mutex: marking dirty never waits on a ledger.
+    pub(crate) registry: Mutex<pulse::Registry>,
+    pub(crate) diffs: git::DiffCache,
+}
+
+/// Starts runs for real: processes, PTYs, in-process effects.
+pub(crate) struct ProcessLauncher;
+
+impl Launcher for ProcessLauncher {
+    fn start(
+        &mut self,
+        inv: Invocation,
+        env: PlanEnv,
+        ws: runner::Workspace,
+        ledger: Sender<Cmd>,
+    ) -> runner::Running {
+        runner::start(inv, env, ws, ledger)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -121,5 +149,170 @@ impl Host {
 
     pub fn shutdown(self) {
         todo!("not implemented")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use argus_core::event::{
+        AgentLaunch, Author, Event, JobInfo, JobOrigin, RunOutcome, RunPurpose,
+    };
+    use argus_core::ids::{Attempt, GitOid, Id128, RunId};
+    use argus_core::models::{AgentCli, ModelChoice, ModelPresets, ModelSet, PresetName};
+    use argus_core::plan::ToolPaths;
+
+    fn scratch() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "argus-hostlib-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    pub(crate) fn config(data_root: PathBuf) -> HostConfig {
+        let opus = ModelChoice {
+            cli: AgentCli::Claude,
+            model: argus_core::ids::ModelId("opus".into()),
+            effort: None,
+        };
+        let name = PresetName::parse("default").unwrap();
+        let presets = ModelPresets::new(
+            BTreeMap::from([(name.clone(), ModelSet::new([opus]).unwrap())]),
+            name,
+        )
+        .unwrap();
+        HostConfig {
+            socket: data_root.join("argus.sock"),
+            data_root,
+            phone: None,
+            tools: ToolPaths {
+                claude: "claude".into(),
+                codex: "codex".into(),
+                java: "java".into(),
+                tla2tools_jar: "tla2tools.jar".into(),
+                tlars: "tlars".into(),
+                lake: "lake".into(),
+                eas: "eas".into(),
+                script: "script".into(),
+            },
+            policy: PolicyConfig::default(),
+            presets,
+            packet: PacketConfig {
+                sensitive: Vec::new(),
+            },
+            snapshot_deny: Vec::new(),
+            retention: Retention {
+                terminal_days: Some(30),
+            },
+            tz: UtcOffset { minutes: 540 },
+        }
+    }
+
+    pub(crate) fn job_info(job: JobId, root: &std::path::Path) -> JobInfo {
+        JobInfo {
+            job,
+            title: "fix the gate".into(),
+            repo: root.join("repo"),
+            base: GitOid::parse(&"b".repeat(40)).unwrap(),
+            target: "main".into(),
+            worktree: root.join("worktree"),
+            group: None,
+            origin: JobOrigin::Launched,
+        }
+    }
+
+    /// A job whose agent was running when the previous host died.
+    fn interrupted_job(root: &std::path::Path, job: JobId, run: RunId) {
+        let store = Store::open(root.to_path_buf()).unwrap();
+        let mut ledger = store.open_job(job).unwrap();
+        ledger
+            .submit(Author::Host, Event::JobOpened(job_info(job, root)))
+            .unwrap();
+        let launch = AgentLaunch {
+            cli: AgentCli::Claude,
+            model: None,
+            prompt: "go".into(),
+            resume: None,
+        };
+        ledger
+            .submit(
+                Author::Human,
+                Event::RunRequested {
+                    run,
+                    purpose: RunPurpose::Agent(launch),
+                },
+            )
+            .unwrap();
+        ledger
+            .submit(
+                Author::Host,
+                Event::RunStarted {
+                    run,
+                    attempt: Attempt(0),
+                    pid: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_restarted_host_abandons_what_was_running_and_knows_its_jobs() {
+        let root = scratch();
+        let (job, run) = (JobId(Id128(7)), RunId(Id128(1)));
+        interrupted_job(&root, job, run);
+        // A directory without a `JobOpened` is skipped, not fatal.
+        Store::open(root.clone())
+            .unwrap()
+            .open_job(JobId(Id128(8)))
+            .unwrap();
+
+        let host = Host::start(config(root.clone())).unwrap();
+        assert!(host.inner.jobs.lock().unwrap().contains_key(&job));
+        host.shutdown();
+
+        let ledger = Store::open(root).unwrap().open_job(job).unwrap();
+        let attempts = &ledger.views().runs().get(&run).unwrap().attempts;
+        assert_eq!(
+            attempts[0].finished.as_ref().map(|f| f.1.clone()),
+            Some(RunOutcome::Abandoned)
+        );
+        // An agent is not retried: a human decides.
+        assert_eq!(attempts.len(), 1);
+    }
+
+    #[test]
+    fn a_second_host_on_the_same_store_is_refused() {
+        let root = scratch();
+        interrupted_job(&root, JobId(Id128(7)), RunId(Id128(1)));
+        let host = Host::start(config(root.clone())).unwrap();
+        assert!(Host::start(config(root)).is_err());
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_blob_is_found_by_its_job_and_hex_id() {
+        let root = scratch();
+        let job = JobId(Id128(7));
+        interrupted_job(&root, job, RunId(Id128(1)));
+        let host = Host::start(config(root.clone())).unwrap();
+        let hex = "ab".repeat(32);
+        let path = host.blob_path(&job.0.to_string(), &hex).unwrap();
+        assert!(
+            path.starts_with(root.join("jobs").join(job.0.to_string())),
+            "{}",
+            path.display()
+        );
+        assert!(
+            path.ends_with(format!("ab/{}", &hex[2..])),
+            "{}",
+            path.display()
+        );
+        assert_eq!(host.blob_path("not-a-job", &hex), None);
+        assert_eq!(host.blob_path(&job.0.to_string(), "zz"), None);
+        host.shutdown();
     }
 }
