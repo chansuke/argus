@@ -728,4 +728,40 @@ mod tests {
         let (_, previous) = review.expect("a review run was started");
         assert_eq!(previous, Some(oid('1')));
     }
+
+    #[test]
+    fn the_loop_runs_on_its_own_thread_until_told_to_stop() {
+        let launcher = FakeLauncher::default();
+        let (inbox, commands) = mpsc::channel();
+        let ledger = JobLedger::open(&scratch()).unwrap();
+        let job = JobLoop::new(
+            ledger,
+            inbox.clone(),
+            launcher.clone(),
+            cfg(PolicyConfig::default()),
+        );
+        let thread = std::thread::spawn(move || job.run(commands));
+        let (reply, answer) = mpsc::channel();
+        inbox
+            .send(Cmd::Submit {
+                author: Author::Human,
+                event: agent(1),
+                reply,
+            })
+            .unwrap();
+        assert!(matches!(answer.recv().unwrap(), Ok(Submitted::Appended(_))));
+        inbox.send(Cmd::Stop).unwrap();
+        thread.join().unwrap();
+        // The batch that appended the request also started the run.
+        assert_eq!(
+            launcher
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.run)
+                .collect::<Vec<_>>(),
+            vec![run(1)]
+        );
+    }
 }
