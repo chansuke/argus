@@ -4,16 +4,16 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use argus_core::ids::{Attempt, RunId, SourceId};
+use argus_core::ids::{Attempt, RunId};
 use argus_core::ledger::SourceCursor;
 use argus_core::plan::{CommandSpec, Effect, Invocation, PlanEnv};
-use argus_core::source::{RawFrame, SourceKind, SourceMeta, SourceOrigin};
+use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 
-use crate::ledger_thread::Cmd;
+use crate::ledger_thread::{self, Cmd, observe};
 use crate::pty;
 
 pub(crate) struct Running {
@@ -158,23 +158,7 @@ fn open_source(
         kind,
         origin,
     };
-    let (reply, answer) = mpsc::channel();
-    let gone = || std::io::Error::other("the ledger thread stopped");
-    ledger
-        .send(Cmd::OpenSource { meta, reply })
-        .map_err(|_| gone())?;
-    answer
-        .recv()
-        .map_err(|_| gone())?
-        .map_err(|e| std::io::Error::other(format!("{e:?}")))
-}
-
-fn observe(ledger: &Sender<Cmd>, source: SourceId, frames: Vec<RawFrame>) {
-    if !frames.is_empty() {
-        // A stopped ledger thread means the host is shutting down; the bytes are lost
-        // with the process, as they would be with a crash.
-        let _ = ledger.send(Cmd::Observe { source, frames });
-    }
+    ledger_thread::open_source(ledger, meta)
 }
 
 /// Reads `stream` to its end, observing complete frames as they arrive.
@@ -210,51 +194,13 @@ pub(crate) fn run_effect(effect: Effect, env: &PlanEnv, ledger: &Sender<Cmd>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use crate::ledger_thread::testing::{Received, bytes, fake_ledger};
     use std::path::PathBuf;
-    use std::sync::mpsc;
-    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use argus_core::ids::{Id128, SourceId};
-    use argus_core::ledger::SourceCursor;
+    use argus_core::ids::Id128;
     use argus_core::plan::{SNAPSHOT_DENY, ToolPaths, Workdir};
-    use argus_core::source::{RawFrame, SourceKind, SourceMeta, SourceOrigin};
-
-    /// What a fake ledger thread received: per source, its header and stored frames.
-    type Received = BTreeMap<SourceId, (SourceMeta, Vec<Vec<u8>>)>;
-
-    fn fake_ledger() -> (Sender<Cmd>, JoinHandle<Received>) {
-        let (tx, rx) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            let mut got = Received::new();
-            for cmd in rx {
-                match cmd {
-                    Cmd::OpenSource { meta, reply } => {
-                        got.insert(meta.id, (meta.clone(), Vec::new()));
-                        let cursor = SourceCursor {
-                            meta,
-                            resume_at: 0,
-                            last: None,
-                        };
-                        reply.send(Ok(cursor)).unwrap();
-                    }
-                    Cmd::Observe { source, frames } => {
-                        let stored = &mut got.get_mut(&source).expect("observed after open").1;
-                        for frame in frames {
-                            match frame {
-                                RawFrame::Bytes { bytes, .. } => stored.push(bytes),
-                                other => panic!("{other:?}"),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            got
-        });
-        (tx, thread)
-    }
+    use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 
     fn env() -> PlanEnv {
         PlanEnv {
@@ -303,7 +249,7 @@ mod tests {
     fn by_origin(got: &Received, origin: SourceOrigin) -> Option<(SourceKind, Vec<Vec<u8>>)> {
         got.values()
             .find(|(meta, _)| meta.origin == origin)
-            .map(|(meta, frames)| (meta.kind, frames.clone()))
+            .map(|(meta, frames)| (meta.kind, bytes(frames)))
     }
 
     #[test]

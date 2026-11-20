@@ -79,3 +79,79 @@ impl LedgerHandle {
 pub(crate) fn run(ledger: JobLedger, inbox: Receiver<Cmd>, live: BTreeSet<RunId>) {
     todo!("not implemented")
 }
+
+/// Opens (or reopens) a source on the ledger thread and returns where ingestion resumes.
+pub(crate) fn open_source(ledger: &Sender<Cmd>, meta: SourceMeta) -> std::io::Result<SourceCursor> {
+    let (reply, answer) = std::sync::mpsc::channel();
+    let gone = || std::io::Error::other("the ledger thread stopped");
+    ledger
+        .send(Cmd::OpenSource { meta, reply })
+        .map_err(|_| gone())?;
+    answer
+        .recv()
+        .map_err(|_| gone())?
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
+/// Hands frames to the ledger thread. A stopped ledger thread means the host is shutting
+/// down; the frames are lost with the process, as they would be with a crash.
+pub(crate) fn observe(ledger: &Sender<Cmd>, source: SourceId, frames: Vec<RawFrame>) {
+    if !frames.is_empty() {
+        let _ = ledger.send(Cmd::Observe { source, frames });
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc::{self, Sender};
+    use std::thread::JoinHandle;
+
+    use argus_core::ids::SourceId;
+    use argus_core::ledger::SourceCursor;
+    use argus_core::source::{RawFrame, SourceMeta};
+
+    use super::Cmd;
+
+    /// What a fake ledger thread received: per source, its header and stored frames.
+    pub(crate) type Received = BTreeMap<SourceId, (SourceMeta, Vec<RawFrame>)>;
+
+    /// A ledger thread that opens every source fresh and keeps what it is sent.
+    pub(crate) fn fake_ledger() -> (Sender<Cmd>, JoinHandle<Received>) {
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut got = Received::new();
+            for cmd in rx {
+                match cmd {
+                    Cmd::OpenSource { meta, reply } => {
+                        got.insert(meta.id, (meta.clone(), Vec::new()));
+                        let cursor = SourceCursor {
+                            meta,
+                            resume_at: 0,
+                            last: None,
+                        };
+                        reply.send(Ok(cursor)).unwrap();
+                    }
+                    Cmd::Observe { source, frames } => {
+                        let stored = &mut got.get_mut(&source).expect("observed after open").1;
+                        stored.extend(frames);
+                    }
+                    _ => {}
+                }
+            }
+            got
+        });
+        (tx, thread)
+    }
+
+    /// The bytes of every `Bytes` frame, in order.
+    pub(crate) fn bytes(frames: &[RawFrame]) -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                RawFrame::Bytes { bytes, .. } => Some(bytes.clone()),
+                RawFrame::Discontinuity { .. } => None,
+            })
+            .collect()
+    }
+}
