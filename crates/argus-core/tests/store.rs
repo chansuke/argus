@@ -28,7 +28,10 @@ fn jobs_are_found_again_in_id_order_and_open_once() {
     // Something that is not a job is ignored.
     std::fs::create_dir_all(root.join("jobs").join("notes")).unwrap();
     std::fs::write(root.join("jobs").join("README"), "").unwrap();
-    assert_eq!(Store::open(root.clone()).unwrap().jobs().unwrap(), vec![b, a]);
+    assert_eq!(
+        Store::open(root.clone()).unwrap().jobs().unwrap(),
+        vec![b, a]
+    );
 
     // Only one host may hold a job.
     assert!(store.open_job(a).is_err());
