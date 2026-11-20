@@ -7,20 +7,24 @@ use argus_api::vm::*;
 use argus_api::{ApiError, Caller, Handler};
 use std::path::PathBuf;
 
+use argus_core::diff::HeadDiff;
 use argus_core::event::{
     AgentLaunch, Anchor, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens,
     RunPurpose, TaskState,
 };
+use argus_core::event::{CheckSpec, DevicePlatform, TlaEngine};
 use argus_core::ids::{
     CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange, ModelId,
-    RepoPath, RunId, SourceId, TaskKey, ThreadId, UnixMillis,
+    RepoPath, RunId, SourceId, TaskKey, ThreadId, TreeOid, UnixMillis,
 };
 use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
+use argus_core::models::{self, ModelChoice};
 use argus_core::source::{PlanStatus, SourceKind};
+use argus_core::views::packet::{self, PacketConfig};
 use argus_core::views::timeline::{BucketWidth, Window};
-use argus_core::views::{GateState, glance, progress, timeline};
+use argus_core::views::{GateState, checks, glance, progress, review, timeline};
 use argus_json::Json;
 use argus_log::{EventId, Seq};
 
@@ -109,6 +113,342 @@ fn anchor(input: AnchorInput) -> Result<Anchor, ApiError> {
 }
 
 const RAW_PAGE_MAX: u16 = 500;
+const REVIEW_TRIES: usize = 3;
+
+/// `None` when `diff` is not of the current head (it moved): read again.
+fn review_screen(
+    l: &JobLedger,
+    job: String,
+    diff: Option<&HeadDiff>,
+    cfg: &PacketConfig,
+    now: UnixMillis,
+) -> Option<ReviewScreen> {
+    let views = l.views();
+    let review = views.review();
+    let head_tree = review.head().map(|h| h.snapshot.tree.clone());
+    let mut screen = ReviewScreen {
+        job,
+        state: job_state(views.glance(now).state),
+        base: views
+            .runs()
+            .job()
+            .map(|j| j.base.as_str().to_owned())
+            .unwrap_or_default(),
+        head: None,
+        headline: None,
+        agenda: Vec::new(),
+        unattached: Vec::new(),
+        threads: Vec::new(),
+        reviews: review
+            .reviews()
+            .map(|(run, r)| review_card(run, r))
+            .collect(),
+        checks: views
+            .checks()
+            .latest_runs()
+            .map(|(run, c)| check_card(run, c, head_tree.as_ref()))
+            .collect(),
+        window: Vec::new(),
+        drafts: review.feedback(None).len() as u32,
+        can_merge: false,
+    };
+    let Some(diff) = diff else {
+        // No head yet; one that arrived since the first read needs its diff.
+        return head_tree.is_none().then_some(screen);
+    };
+    let packet = views.review_packet(diff, cfg).ok()?;
+    screen.head = Some(HeadRef {
+        tree: packet.head.snapshot.tree.as_str().to_owned(),
+        seq: review.snapshots().len() as u32,
+    });
+    screen.headline = Some(headline(&packet));
+    screen.agenda = packet.agenda.iter().map(agenda_item).collect();
+    screen.unattached = packet.unattached.iter().map(finding_view).collect();
+    screen.threads = packet.loose_threads.iter().map(thread_view).collect();
+    screen.window = packet.window.iter().map(|e| e.fact.to_string()).collect();
+    screen.can_merge = packet.approved.is_some();
+    Some(screen)
+}
+
+fn headline(p: &packet::ReviewPacket<'_>) -> Headline {
+    let h = &p.headline;
+    Headline {
+        round: p.round,
+        files: h.files,
+        added: h.added,
+        removed: h.removed,
+        checks: gate(h.checks),
+        ai: h
+            .ai
+            .iter()
+            .map(|t| AiTally {
+                model: model_pick(&t.model),
+                high: t.by_severity[0],
+                medium: t.by_severity[1],
+                low: t.by_severity[2],
+                nit: t.by_severity[3],
+                unstructured: t.unstructured,
+            })
+            .collect(),
+        pending_reviews: h.pending_reviews,
+        unaddressed: h.unaddressed,
+        unexplained: h.unexplained,
+        withheld: p
+            .head
+            .snapshot
+            .withheld
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect(),
+    }
+}
+
+fn model_pick(m: &ModelChoice) -> ModelPick {
+    ModelPick {
+        agent: agent_wire(m.cli),
+        model: m.model.0.clone(),
+        effort: m.effort.map(|e| match e {
+            models::Effort::Low => Effort::Low,
+            models::Effort::Medium => Effort::Medium,
+            models::Effort::High => Effort::High,
+            models::Effort::Max => Effort::Max,
+        }),
+    }
+}
+
+fn severity(s: review::Severity) -> Severity {
+    match s {
+        review::Severity::High => Severity::High,
+        review::Severity::Medium => Severity::Medium,
+        review::Severity::Low => Severity::Low,
+        review::Severity::Nit => Severity::Nit,
+    }
+}
+
+fn lines(path: &RepoPath, at: LineRange) -> Lines {
+    Lines {
+        path: path.as_str().to_owned(),
+        start: at.start(),
+        end: at.end(),
+    }
+}
+
+fn applicability(a: &packet::Applicability) -> Applicability {
+    match a {
+        packet::Applicability::Current => Applicability::Current {},
+        packet::Applicability::CarriedForward { from } => Applicability::CarriedForward {
+            from_tree: from.as_str().to_owned(),
+        },
+    }
+}
+
+fn facts(f: &[FactId]) -> Vec<String> {
+    f.iter().map(|f| f.to_string()).collect()
+}
+
+fn agenda_item(a: &packet::AgendaItem<'_>) -> AgendaItem {
+    let h = a.hunk;
+    AgendaItem {
+        hunk: HunkView {
+            path: h.anchor.path.as_str().to_owned(),
+            old_start: h.header.old_start,
+            old_len: h.header.old_len,
+            new_start: h.header.new_start,
+            new_len: h.header.new_len,
+            text: h.text.clone(),
+        },
+        tier: match a.tier {
+            packet::Tier::Blocking => Tier::Blocking,
+            packet::Tier::Suspicious => Tier::Suspicious,
+            packet::Tier::Normal => Tier::Normal,
+            packet::Tier::Collapsed => Tier::Collapsed,
+        },
+        signals: a
+            .signals
+            .iter()
+            .map(|s| match s {
+                packet::Signal::CheckFailed { run } => Signal::CheckFailed {
+                    run: run.0.to_string(),
+                },
+                packet::Signal::Finding {
+                    severity: s,
+                    agreeing_models,
+                } => Signal::Finding {
+                    severity: severity(*s),
+                    agreeing_models: *agreeing_models,
+                },
+                packet::Signal::Unaddressed(t) => Signal::Unaddressed {
+                    thread: t.0.to_string(),
+                },
+                packet::Signal::Unexplained => Signal::Unexplained {},
+                packet::Signal::SensitivePath => Signal::SensitivePath {},
+            })
+            .collect(),
+        provenance: match &a.provenance {
+            packet::Provenance::Direct {
+                facts: f,
+                coverage_permille,
+            } => Provenance::Direct {
+                facts: facts(f),
+                coverage_permille: *coverage_permille,
+            },
+            packet::Provenance::ViaShell { facts: f } => Provenance::ViaShell { facts: facts(f) },
+            packet::Provenance::Unexplained => Provenance::Unexplained {},
+        },
+        findings: a.findings.iter().map(finding_view).collect(),
+        threads: a.threads.iter().map(thread_view).collect(),
+    }
+}
+
+fn finding_view(f: &packet::FindingRef<'_>) -> FindingView {
+    let at = match &f.finding.anchor {
+        Some(Anchor::Code {
+            path, lines: at, ..
+        }) => Some(lines(path, *at)),
+        _ => None,
+    };
+    FindingView {
+        id: f.finding.id.to_string(),
+        run: f.run.0.to_string(),
+        model: model_pick(f.model),
+        severity: severity(f.finding.severity),
+        title: f.finding.title.clone(),
+        body: f.finding.body.clone(),
+        at,
+        applicability: applicability(&f.applicability),
+        agreeing_models: f.agreeing_models,
+        dismissed: f.dismissed,
+        promoted: f.promoted,
+    }
+}
+
+fn thread_view(t: &packet::ThreadRef<'_>) -> ThreadView {
+    let code_path = match &t.thread.anchor {
+        Anchor::Code { path, .. } => Some(path),
+        _ => None,
+    };
+    ThreadView {
+        id: t.id.0.to_string(),
+        at: code_path.zip(t.at).map(|(path, at)| lines(path, at)),
+        // A code thread whose lines no longer exist at head.
+        outdated: code_path.is_some() && t.at.is_none(),
+        resolved: t.thread.resolved,
+        unaddressed: t.unaddressed,
+        from_finding: match &t.thread.origin {
+            review::ThreadOrigin::Human => None,
+            review::ThreadOrigin::Promoted(f) => Some(f.to_string()),
+        },
+        comments: t
+            .thread
+            .comments
+            .iter()
+            .map(|c| Comment {
+                id: c.id.0.to_string(),
+                at_ms: c.at.0,
+                body: c.body.clone(),
+                draft: c.sent_by.is_none(),
+            })
+            .collect(),
+    }
+}
+
+fn review_card(run: &RunId, r: &review::ReviewRun) -> ReviewRunCard {
+    ReviewRunCard {
+        run: run.0.to_string(),
+        model: model_pick(&r.spec.llm.model),
+        lens: match r.spec.lens {
+            ReviewLens::General => Lens::General,
+            ReviewLens::Correctness => Lens::Correctness,
+            ReviewLens::Security => Lens::Security,
+            ReviewLens::Tests => Lens::Tests,
+        },
+        tree: r.spec.tree.as_str().to_owned(),
+        state: match &r.output {
+            review::ReviewOutput::Running => ReviewRunState::Running {},
+            review::ReviewOutput::Findings(f) => ReviewRunState::Findings {
+                count: f.len() as u32,
+            },
+            review::ReviewOutput::Unstructured { text, .. } => {
+                ReviewRunState::Unstructured { text: text.clone() }
+            }
+            review::ReviewOutput::Failed { reason } => ReviewRunState::Failed {
+                reason: reason.clone(),
+            },
+        },
+        raw_source: r.sources.first().map(|s| s.0.to_string()),
+    }
+}
+
+fn platform(p: DevicePlatform) -> Platform {
+    match p {
+        DevicePlatform::Ios => Platform::Ios,
+        DevicePlatform::Android => Platform::Android,
+    }
+}
+
+fn check_card(run: &RunId, c: &checks::CheckRun, head: Option<&TreeOid>) -> CheckCard {
+    let tree = &c.request.tree;
+    CheckCard {
+        run: run.0.to_string(),
+        target: match c.request.spec.target() {
+            argus_core::event::CheckTarget::Tla { spec, config } => CheckTarget::Tla {
+                spec: spec.as_str().to_owned(),
+                config: config.map(|c| c.as_str().to_owned()),
+            },
+            argus_core::event::CheckTarget::Lean { root } => CheckTarget::Lean {
+                root: root.as_str().to_owned(),
+            },
+            argus_core::event::CheckTarget::Device {
+                project,
+                platform: p,
+            } => CheckTarget::Device {
+                project: project.as_str().to_owned(),
+                platform: platform(p),
+            },
+        },
+        engine: match &c.request.spec {
+            CheckSpec::Tla { engine, .. } => Some(match engine {
+                TlaEngine::JavaTlc => Engine::JavaTlc,
+                TlaEngine::Tlars => Engine::Tlars,
+            }),
+            _ => None,
+        },
+        tree: tree.as_str().to_owned(),
+        applicability: if head == Some(tree) {
+            Applicability::Current {}
+        } else {
+            Applicability::CarriedForward {
+                from_tree: tree.as_str().to_owned(),
+            }
+        },
+        verdict: c.verdict.as_ref().map(|(_, v)| match v {
+            checks::CheckVerdict::Proved => CheckVerdict::Proved {},
+            checks::CheckVerdict::Holes { sorries } => CheckVerdict::Holes { sorries: *sorries },
+            checks::CheckVerdict::Refuted { summary, trace } => CheckVerdict::Refuted {
+                summary: summary.clone(),
+                trace: facts(trace),
+            },
+            checks::CheckVerdict::Passed => CheckVerdict::Passed {},
+            checks::CheckVerdict::ToolError { summary } => CheckVerdict::ToolError {
+                summary: summary.clone(),
+            },
+            checks::CheckVerdict::Cancelled => CheckVerdict::Cancelled {},
+        }),
+        evidence: c
+            .evidence
+            .iter()
+            .map(|a| Evidence {
+                run: run.0.to_string(),
+                name: a.name.clone(),
+                media_type: a.media_type.clone(),
+                blob: a.blob.hex(),
+                len: a.len.to_string(),
+            })
+            .collect(),
+        // Device previews are served once device checks run.
+        preview_url: None,
+    }
+}
 
 /// The source a frame belongs to, when its actor is a source (`src-<id>`).
 fn source_of(event: &EventId) -> Option<SourceId> {
@@ -680,14 +1020,36 @@ impl Handler for ApiHandler<'_> {
             }
         })
     }
+    /// The review packet as a screen. Two short reads with git between them, so the
+    /// job's sequencer is never held while git runs; a snapshot landing in between
+    /// (`HeadMoved`) starts over.
     fn review(&mut self, caller: &Caller, input: JobRef) -> Result<ReviewScreen, ApiError> {
-        // TODO: two short reads with git between them, on this API thread, so the job's
-        //       sequencer is never held while shelling out:
-        //   1. req = read(|l| l.views().review().diff_request())   (None -> empty screen)
-        //   2. diff = host.diffs.get(repo, &req)                     (memoized, immutable)
-        //   3. read(|l| l.views().review_packet(&diff, &cfg).map(to_screen));
-        //      Err(HeadMoved) -> back to 1 (a newer snapshot landed in between).
-        todo!("not implemented")
+        let (_, handle) = self.job_handle(&input.job)?;
+        let now = now();
+        for _ in 0..REVIEW_TRIES {
+            let (req, repo) = handle.read(&mut Vec::new(), |l| {
+                let views = l.views();
+                (
+                    views.review().diff_request(),
+                    views.runs().job().map(|j| j.repo.clone()),
+                )
+            });
+            let diff = match (req, repo) {
+                (Some(req), Some(repo)) => {
+                    Some(self.host.diffs.get(&repo, &req).map_err(internal)?)
+                }
+                _ => None,
+            };
+            let cfg = self.host.config.packet.clone();
+            let job = input.job.clone();
+            let screen = handle.read(&mut self.deps, move |l| {
+                review_screen(l, job, diff.as_deref(), &cfg, now)
+            });
+            if let Some(screen) = screen {
+                return Ok(screen);
+            }
+        }
+        Err(internal("the head kept moving while the review was read"))
     }
     fn presets(&mut self, caller: &Caller, input: Empty) -> Result<Presets, ApiError> {
         todo!("not implemented")
