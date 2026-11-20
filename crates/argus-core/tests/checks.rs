@@ -566,3 +566,26 @@ fn a_target_depends_only_on_its_own_files() {
         }
     );
 }
+
+#[test]
+fn a_rerun_on_the_same_engine_is_not_a_disagreement() {
+    let mut job = Job::new();
+    let (pass, violated) = (fixture("tlc/pass.out"), fixture("tlc/violated.out"));
+    job.check(
+        1,
+        '1',
+        tla(TlaEngine::JavaTlc),
+        SourceKind::TlcTool,
+        &pass,
+        0,
+    );
+    job.check(
+        2,
+        '1',
+        tla(TlaEngine::JavaTlc),
+        SourceKind::TlcTool,
+        &violated,
+        12,
+    );
+    assert!(job.checks().disagreements().is_empty());
+}
