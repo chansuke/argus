@@ -337,3 +337,24 @@ fn rfc3339_refuses_each_malformed_part() {
         assert_eq!(p(bad), None, "{bad}");
     }
 }
+
+#[test]
+fn a_finding_id_reads_back_from_its_text() {
+    use argus_core::ids::{FactId, FindingId};
+    let finding = FindingId {
+        fact: FactId::parse("src-0f8fad5d-d9cb-469f-a165-70867728950e:12.0").unwrap(),
+        index: 3,
+    };
+    let text = finding.to_string();
+    assert_eq!(text, "src-0f8fad5d-d9cb-469f-a165-70867728950e:12.0#3");
+    assert_eq!(FindingId::parse(&text), Some(finding));
+    for bad in [
+        "",
+        "src-x:1.0",
+        "src-0f8fad5d-d9cb-469f-a165-70867728950e:12.0#",
+        "#3",
+        "a#b",
+    ] {
+        assert_eq!(FindingId::parse(bad), None, "{bad:?}");
+    }
+}

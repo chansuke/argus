@@ -160,6 +160,19 @@ pub struct FindingId {
     pub index: u16,
 }
 
+impl FindingId {
+    /// `<fact>#<index>`, the form the API uses.
+    pub fn parse(s: &str) -> Option<Self> {
+        todo!("not implemented")
+    }
+}
+
+impl std::fmt::Display for FindingId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        todo!("not implemented")
+    }
+}
+
 /// A skill candidate inside an insight run's result.
 pub type CandidateId = FindingId;
 
