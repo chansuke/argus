@@ -25,11 +25,17 @@ use crate::{git, pty, tail};
 pub(crate) struct Running {
     pub run: RunId,
     cancel: Sender<()>,
+    input: Sender<Vec<u8>>,
 }
 
 impl Running {
-    pub(crate) fn new(run: RunId, cancel: Sender<()>) -> Self {
-        Running { run, cancel }
+    pub(crate) fn new(run: RunId, cancel: Sender<()>, input: Sender<Vec<u8>>) -> Self {
+        Running { run, cancel, input }
+    }
+
+    /// Sends what the human typed to the program's terminal.
+    pub(crate) fn send_input(&self, bytes: Vec<u8>) {
+        todo!("not implemented")
     }
 
     /// Asks the run to stop (`RunCancelRequested` reached the host). Idempotent.
@@ -68,11 +74,12 @@ pub(crate) fn start(inv: Invocation, env: PlanEnv, ws: Workspace, ledger: Sender
     let (cancel, cancelled) = mpsc::channel();
     let run = env.run;
     std::thread::spawn(move || {
-        let control = Control {
+        let mut control = Control {
             cancel: cancelled,
             grace: GRACE,
+            input: None,
         };
-        let outcome = execute(inv, &env, &ws, &ledger, &control);
+        let outcome = execute(inv, &env, &ws, &ledger, &mut control);
         let finished = Event::RunFinished {
             run: env.run,
             attempt: env.attempt,
@@ -82,7 +89,8 @@ pub(crate) fn start(inv: Invocation, env: PlanEnv, ws: Workspace, ledger: Sender
         let _ = ledger_thread::submit(&ledger, Author::Host, finished);
         let _ = ledger.send(Cmd::Released { run: env.run });
     });
-    Running { run, cancel }
+    let (input, _) = mpsc::channel();
+    Running { run, cancel, input }
 }
 
 fn execute(
@@ -90,7 +98,7 @@ fn execute(
     env: &PlanEnv,
     ws: &Workspace,
     ledger: &Sender<Cmd>,
-    control: &Control,
+    control: &mut Control,
 ) -> RunOutcome {
     let failed = |reason: String| RunOutcome::Failed { reason };
     match inv {
@@ -121,7 +129,7 @@ fn run_process(
     env: &PlanEnv,
     ws: &Workspace,
     ledger: &Sender<Cmd>,
-    control: &Control,
+    control: &mut Control,
 ) -> RunOutcome {
     // Held until the process ended: dropping it removes the checkout.
     let checkout = match &spec.workdir {
@@ -292,6 +300,9 @@ fn media_type(name: &str) -> &'static str {
 pub(crate) struct Control {
     pub cancel: Receiver<()>,
     pub grace: Duration,
+    /// Bytes the human typed (`RunInput`), for a program on a terminal. Taken by
+    /// `spawn_capture`.
+    pub input: Option<Receiver<Vec<u8>>>,
 }
 
 /// How a captured process ended.
@@ -307,7 +318,7 @@ pub(crate) fn spawn_capture(
     dir: &Path,
     env: &PlanEnv,
     ledger: &Sender<Cmd>,
-    control: &Control,
+    control: &mut Control,
 ) -> std::io::Result<Ended> {
     let (program, args) = match spec.terminal {
         true => pty::wrap(&env.tools.script, &spec.program, &spec.args),
@@ -524,18 +535,23 @@ mod tests {
     }
 
     fn capture(spec: &CommandSpec, dir: &Path) -> (std::process::ExitStatus, Received) {
-        let (_cancel, control) = control(Duration::from_secs(5));
-        let (ended, got) = capture_with(spec, dir, &control);
+        let (_cancel, mut control) = control(Duration::from_secs(5));
+        let (ended, got) = capture_with(spec, dir, &mut control);
         assert!(!ended.cancelled);
         (ended.status, got)
     }
 
     fn control(grace: Duration) -> (Sender<()>, Control) {
         let (tx, cancel) = std::sync::mpsc::channel();
-        (tx, Control { cancel, grace })
+        let control = Control {
+            cancel,
+            grace,
+            input: None,
+        };
+        (tx, control)
     }
 
-    fn capture_with(spec: &CommandSpec, dir: &Path, control: &Control) -> (Ended, Received) {
+    fn capture_with(spec: &CommandSpec, dir: &Path, control: &mut Control) -> (Ended, Received) {
         let (ledger, thread) = fake_ledger();
         let ended = spawn_capture(spec, dir, &env(), &ledger, control).unwrap();
         drop(ledger);
@@ -795,15 +811,39 @@ mod tests {
     const BUSY: &str = "i=0; while [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done";
 
     #[test]
+    fn what_the_human_types_reaches_the_program_on_the_terminal() {
+        let mut spec = sh("read line; echo \"got:$line\"");
+        spec.terminal = true;
+        let (_cancel, mut control) = control(Duration::from_secs(5));
+        let (typed, input) = std::sync::mpsc::channel();
+        control.input = Some(input);
+        // Enter on a terminal is a carriage return.
+        typed.send(b"hello\r".to_vec()).unwrap();
+        let started = Instant::now();
+        let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(ended.status.success());
+        let screen = by_origin(&got, SourceOrigin::Terminal).unwrap().1.concat();
+        assert!(
+            String::from_utf8_lossy(&screen).contains("got:hello"),
+            "{screen:?}"
+        );
+    }
+
+    #[test]
     fn a_cancel_asks_the_process_to_exit_first() {
         let spec = sh(&format!("trap 'echo bye; exit 0' TERM; {BUSY}"));
-        let (cancel, control) = control(Duration::from_secs(5));
+        let (cancel, mut control) = control(Duration::from_secs(5));
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             cancel.send(()).unwrap();
         });
         let started = Instant::now();
-        let (ended, got) = capture_with(&spec, Path::new("/"), &control);
+        let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "{:?}",
@@ -822,13 +862,13 @@ mod tests {
     fn a_cancel_reaches_a_program_on_a_terminal() {
         let mut spec = sh(&format!("trap 'echo bye; exit 0' TERM; {BUSY}"));
         spec.terminal = true;
-        let (cancel, control) = control(Duration::from_secs(5));
+        let (cancel, mut control) = control(Duration::from_secs(5));
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             cancel.send(()).unwrap();
         });
         let started = Instant::now();
-        let (ended, got) = capture_with(&spec, Path::new("/"), &control);
+        let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "{:?}",
@@ -845,14 +885,14 @@ mod tests {
     #[test]
     fn a_process_that_ignores_the_request_is_killed_after_the_grace() {
         let spec = sh(&format!("trap '' TERM; {BUSY}"));
-        let (cancel, control) = control(Duration::from_millis(300));
+        let (cancel, mut control) = control(Duration::from_millis(300));
         // After the shell installed its trap: a signal before that would end it at once.
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             cancel.send(()).unwrap();
         });
         let started = Instant::now();
-        let (ended, _) = capture_with(&spec, Path::new("/"), &control);
+        let (ended, _) = capture_with(&spec, Path::new("/"), &mut control);
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "{:?}",

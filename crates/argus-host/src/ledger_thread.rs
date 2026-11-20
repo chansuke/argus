@@ -418,6 +418,7 @@ mod tests {
         inv: Invocation,
         ws: Workspace,
         cancelled: mpsc::Receiver<()>,
+        typed: mpsc::Receiver<Vec<u8>>,
     }
 
     #[derive(Clone, Default)]
@@ -432,14 +433,16 @@ mod tests {
             _: Sender<Cmd>,
         ) -> Running {
             let (cancel, cancelled) = mpsc::channel();
+            let (input, typed) = mpsc::channel();
             self.0.lock().unwrap().push(Started {
                 run: env.run,
                 attempt: env.attempt,
                 inv,
                 ws,
                 cancelled,
+                typed,
             });
-            Running::new(env.run, cancel)
+            Running::new(env.run, cancel, input)
         }
     }
 
@@ -611,6 +614,32 @@ mod tests {
         job.submit(Author::Human, Event::RunCancelRequested { run: run(1) });
         let launcher = job.launcher.0.lock().unwrap();
         assert!(launcher[0].cancelled.try_recv().is_ok());
+    }
+
+    #[test]
+    fn typed_input_goes_on_record_then_to_the_live_run_once() {
+        use argus_core::ids::InputId;
+        let mut job = Job::open(scratch(), PolicyConfig::default());
+        job.submit(Author::Human, agent(1));
+        let typed = |n: u128, input: u128| Event::RunInput {
+            input: InputId(Id128(input)),
+            run: run(n),
+            bytes: b"y\r".to_vec(),
+        };
+        assert!(matches!(
+            job.submit(Author::Human, typed(1, 7)),
+            Submitted::Appended(_)
+        ));
+        // A retried submission is a duplicate: the agent must not get the keys twice.
+        assert!(matches!(
+            job.submit(Author::Human, typed(1, 7)),
+            Submitted::Duplicate(_)
+        ));
+        // Input for a run that is not executing is recorded and goes nowhere.
+        job.submit(Author::Human, typed(9, 8));
+        let launcher = job.launcher.0.lock().unwrap();
+        let received: Vec<Vec<u8>> = launcher[0].typed.try_iter().collect();
+        assert_eq!(received, vec![b"y\r".to_vec()]);
     }
 
     #[test]
