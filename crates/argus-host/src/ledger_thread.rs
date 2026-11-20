@@ -14,6 +14,7 @@ use argus_core::ledger::{JobLedger, LedgerError, SourceCursor, Submitted};
 use argus_core::plan::{Invocation, PlanEnv, ToolPaths, plan};
 use argus_core::policy::{self, PolicyConfig};
 use argus_core::source::{RawFrame, SourceMeta};
+use argus_core::views::ViewSet;
 use argus_core::views::runs::Due;
 
 use crate::pulse::Dep;
@@ -57,18 +58,52 @@ impl LedgerHandle {
     pub(crate) fn new(tx: Sender<Cmd>, ledger: LedgerRef) -> Self {
         LedgerHandle { tx, ledger }
     }
+    /// `Err(Rejected)` and friends as the ledger said; a stopped loop is an I/O error.
     pub(crate) fn submit(&self, author: Author, event: Event) -> Result<Submitted, LedgerError> {
-        todo!("not implemented")
+        let (reply, answer) = std::sync::mpsc::channel();
+        let gone = || {
+            LedgerError::Log(argus_log::LogError::Io(std::io::Error::other(
+                "the ledger thread stopped",
+            )))
+        };
+        self.tx
+            .send(Cmd::Submit {
+                author,
+                event,
+                reply,
+            })
+            .map_err(|_| gone())?;
+        answer.recv().map_err(|_| gone())?
     }
     /// Runs `f` on the ledger thread and appends what it read to `deps` (subscriptions
     /// keep them; one-shot calls drop them).
-    #[expect(clippy::ptr_arg, reason = "sketch: the body pushes the read's Dep")]
     pub(crate) fn read<T: Send + 'static>(
         &self,
         deps: &mut Vec<Dep>,
         f: impl FnOnce(&JobLedger) -> T + Send + 'static,
     ) -> T {
-        todo!("not implemented")
+        let (reply, answer) = std::sync::mpsc::channel();
+        let at = self.ledger;
+        let read = move |ledger: &JobLedger| {
+            let views = ledger.views();
+            // Reads before this one belong to whoever made them.
+            let _ = views.take_reads();
+            let value = f(ledger);
+            let mask = views.take_reads();
+            let dep = Dep::Views {
+                ledger: at,
+                mask,
+                stamp: views.stamp(mask),
+            };
+            let _ = reply.send((value, dep));
+        };
+        // The loop owns the ledger; if it stopped, the host is going away.
+        self.tx
+            .send(Cmd::Read(Box::new(read)))
+            .expect("the ledger thread outlives its handles");
+        let (value, dep) = answer.recv().expect("the ledger thread answers every read");
+        deps.push(dep);
+        value
     }
     pub(crate) fn sender(&self) -> Sender<Cmd> {
         self.tx.clone()
