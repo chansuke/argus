@@ -154,11 +154,21 @@ pub(crate) fn spawn_capture(
                 let timed_out = spec.timeout.is_some_and(|t| started.elapsed() >= t);
                 if cancel || timed_out {
                     cancelled = cancel;
-                    signal_group(pgid, "TERM");
+                    // On a PTY the program leads its own session under `script`, which
+                    // would only hang it up; ask the program itself.
+                    match spec.terminal {
+                        true => children(pgid)
+                            .into_iter()
+                            .for_each(|c| signal_group(c, "TERM")),
+                        false => signal_group(pgid, "TERM"),
+                    }
                     stopping = Some(Instant::now());
                 }
             }
             Some(since) if since.elapsed() >= control.grace => {
+                children(pgid)
+                    .into_iter()
+                    .for_each(|c| signal_group(c, "KILL"));
                 signal_group(pgid, "KILL");
                 break child.wait()?;
             }
@@ -175,6 +185,16 @@ pub(crate) fn spawn_capture(
         let _ = reader.join();
     }
     Ok(status)
+}
+
+/// Direct children of `pid` (Linux `/proc`); empty once it has none or is gone.
+fn children(pid: u32) -> Vec<u32> {
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|c| c.parse().ok())
+        .collect()
 }
 
 /// `kill -<signal> -<pgid>`: std can only SIGKILL one process, not ask a group to exit.
