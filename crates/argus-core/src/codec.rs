@@ -951,4 +951,14 @@ mod tests {
             assert!(decode(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }
     }
+
+    /// A field stored as `null` is "none", even for a type whose own form has no null.
+    #[test]
+    fn a_null_optional_field_reads_as_none() {
+        let stored = br#"{"Decided":{"decision":"0f8fad5d-d9cb-469f-a165-70867728950e","tree":null,"verdict":"Abandon","note":""}}"#;
+        match decode(stored).unwrap() {
+            Event::Decided { tree, .. } => assert_eq!(tree, None),
+            other => panic!("{other:?}"),
+        }
+    }
 }
