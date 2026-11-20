@@ -173,3 +173,26 @@ pub(crate) fn verdict(messages: &[(FactId, LeanMessage)], exit_code: i32) -> Che
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_severity_lean_writes_is_read() {
+        let severity = |word: &str| {
+            let line = format!(
+                r#"{{"severity":"{word}","fileName":"A.lean","pos":{{"line":1,"column":0}},"data":"d"}}"#
+            );
+            match decode_json(line.as_bytes()).iter().next() {
+                Some(Observation::Lean(m)) => Some(m.severity),
+                _ => None,
+            }
+        };
+        assert_eq!(severity("error"), Some(LeanSeverity::Error));
+        assert_eq!(severity("warning"), Some(LeanSeverity::Warning));
+        assert_eq!(severity("information"), Some(LeanSeverity::Info));
+        assert_eq!(severity("info"), Some(LeanSeverity::Info));
+        assert_eq!(severity("loud"), None);
+    }
+}
