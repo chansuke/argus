@@ -457,7 +457,7 @@ fn children(pid: u32) -> Vec<u32> {
 /// under a mutant that made `children` return `[1]`). Neither, nor this host's own group,
 /// is ever a run's.
 fn may_signal(pgid: u32, own_group: Option<u32>) -> bool {
-    todo!("not implemented")
+    pgid > 1 && Some(pgid) != own_group
 }
 
 /// This process's group (`/proc/self/stat` field 5; the name in field 2 may hold spaces
@@ -467,11 +467,16 @@ fn own_group() -> Option<u32> {
 }
 
 fn parse_pgrp(stat: &str) -> Option<u32> {
-    todo!("not implemented")
+    let (_, after_name) = stat.rsplit_once(')')?;
+    // After the name: state (3), ppid (4), pgrp (5).
+    after_name.split_whitespace().nth(2)?.parse().ok()
 }
 
 /// `kill -<signal> -<pgid>`: std can only SIGKILL one process, not ask a group to exit.
 fn signal_group(pgid: u32, signal: &str) {
+    if !may_signal(pgid, own_group()) {
+        return;
+    }
     let _ = Command::new("kill")
         .arg(format!("-{signal}"))
         .arg("--")
