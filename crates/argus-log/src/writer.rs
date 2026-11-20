@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::frame::{self, FileHead};
 use crate::{ActorKey, LogDir, LogError, Seq, Stamp};
@@ -50,11 +51,7 @@ impl LogWriter {
             .append(true)
             .create(true)
             .open(&path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(LogError::Locked(path)),
-            Err(TryLockError::Error(e)) => return Err(e.into()),
-        }
+        lock(&file, &path)?;
 
         let mut recovery = Recovery::default();
         let len = file.metadata()?.len();
@@ -142,6 +139,26 @@ impl LogWriter {
     }
     pub fn actor(&self) -> &ActorKey {
         &self.actor
+    }
+}
+
+/// How long a held lock is retried before it counts as another writer's.
+const LOCK_WAIT: Duration = Duration::from_millis(200);
+
+/// Takes the exclusive lock. A process forked by this one holds every descriptor until it
+/// execs, so a lock just released by closing a log can look held for a moment; it is
+/// retried briefly. Another writer holds it for good and still gets `Locked`.
+fn lock(file: &File, path: &Path) -> Result<(), LogError> {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(TryLockError::WouldBlock) => return Err(LogError::Locked(path.to_path_buf())),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
     }
 }
 
