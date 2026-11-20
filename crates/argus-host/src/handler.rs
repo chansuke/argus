@@ -5,11 +5,19 @@
 
 use argus_api::vm::*;
 use argus_api::{ApiError, Caller, Handler};
-use argus_core::event::{Decision, ReviewLens};
-use argus_core::models::AgentCli;
+use std::path::PathBuf;
 
-use crate::HostInner;
+use argus_core::event::{
+    AgentLaunch, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens, RunPurpose,
+};
+use argus_core::ids::{Id128, InputId, JobId, ModelId, RunId, UnixMillis};
+use argus_core::ledger::{JobLedger, LedgerError, Submitted};
+use argus_core::models::AgentCli;
+use argus_core::views::{GateState, glance, progress};
+
+use crate::ledger_thread::LedgerHandle;
 use crate::pulse::Dep;
+use crate::{HostInner, git};
 
 pub(crate) struct ApiHandler<'h> {
     host: &'h HostInner,
@@ -30,7 +38,190 @@ impl<'h> ApiHandler<'h> {
 /// `Caller` -> `Author`. Desktop, CLI, and paired phones are `Human`; agents are bound to
 /// their own run and cannot speak as anyone else.
 fn author(caller: &Caller) -> Result<argus_core::event::Author, ApiError> {
-    todo!("not implemented")
+    match caller {
+        Caller::Local | Caller::Phone { .. } => Ok(Author::Human),
+        Caller::Agent { run } => Ok(Author::Agent(RunId(id(run, "caller.run")?))),
+    }
+}
+
+fn id(text: &str, path: &str) -> Result<Id128, ApiError> {
+    Id128::parse(text).ok_or_else(|| ApiError::BadInput {
+        path: path.into(),
+        what: format!("not an id: {text:?}"),
+    })
+}
+
+/// A request id becomes the id of what it creates, so a retried request creates nothing new.
+fn derived(namespace: &str, request_id: &str) -> Id128 {
+    Id128::derive(namespace, request_id.as_bytes())
+}
+
+fn ledger_error(e: LedgerError) -> ApiError {
+    match e {
+        LedgerError::Rejected(Rejected::NotHead { head }) => ApiError::StaleHead {
+            head: head.map(|h| h.as_str().to_owned()),
+        },
+        LedgerError::Rejected(r) => ApiError::Rejected {
+            what: format!("{r:?}"),
+        },
+        other => ApiError::Internal {
+            what: format!("{other:?}"),
+        },
+    }
+}
+
+fn internal(e: impl std::fmt::Display) -> ApiError {
+    ApiError::Internal {
+        what: e.to_string(),
+    }
+}
+
+fn now() -> UnixMillis {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    UnixMillis(since.map_or(0, |d| d.as_millis() as i64))
+}
+
+impl ApiHandler<'_> {
+    fn job_handle(&self, job: &str) -> Result<(JobId, LedgerHandle), ApiError> {
+        let job = JobId(id(job, "job")?);
+        let handle = self.host.job(job).ok_or_else(|| ApiError::NotFound {
+            what: format!("job {}", job.0),
+        })?;
+        Ok((job, handle))
+    }
+
+    fn submit(&self, handle: &LedgerHandle, author: Author, event: Event) -> Result<Ack, ApiError> {
+        match handle.submit(author, event).map_err(ledger_error)? {
+            Submitted::Appended(_) => Ok(Ack { duplicate: false }),
+            Submitted::Duplicate(_) => Ok(Ack { duplicate: true }),
+        }
+    }
+}
+
+// Core -> wire for what the overview shows.
+fn job_state(s: glance::JobState) -> JobState {
+    match s {
+        glance::JobState::Working => JobState::Working {},
+        glance::JobState::AwaitingDecision => JobState::AwaitingDecision {},
+        glance::JobState::ChangesRequested { delivered } => {
+            JobState::ChangesRequested { delivered }
+        }
+        glance::JobState::Approved => JobState::Approved {},
+        glance::JobState::Merging => JobState::Merging {},
+        glance::JobState::Merged => JobState::Merged {},
+        glance::JobState::Abandoned => JobState::Abandoned {},
+    }
+}
+fn gate(g: GateState) -> Gate {
+    match g {
+        GateState::NotConfigured => Gate::NotConfigured {},
+        GateState::Pending => Gate::Pending {},
+        GateState::Green => Gate::Green {},
+        GateState::Red { open } => Gate::Red { open },
+        GateState::Stale => Gate::Stale {},
+    }
+}
+fn activity(a: &progress::Activity) -> Activity {
+    use progress::{Activity as A, WaitReason};
+    match a {
+        A::Starting { since } => Activity::Starting { since_ms: since.0 },
+        A::Thinking { since } => Activity::Thinking { since_ms: since.0 },
+        A::Writing { since } => Activity::Writing { since_ms: since.0 },
+        A::Tool { name, since, call } => Activity::Tool {
+            name: name.0.clone(),
+            since_ms: since.0,
+            fact: call.to_string(),
+        },
+        A::AwaitingHuman { since, why } => Activity::AwaitingHuman {
+            since_ms: since.0,
+            permission: match why {
+                WaitReason::Permission { message } => Some(message.clone()),
+                WaitReason::TurnEnded => None,
+            },
+        },
+        A::Exited { at, ok } => Activity::Exited {
+            at_ms: at.0,
+            ok: *ok,
+        },
+    }
+}
+fn attention(a: &glance::Attention) -> Attention {
+    use glance::Attention as A;
+    match a {
+        A::AwaitingPermission { since, run } => Attention::AwaitingPermission {
+            since_ms: since.0,
+            run: run.0.to_string(),
+        },
+        A::Counterexample { since } => Attention::Counterexample { since_ms: since.0 },
+        A::ChecksFailing { since } => Attention::ChecksFailing { since_ms: since.0 },
+        A::DeliveryFailed { since, decision } => Attention::DeliveryFailed {
+            since_ms: since.0,
+            decision: decision.0.to_string(),
+        },
+        A::AwaitingDecision { since } => Attention::AwaitingDecision { since_ms: since.0 },
+        A::AgentWaiting { since, run } => Attention::AgentWaiting {
+            since_ms: since.0,
+            run: run.0.to_string(),
+        },
+        A::Stalled { since, run } => Attention::Stalled {
+            since_ms: since.0,
+            run: run.0.to_string(),
+        },
+        A::RunFailed { since, run } => Attention::RunFailed {
+            since_ms: since.0,
+            run: run.0.to_string(),
+        },
+    }
+}
+
+/// What one job contributes to the overview, read in one go on its loop.
+struct JobSummary {
+    glance: glance::Glance,
+    card: JobCard,
+}
+
+fn summarize(ledger: &JobLedger, now: UnixMillis) -> Option<JobSummary> {
+    let views = ledger.views();
+    let info = views.runs().job()?.clone();
+    let g = views.glance(now);
+    let staleness: std::collections::BTreeMap<RunId, u32> =
+        views.progress().staleness().map(|(r, n)| (*r, n)).collect();
+    let agents = g
+        .now
+        .iter()
+        .filter_map(|(run, a)| {
+            let RunPurpose::Agent(launch) = &views.runs().get(run)?.purpose else {
+                return None;
+            };
+            Some(AgentNow {
+                run: run.0.to_string(),
+                agent: agent_wire(launch.cli),
+                model: launch.model.as_ref().map(|m| m.0.clone()),
+                activity: activity(a),
+                calls_since_plan_change: staleness.get(run).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    let updated = views
+        .runs()
+        .iter()
+        .map(|(_, r)| r.requested_at.0)
+        .max()
+        .unwrap_or(0);
+    let card = JobCard {
+        job: info.job.0.to_string(),
+        title: info.title.clone(),
+        group: info.group.map(|g| g.to_string()),
+        state: job_state(g.state),
+        share: g.share.map(|s| s.get()),
+        agents,
+        review: gate(g.review),
+        checks: gate(g.checks),
+        open_leases: g.open_leases,
+        attention: g.attention.iter().map(attention).collect(),
+        updated_ms: updated,
+    };
+    Some(JobSummary { glance: g, card })
 }
 
 // Wire <-> core for closed sets. Exhaustive in both directions, so a variant added on
@@ -65,9 +256,31 @@ fn lens(l: Lens) -> ReviewLens {
 
 impl Handler for ApiHandler<'_> {
     fn overview(&mut self, caller: &Caller, input: Empty) -> Result<Overview, ApiError> {
-        // TODO: deps.push(JobSet); per job: read(|l| l.views().glance(now)) -> JobCard;
-        //       queue = views::glance::queue(..) -> QueueEntry.
-        todo!("not implemented")
+        self.deps.push(Dep::JobSet);
+        let now = now();
+        let mut summaries = Vec::new();
+        for job in self.host.job_ids() {
+            let Some(handle) = self.host.job(job) else {
+                continue;
+            };
+            if let Some(summary) = handle.read(&mut self.deps, move |l| summarize(l, now)) {
+                summaries.push((job, summary));
+            }
+        }
+        let titles: std::collections::BTreeMap<JobId, String> = summaries
+            .iter()
+            .map(|(j, s)| (*j, s.card.title.clone()))
+            .collect();
+        let queue = glance::queue(summaries.iter().map(|(j, s)| (*j, &s.glance)))
+            .into_iter()
+            .map(|(job, a)| QueueEntry {
+                job: job.0.to_string(),
+                title: titles[&job].clone(),
+                attention: attention(a),
+            })
+            .collect();
+        let jobs = summaries.into_iter().map(|(_, s)| s.card).collect();
+        Ok(Overview { queue, jobs })
     }
     fn job(&mut self, caller: &Caller, input: JobRef) -> Result<JobPulse, ApiError> {
         todo!("not implemented")
@@ -150,14 +363,74 @@ impl Handler for ApiHandler<'_> {
         //       on the sequencer (NotApproved -> StaleHead).
         todo!("not implemented")
     }
+    /// One job per chosen agent, each in its own worktree of `repo` at `base` (default:
+    /// `HEAD`), merging into the branch checked out there. Several agents share a group,
+    /// for side-by-side comparison. Ids derive from `request_id`, so a retry is harmless.
     fn start_jobs(&mut self, caller: &Caller, input: StartJobs) -> Result<Started, ApiError> {
-        // TODO: per agent choice (fan-out shares a group id derived from request_id):
-        //       git::create_worktree; store.open_job; submit(Host, JobOpened);
-        //       submit(Human, RunRequested{ Agent(AgentLaunch{ cli: agent_cli(..), .. }) }).
-        todo!("not implemented")
+        let author = author(caller)?;
+        let repo = PathBuf::from(&input.repo);
+        let base = git::resolve(&repo, input.base.as_deref().unwrap_or("HEAD")).map_err(|e| {
+            ApiError::BadInput {
+                path: "base".into(),
+                what: e.to_string(),
+            }
+        })?;
+        let target = git::current_branch(&repo).unwrap_or_else(|| "main".into());
+        let group = (input.agents.len() > 1).then(|| derived("group", &input.request_id));
+        let mut jobs = Vec::new();
+        for (i, choice) in input.agents.iter().enumerate() {
+            let job = JobId(derived("job", &format!("{}\0{i}", input.request_id)));
+            let at = self
+                .host
+                .config
+                .data_root
+                .join("worktrees")
+                .join(job.0.to_string());
+            let worktree = git::create_worktree(&repo, &base, job, &at).map_err(internal)?;
+            let info = JobInfo {
+                job,
+                title: input.title.clone(),
+                repo: repo.clone(),
+                base: base.clone(),
+                target: target.clone(),
+                worktree,
+                group,
+                origin: JobOrigin::Launched,
+            };
+            self.host.create_job(info).map_err(internal)?;
+            let handle = self
+                .host
+                .job(job)
+                .ok_or_else(|| internal("the job did not open"))?;
+            let launch = AgentLaunch {
+                cli: agent_cli(choice.agent),
+                model: choice.model.clone().map(ModelId),
+                prompt: input.prompt.clone(),
+                resume: None,
+            };
+            let run = RunId(Id128::derive("agent", &job.0.0.to_le_bytes()));
+            self.submit(
+                &handle,
+                author.clone(),
+                Event::RunRequested {
+                    run,
+                    purpose: RunPurpose::Agent(launch),
+                },
+            )?;
+            jobs.push(job.0.to_string());
+        }
+        Ok(Started { jobs })
     }
+    /// Bytes for the run's terminal, recorded first (`RunInput`), typed once.
     fn send_input(&mut self, caller: &Caller, input: SendInput) -> Result<Ack, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let event = Event::RunInput {
+            input: InputId(derived("input", &input.request_id)),
+            run: RunId(id(&input.run, "run")?),
+            bytes: input.text.into_bytes(),
+        };
+        self.submit(&handle, author, event)
     }
     fn answer_permission(
         &mut self,
@@ -169,7 +442,10 @@ impl Handler for ApiHandler<'_> {
         todo!("not implemented")
     }
     fn cancel_run(&mut self, caller: &Caller, input: RunRef) -> Result<Ack, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let run = RunId(id(&input.run, "run")?);
+        let (_, handle) = self.job_handle(&input.job)?;
+        self.submit(&handle, author, Event::RunCancelRequested { run })
     }
     fn set_task(&mut self, caller: &Caller, input: SetTask) -> Result<TaskSaved, ApiError> {
         // TODO: agent callers may only touch tasks they created or create new ones under
