@@ -137,26 +137,7 @@ pub(crate) fn snapshot(
     }
 
     let message = format!("argus snapshot of job {}", job.0);
-    let identity = [
-        ("GIT_AUTHOR_NAME", OsStr::new("argus")),
-        ("GIT_AUTHOR_EMAIL", OsStr::new("argus@localhost")),
-        ("GIT_COMMITTER_NAME", OsStr::new("argus")),
-        ("GIT_COMMITTER_EMAIL", OsStr::new("argus@localhost")),
-    ];
-    let commit = git(
-        worktree,
-        &[
-            "commit-tree",
-            tree.as_str(),
-            "-p",
-            base.as_str(),
-            "-m",
-            &message,
-        ],
-        &identity,
-        None,
-    )?;
-    let commit = String::from_utf8_lossy(&commit).trim().to_owned();
+    let commit = commit_tree(worktree, &tree, base, &message)?;
     let reference = format!("refs/argus/{}/{}", job.0, tree.as_str());
     git(worktree, &["update-ref", &reference, &commit], &[], None)?;
 
@@ -264,16 +245,79 @@ pub(crate) fn merge(
 
 /// Throwaway checkout of `tree` on top of `base` (detached worktree under the host's
 /// temp dir), removed when the guard drops.
+///
+/// The checkout is a commit of `tree` on `base`, so `git diff <base>` inside it shows the
+/// snapshot's change and nothing the agent did since.
 pub(crate) fn materialize(
     repo: &Path,
     tree: &TreeOid,
     base: &CommitOid,
 ) -> std::io::Result<TempCheckout> {
-    todo!("not implemented")
+    let commit = commit_tree(repo, tree, base, "argus checkout")?;
+    static N: AtomicU32 = AtomicU32::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "argus-checkout-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let target = path.to_string_lossy().into_owned();
+    git(
+        repo,
+        &["worktree", "add", "--quiet", "--detach", &target, &commit],
+        &[],
+        None,
+    )?;
+    Ok(TempCheckout {
+        path,
+        repo: repo.to_path_buf(),
+    })
 }
 
 pub(crate) struct TempCheckout {
     pub path: PathBuf,
+    repo: PathBuf,
+}
+
+impl Drop for TempCheckout {
+    fn drop(&mut self) {
+        let target = self.path.to_string_lossy().into_owned();
+        let removed = git(
+            &self.repo,
+            &["worktree", "remove", "--force", &target],
+            &[],
+            None,
+        );
+        if removed.is_err() {
+            // The worktree is gone or broken: remove the files and forget it.
+            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = git(&self.repo, &["worktree", "prune"], &[], None);
+        }
+    }
+}
+
+/// A commit of `tree` on `base` by argus (no user identity needed), returned as its id.
+fn commit_tree(
+    dir: &Path,
+    tree: &TreeOid,
+    base: &CommitOid,
+    message: &str,
+) -> std::io::Result<String> {
+    let identity = [
+        ("GIT_AUTHOR_NAME", OsStr::new("argus")),
+        ("GIT_AUTHOR_EMAIL", OsStr::new("argus@localhost")),
+        ("GIT_COMMITTER_NAME", OsStr::new("argus")),
+        ("GIT_COMMITTER_EMAIL", OsStr::new("argus@localhost")),
+    ];
+    let args = [
+        "commit-tree",
+        tree.as_str(),
+        "-p",
+        base.as_str(),
+        "-m",
+        message,
+    ];
+    let commit = git(dir, &args, &identity, None)?;
+    Ok(String::from_utf8_lossy(&commit).trim().to_owned())
 }
 
 #[cfg(test)]
