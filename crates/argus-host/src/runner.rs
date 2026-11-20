@@ -767,6 +767,52 @@ mod tests {
     }
 
     #[test]
+    fn artifacts_are_typed_by_extension() {
+        let cases = [
+            ("shot.PNG", "image/png"),
+            ("a.jpg", "image/jpeg"),
+            ("a.jpeg", "image/jpeg"),
+            ("a.gif", "image/gif"),
+            ("a.webp", "image/webp"),
+            ("run.mp4", "video/mp4"),
+            ("run.webm", "video/webm"),
+            ("out.log", "text/plain"),
+            ("a.txt", "text/plain"),
+            ("r.json", "application/json"),
+            ("trace", "application/octet-stream"),
+            ("x.bin", "application/octet-stream"),
+        ];
+        for (name, want) in cases {
+            assert_eq!(media_type(name), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_home_run_runs_in_home_and_its_watched_files_are_followed() {
+        let dir = scratch_dir("home");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        let mut ws = workspace(&dir);
+        ws.home = home.clone();
+        let mut spec = sh("basename \"$PWD\"; printf 'seen\\n' > notes/run.jsonl");
+        spec.workdir = Workdir::Home;
+        spec.watch = vec![argus_core::plan::WatchSpec {
+            pattern: "notes/*.jsonl".into(),
+            kind: SourceKind::ClaudeTranscript,
+        }];
+        let got = run_to_end(Invocation::Process(spec), ws);
+        assert_eq!(
+            by_origin(&got, SourceOrigin::Stdout).unwrap().1.concat(),
+            b"home\n"
+        );
+        let watched = by_origin(&got, SourceOrigin::File(home.join("notes/run.jsonl"))).unwrap();
+        assert_eq!(
+            watched,
+            (SourceKind::ClaudeTranscript, vec![b"seen\n".to_vec()])
+        );
+    }
+
+    #[test]
     fn importing_a_missing_file_fails() {
         let dir = scratch_dir("import-missing");
         let inv = Invocation::InProcess(Effect::Import {
