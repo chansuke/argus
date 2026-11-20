@@ -1110,3 +1110,314 @@ fn a_job_with_nothing_to_judge_can_only_be_abandoned() {
         Err(LedgerError::Rejected(Rejected::NotHead { .. }))
     ));
 }
+
+// ---------------------------------------------------------------- packet, found by mutation testing
+
+/// Three files: two hunks in `src/a.rs` (three added lines at the top; one line replaced at
+/// 12), one in `src/b.rs`, one in a Lean package.
+const SMALL_DIFF: &str = "diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -0,0 +1,3 @@
++one
++two
++three
+@@ -10,1 +12,1 @@
+-old
++new
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1,1 +1,1 @@
+-b
++B
+diff --git a/proofs/A.lean b/proofs/A.lean
+--- a/proofs/A.lean
++++ b/proofs/A.lean
+@@ -1,1 +1,2 @@
+-x
++y
++z
+";
+
+fn small_diff(tree: char) -> HeadDiff {
+    HeadDiff {
+        request: DiffRequest {
+            base: oid('b'),
+            tree: oid(tree),
+        },
+        hunks: parse_unified(SMALL_DIFF),
+    }
+}
+
+fn agenda_line(item: &argus_core::views::packet::AgendaItem<'_>) -> (String, u32) {
+    (
+        item.hunk.anchor.path.as_str().to_owned(),
+        item.hunk.header.new_start,
+    )
+}
+
+fn finding_signals(item: &argus_core::views::packet::AgendaItem<'_>) -> Vec<u16> {
+    item.signals
+        .iter()
+        .filter_map(|s| match s {
+            Signal::Finding {
+                agreeing_models, ..
+            } => Some(*agreeing_models),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_lone_high_finding_is_suspicious_and_two_agreeing_ones_block() {
+    use argus_core::views::packet::tier;
+    use argus_core::views::review::Severity;
+    let high = |agreeing_models| Signal::Finding {
+        severity: Severity::High,
+        agreeing_models,
+    };
+    assert_eq!(tier(&[high(1)], false), Tier::Suspicious);
+    assert_eq!(tier(&[high(2)], false), Tier::Blocking);
+}
+
+#[test]
+fn hunks_of_one_tier_are_ordered_by_how_much_they_change() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, Vec::new());
+    let diff = small_diff('1');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    // All unexplained, so one tier: 3 added beats 2 added, beats 1 added + 1 removed
+    // and 1 + 1 (a product would order them otherwise).
+    let order: Vec<_> = packet.agenda.iter().map(agenda_line).collect();
+    assert_eq!(order[0], ("src/a.rs".to_owned(), 1));
+    assert_eq!(order[1], ("proofs/A.lean".to_owned(), 1));
+    assert!(packet.agenda.iter().all(|a| a.tier == Tier::Suspicious));
+}
+
+#[test]
+fn overlapping_findings_agree_transitively_and_others_stand_alone() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, Vec::new());
+    let at = |path: &str, start: u32, end: u32| {
+        format!(
+            r#"{{"path":"{path}","start":{start},"end":{end},"severity":"high","title":"t","body":""}}"#
+        )
+    };
+    // 1-1 and 3-3 do not overlap, but 1-3 overlaps both: one cluster of three models.
+    job.review(
+        5,
+        '1',
+        "opus",
+        &format!("[{}, {}]", at("src/a.rs", 1, 1), at("src/b.rs", 1, 1)),
+    );
+    job.review(6, '1', "sonnet", &format!("[{}]", at("src/a.rs", 3, 3)));
+    job.review(7, '1', "haiku", &format!("[{}]", at("src/a.rs", 1, 3)));
+    // The same lines in another file are another place.
+    job.review(8, '1', "fable", &format!("[{}]", at("src/c.rs", 1, 1)));
+    let diff = small_diff('1');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    let a = packet
+        .agenda
+        .iter()
+        .find(|i| agenda_line(i) == ("src/a.rs".to_owned(), 1))
+        .unwrap();
+    assert_eq!(finding_signals(a), vec![3, 3, 3]);
+    let b = packet
+        .agenda
+        .iter()
+        .find(|i| agenda_line(i).0 == "src/b.rs")
+        .unwrap();
+    assert_eq!(finding_signals(b), vec![1]);
+    let replaced = packet
+        .agenda
+        .iter()
+        .find(|i| agenda_line(i) == ("src/a.rs".to_owned(), 12))
+        .unwrap();
+    assert!(replaced.findings.is_empty());
+    assert_eq!(packet.unattached.len(), 1);
+    assert_eq!(packet.unattached[0].agreeing_models, 1);
+}
+
+#[test]
+fn a_dismissed_finding_is_shown_but_raises_no_signal() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, Vec::new());
+    job.review(
+        5,
+        '1',
+        "opus",
+        r#"[{"path":"src/b.rs","start":1,"end":1,"severity":"high","title":"t","body":""}]"#,
+    );
+    let finding = {
+        let views = job.ledger.views();
+        let (_, r) = views.review().reviews().next().unwrap();
+        let argus_core::views::review::ReviewOutput::Findings(found) = &r.output else {
+            panic!()
+        };
+        found[0].id.clone()
+    };
+    job.ok(
+        Author::Human,
+        Event::FindingDismissed {
+            finding,
+            dismissed: true,
+        },
+    );
+    let diff = small_diff('1');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    let b = packet
+        .agenda
+        .iter()
+        .find(|i| agenda_line(i).0 == "src/b.rs")
+        .unwrap();
+    assert_eq!(b.findings.len(), 1);
+    assert!(b.findings[0].dismissed);
+    assert!(finding_signals(b).is_empty());
+}
+
+#[test]
+fn only_a_sent_unresolved_thread_whose_lines_survived_is_unaddressed() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, Vec::new());
+    let open = |job: &mut Job, t: u128, path: &str, line: u32| {
+        let anchor = Anchor::Code {
+            tree: oid('1'),
+            path: repo(path),
+            lines: LineRange::new(line, line).unwrap(),
+        };
+        job.ok(
+            Author::Human,
+            Event::ThreadOpened {
+                thread: ThreadId(Id128(t)),
+                comment: CommentId(Id128(t * 100)),
+                anchor,
+                body: format!("thread {t}"),
+            },
+        );
+    };
+    open(&mut job, 1, "src/a.rs", 12);
+    open(&mut job, 2, "src/a.rs", 2);
+    // Outside every hunk: a loose thread.
+    open(&mut job, 3, "src/b.rs", 5);
+    job.ok(
+        Author::Human,
+        decided(1, Some(oid('1')), Decision::RequestChanges),
+    );
+    job.ok(
+        Author::Human,
+        Event::ThreadResolved {
+            thread: ThreadId(Id128(2)),
+            resolved: true,
+        },
+    );
+    // A draft opened after the decision was never sent.
+    open(&mut job, 4, "src/a.rs", 3);
+    job.snapshot_of(11, oid('2'), Some(oid('1')), Vec::new());
+
+    let diff = small_diff('2');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    let unaddressed: Vec<u128> = packet
+        .agenda
+        .iter()
+        .flat_map(|a| &a.threads)
+        .chain(&packet.loose_threads)
+        .filter(|t| t.unaddressed)
+        .map(|t| t.id.0.0)
+        .collect();
+    // Thread 3 is outside every hunk, but its lines survived too: loose and unaddressed.
+    assert_eq!(unaddressed, vec![1, 3]);
+    let loose: Vec<u128> = packet.loose_threads.iter().map(|t| t.id.0.0).collect();
+    assert_eq!(loose, vec![3]);
+    let top = packet
+        .agenda
+        .iter()
+        .find(|i| agenda_line(i) == ("src/a.rs".to_owned(), 1))
+        .unwrap();
+    let mut held: Vec<u128> = top.threads.iter().map(|t| t.id.0.0).collect();
+    held.sort();
+    assert_eq!(held, vec![2, 4]);
+}
+
+#[test]
+fn a_failing_check_on_the_head_marks_the_hunk_it_points_into() {
+    use argus_core::event::{CheckRequest, CheckSpec, LeanMode};
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('0'), None, Vec::new());
+    job.snapshot_of(11, oid('1'), Some(oid('0')), Vec::new());
+    let check = |job: &mut Job, n: u128, tree: char, root: &str, out: &str, code: i32| {
+        let request = CheckRequest {
+            tree: oid(tree),
+            base: oid('b'),
+            spec: CheckSpec::Lean {
+                root: repo(root),
+                mode: LeanMode::LakeBuild,
+            },
+        };
+        job.ok(
+            Author::Policy,
+            Event::RunRequested {
+                run: run(n),
+                purpose: RunPurpose::Check(request),
+            },
+        );
+        job.start(n);
+        let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+        job.feed(n, SourceKind::LeanText, SourceOrigin::Stdout, &lines);
+        job.finish(n, RunOutcome::Exited { code });
+    };
+    let error = "error: A.lean:2:1: unsolved goals";
+    check(&mut job, 20, '1', "proofs", error, 1);
+    // The same message from a check of an older tree, and a check that passed.
+    check(
+        &mut job,
+        21,
+        '0',
+        "other",
+        "error: A.lean:2:1: unsolved goals",
+        1,
+    );
+    check(&mut job, 22, '1', "src", "warning: a.rs:1:1: unused", 0);
+    let diff = small_diff('1');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    let failed: Vec<_> = packet
+        .agenda
+        .iter()
+        .filter(|a| {
+            a.signals
+                .iter()
+                .any(|s| matches!(s, Signal::CheckFailed { .. }))
+        })
+        .map(agenda_line)
+        .collect();
+    assert_eq!(failed, vec![("proofs/A.lean".to_owned(), 1)]);
+    assert_eq!(packet.agenda[0].tier, Tier::Blocking);
+}
+
+#[test]
+fn reviews_still_running_are_counted_not_tallied() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, Vec::new());
+    for (n, name) in [(5, "opus"), (6, "sonnet")] {
+        let spec = ReviewSpec {
+            tree: oid('1'),
+            base: oid('b'),
+            lens: ReviewLens::General,
+            llm: LlmCall {
+                model: model(name),
+                prompt: "review".into(),
+            },
+        };
+        job.ok(
+            Author::Human,
+            Event::RunRequested {
+                run: run(n),
+                purpose: RunPurpose::Review(spec),
+            },
+        );
+    }
+    let diff = small_diff('1');
+    let packet = job.ledger.views().review_packet(&diff, &cfg()).unwrap();
+    assert_eq!(packet.headline.pending_reviews, 2);
+    assert!(packet.headline.ai.is_empty());
+}
