@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Mutation testing with bounded load: cargo-mutants, one job by default, low priority.
+# Each mutant rebuilds and links its crate's tests, and mold uses every core per link,
+# so the limits matter on a workstation. Extra arguments go to cargo-mutants, e.g.
+#   tools/mutants -f crates/argus-host/src/git.rs
+#   tools/mutants -p argus-log --iterate
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+export MOLD_JOBS=1 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" RUST_TEST_THREADS=2
+exec nice -n 15 cargo mutants -j "${MUTANTS_JOBS:-1}" --output "${MUTANTS_OUT:-target/mutants}" "$@"
