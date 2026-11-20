@@ -35,7 +35,8 @@ impl Running {
 
     /// Sends what the human typed to the program's terminal.
     pub(crate) fn send_input(&self, bytes: Vec<u8>) {
-        todo!("not implemented")
+        // A run that already ended has no terminal to type into.
+        let _ = self.input.send(bytes);
     }
 
     /// Asks the run to stop (`RunCancelRequested` reached the host). Idempotent.
@@ -72,12 +73,13 @@ pub(crate) const GRACE: Duration = Duration::from_secs(10);
 ///   as `Failed`, so nothing waits on them forever.
 pub(crate) fn start(inv: Invocation, env: PlanEnv, ws: Workspace, ledger: Sender<Cmd>) -> Running {
     let (cancel, cancelled) = mpsc::channel();
+    let (input, typed) = mpsc::channel();
     let run = env.run;
     std::thread::spawn(move || {
         let mut control = Control {
             cancel: cancelled,
             grace: GRACE,
-            input: None,
+            input: Some(typed),
         };
         let outcome = execute(inv, &env, &ws, &ledger, &mut control);
         let finished = Event::RunFinished {
@@ -89,7 +91,6 @@ pub(crate) fn start(inv: Invocation, env: PlanEnv, ws: Workspace, ledger: Sender
         let _ = ledger_thread::submit(&ledger, Author::Host, finished);
         let _ = ledger.send(Cmd::Released { run: env.run });
     });
-    let (input, _) = mpsc::channel();
     Running { run, cancel, input }
 }
 
@@ -374,6 +375,20 @@ pub(crate) fn spawn_capture(
                 let _ = pipe.write_all(&bytes);
             })
         });
+    // What the human types goes to the terminal as it arrives. The thread holds the
+    // pipe (so the terminal's input stays open) and ends with the run's `Running`.
+    if spec.terminal
+        && let Some(typed) = control.input.take()
+        && let Some(mut pipe) = stdin.take()
+    {
+        std::thread::spawn(move || {
+            for bytes in typed {
+                if pipe.write_all(&bytes).and_then(|()| pipe.flush()).is_err() {
+                    return;
+                }
+            }
+        });
+    }
     let readers = [
         pump(child.stdout.take(), out, ledger.clone()),
         pump(child.stderr.take(), err, ledger.clone()),

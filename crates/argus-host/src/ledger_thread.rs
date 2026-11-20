@@ -122,8 +122,20 @@ impl<L: Launcher> JobLoop<L> {
                 event,
                 reply,
             } => {
+                let typed = match &event {
+                    Event::RunInput { run, bytes, .. } => Some((*run, bytes.clone())),
+                    _ => None,
+                };
                 let result = self.ledger.submit(author, event);
                 let changed = matches!(result, Ok(Submitted::Appended(_)));
+                // Typed bytes reach the program only once they are on record, and a
+                // retried submission (a duplicate) never types them twice.
+                if changed
+                    && let Some((run, bytes)) = typed
+                    && let Some(running) = self.live.get(&run)
+                {
+                    running.send_input(bytes);
+                }
                 let _ = reply.send(result);
                 changed
             }
