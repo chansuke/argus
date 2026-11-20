@@ -3,8 +3,9 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::ExitStatus;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -57,15 +58,31 @@ pub(crate) fn collect_artifacts(
 /// - Under a PTY (`terminal`): the terminal as one `Terminal` source, and `script`'s own
 ///   stderr. Otherwise stdout and stderr, each with its kind.
 ///
-/// Output is framed and observed as it arrives, so the raw log is live. A `timeout`
-/// kills the process. Returns once the process exited and every stream was read to its
-/// end.
+/// Output is framed and observed as it arrives, so the raw log is live. A message on
+/// `control.cancel` or a passed `timeout` stops the process (see [`Control`]). Returns
+/// once the process exited and every stream was read to its end.
+/// How a running process is stopped: SIGTERM first, so an agent can exit cleanly, then
+/// SIGKILL once `grace` has passed.
+pub(crate) struct Control {
+    pub cancel: Receiver<()>,
+    pub grace: Duration,
+}
+
+/// How a captured process ended.
+#[derive(Debug)]
+pub(crate) struct Ended {
+    pub status: ExitStatus,
+    /// It was stopped because of a cancel (not a timeout, not on its own).
+    pub cancelled: bool,
+}
+
 pub(crate) fn spawn_capture(
     spec: &CommandSpec,
     dir: &Path,
     env: &PlanEnv,
     ledger: &Sender<Cmd>,
-) -> std::io::Result<std::process::ExitStatus> {
+    control: &Control,
+) -> std::io::Result<Ended> {
     let (program, args) = match spec.terminal {
         true => pty::wrap(&env.tools.script, &spec.program, &spec.args),
         false => (spec.program.clone(), spec.args.clone()),
@@ -134,6 +151,10 @@ pub(crate) fn spawn_capture(
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+    };
+    let status = Ended {
+        status,
+        cancelled: false,
     };
     drop(stdin);
     if let Some(writer) = writer {
@@ -240,10 +261,66 @@ mod tests {
     }
 
     fn capture(spec: &CommandSpec, dir: &Path) -> (std::process::ExitStatus, Received) {
+        let (_cancel, control) = control(Duration::from_secs(5));
+        let (ended, got) = capture_with(spec, dir, &control);
+        assert!(!ended.cancelled);
+        (ended.status, got)
+    }
+
+    fn control(grace: Duration) -> (Sender<()>, Control) {
+        let (tx, cancel) = std::sync::mpsc::channel();
+        (tx, Control { cancel, grace })
+    }
+
+    fn capture_with(spec: &CommandSpec, dir: &Path, control: &Control) -> (Ended, Received) {
         let (ledger, thread) = fake_ledger();
-        let status = spawn_capture(spec, dir, &env(), &ledger).unwrap();
+        let ended = spawn_capture(spec, dir, &env(), &ledger, control).unwrap();
         drop(ledger);
-        (status, thread.join().unwrap())
+        (ended, thread.join().unwrap())
+    }
+
+    /// Loops for about five seconds unless stopped.
+    const BUSY: &str = "i=0; while [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done";
+
+    #[test]
+    fn a_cancel_asks_the_process_to_exit_first() {
+        let spec = sh(&format!("trap 'echo bye; exit 0' TERM; {BUSY}"));
+        let (cancel, control) = control(Duration::from_secs(5));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel.send(()).unwrap();
+        });
+        let started = Instant::now();
+        let (ended, got) = capture_with(&spec, Path::new("/"), &control);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(ended.cancelled);
+        // It handled SIGTERM itself and exited cleanly.
+        assert_eq!(ended.status.code(), Some(0));
+        assert_eq!(
+            by_origin(&got, SourceOrigin::Stdout).unwrap().1.concat(),
+            b"bye\n"
+        );
+    }
+
+    #[test]
+    fn a_process_that_ignores_the_request_is_killed_after_the_grace() {
+        let spec = sh(&format!("trap '' TERM; {BUSY}"));
+        let (cancel, control) = control(Duration::from_millis(300));
+        cancel.send(()).unwrap();
+        let started = Instant::now();
+        let (ended, _) = capture_with(&spec, Path::new("/"), &control);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(ended.cancelled);
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(ended.status.signal(), Some(9));
     }
 
     fn by_origin(got: &Received, origin: SourceOrigin) -> Option<(SourceKind, Vec<Vec<u8>>)> {
