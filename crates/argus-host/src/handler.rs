@@ -8,11 +8,16 @@ use argus_api::{ApiError, Caller, Handler};
 use std::path::PathBuf;
 
 use argus_core::event::{
-    AgentLaunch, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens, RunPurpose,
+    AgentLaunch, Anchor, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens,
+    RunPurpose,
 };
-use argus_core::ids::{Id128, InputId, JobId, ModelId, RunId, UnixMillis};
+use argus_core::ids::{
+    CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange, ModelId,
+    RepoPath, RunId, TaskKey, ThreadId, UnixMillis,
+};
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
+use argus_core::views::timeline::{BucketWidth, Window};
 use argus_core::views::{GateState, glance, progress};
 
 use crate::ledger_thread::LedgerHandle;
@@ -54,6 +59,53 @@ fn id(text: &str, path: &str) -> Result<Id128, ApiError> {
 /// A request id becomes the id of what it creates, so a retried request creates nothing new.
 fn derived(namespace: &str, request_id: &str) -> Id128 {
     Id128::derive(namespace, request_id.as_bytes())
+}
+
+fn tree(text: &str, path: &str) -> Result<GitOid, ApiError> {
+    GitOid::parse(text).ok_or_else(|| ApiError::BadInput {
+        path: path.into(),
+        what: format!("not a git object id: {text:?}"),
+    })
+}
+
+fn finding(text: &str) -> Result<FindingId, ApiError> {
+    FindingId::parse(text).ok_or_else(|| ApiError::BadInput {
+        path: "finding".into(),
+        what: format!("not a finding id: {text:?}"),
+    })
+}
+
+fn anchor(input: AnchorInput) -> Result<Anchor, ApiError> {
+    let bad = |path: &str, what: String| ApiError::BadInput {
+        path: format!("anchor.{path}"),
+        what,
+    };
+    Ok(match input {
+        AnchorInput::Code {
+            tree: t,
+            path,
+            start,
+            end,
+        } => Anchor::Code {
+            tree: tree(&t, "anchor.tree")?,
+            path: RepoPath::parse(&path)
+                .ok_or_else(|| bad("path", format!("not a path in the repository: {path:?}")))?,
+            lines: LineRange::new(start, end)
+                .ok_or_else(|| bad("start", format!("not a line range: {start}-{end}")))?,
+        },
+        AnchorInput::Task { task } => Anchor::Task(TaskKey(id(&task, "anchor.task")?)),
+        AnchorInput::Fact { fact } => Anchor::Fact(
+            FactId::parse(&fact).ok_or_else(|| bad("fact", format!("not a fact id: {fact:?}")))?,
+        ),
+        AnchorInput::Window { start_ms, width } => Anchor::Window(Window {
+            width: match width {
+                Bucket::M15 => BucketWidth::M15,
+                Bucket::H1 => BucketWidth::H1,
+                Bucket::H4 => BucketWidth::H4,
+            },
+            start: UnixMillis(start_ms),
+        }),
+    })
 }
 
 fn ledger_error(e: LedgerError) -> ApiError {
@@ -323,45 +375,114 @@ impl Handler for ApiHandler<'_> {
     fn request_check(&mut self, caller: &Caller, input: RequestCheck) -> Result<RunRef, ApiError> {
         todo!("not implemented")
     }
+    /// A draft thread; its id and its first comment's derive from `request_id`.
     fn open_thread(&mut self, caller: &Caller, input: OpenThread) -> Result<Ack, ApiError> {
-        // TODO: AnchorInput -> Anchor (GitOid::parse, RepoPath::parse, LineRange::new).
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let event = Event::ThreadOpened {
+            thread: ThreadId(derived("thread", &input.request_id)),
+            comment: CommentId(derived("comment", &input.request_id)),
+            anchor: anchor(input.anchor)?,
+            body: input.body,
+        };
+        self.submit(&handle, author, event)
     }
     fn reply(&mut self, caller: &Caller, input: Reply) -> Result<Ack, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let event = Event::Replied {
+            comment: CommentId(derived("comment", &input.request_id)),
+            thread: ThreadId(id(&input.thread, "thread")?),
+            body: input.body,
+        };
+        self.submit(&handle, author, event)
     }
     fn resolve(&mut self, caller: &Caller, input: Resolve) -> Result<Ack, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let event = Event::ThreadResolved {
+            thread: ThreadId(id(&input.thread, "thread")?),
+            resolved: input.resolved,
+        };
+        self.submit(&handle, author, event)
     }
     fn promote_finding(&mut self, caller: &Caller, input: PromoteFinding) -> Result<Ack, ApiError> {
-        // TODO: submit(Human, FindingPromoted { finding, thread: derive("promote", request_id),
-        //       comment: uuid(request_id) }).
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let event = Event::FindingPromoted {
+            finding: finding(&input.finding)?,
+            thread: ThreadId(derived("promote", &input.request_id)),
+            comment: CommentId(derived("comment", &input.request_id)),
+        };
+        self.submit(&handle, author, event)
     }
     fn dismiss_finding(&mut self, caller: &Caller, input: DismissFinding) -> Result<Ack, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let event = Event::FindingDismissed {
+            finding: finding(&input.finding)?,
+            dismissed: input.dismissed,
+        };
+        self.submit(&handle, author, event)
     }
+    /// Byte-for-byte what a `RequestChanges` now would deliver (the same `render_feedback`
+    /// the policy uses).
     fn preview_feedback(
         &mut self,
         caller: &Caller,
         input: PreviewFeedback,
     ) -> Result<FeedbackText, ApiError> {
-        // TODO: read(|l| l.views().preview_feedback(&note)): the same `render_feedback`
-        //       the policy uses for delivery.
-        todo!("not implemented")
+        let (_, handle) = self.job_handle(&input.job)?;
+        let note = input.note;
+        let (text, comments) = handle.read(&mut self.deps, move |l| {
+            let views = l.views();
+            (
+                views.preview_feedback(&note),
+                views.review().feedback(None).len() as u32,
+            )
+        });
+        Ok(FeedbackText { text, comments })
     }
+    /// A verdict on the tree the human looked at; a newer head refuses it (`StaleHead`).
     fn decide(&mut self, caller: &Caller, input: Decide) -> Result<Ack, ApiError> {
-        // TODO: submit(author, Decided { decision: DecisionId(uuid(request_id)),
-        //       tree: input.tree.map(GitOid::parse), verdict: decision(input.verdict), note }).
-        //       Rejected::NotHead { head } -> ApiError::StaleHead { head }.
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let event = Event::Decided {
+            decision: DecisionId(derived("decision", &input.request_id)),
+            tree: input.tree.as_deref().map(|t| tree(t, "tree")).transpose()?,
+            verdict: decision(input.verdict),
+            note: input.note,
+        };
+        self.submit(&handle, author, event)
     }
+    /// Merges the approved head. Without a current approval of exactly `tree`, `StaleHead`;
+    /// the ledger checks again on the sequencer, so an approval revoked meanwhile fails too.
     fn merge(&mut self, caller: &Caller, input: MergeJob) -> Result<RunRef, ApiError> {
-        // TODO: token = read(|l| l.views().review().approved_head()); none, or
-        //       token.tree() != input.tree -> StaleHead; submit(Human, RunRequested {
-        //       run: derive("merge", tree), purpose: Merge(token) }). The ledger re-checks
-        //       on the sequencer (NotApproved -> StaleHead).
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let wanted = tree(&input.tree, "tree")?;
+        let (token, head) = handle.read(&mut self.deps, |l| {
+            let review = l.views().review();
+            (
+                review.approved_head(),
+                review.head().map(|h| h.snapshot.tree.as_str().to_owned()),
+            )
+        });
+        let stale = || ApiError::StaleHead { head: head.clone() };
+        let token = token.filter(|t| t.tree() == &wanted).ok_or_else(stale)?;
+        let run = RunId(Id128::derive("merge", wanted.as_str().as_bytes()));
+        let request = Event::RunRequested {
+            run,
+            purpose: RunPurpose::Merge(token),
+        };
+        match handle.submit(author, request) {
+            Err(LedgerError::Rejected(Rejected::NotApproved)) => Err(stale()),
+            Err(e) => Err(ledger_error(e)),
+            Ok(_) => Ok(RunRef {
+                job: input.job,
+                run: run.0.to_string(),
+            }),
+        }
     }
     /// One job per chosen agent, each in its own worktree of `repo` at `base` (default:
     /// `HEAD`), merging into the branch checked out there. Several agents share a group,
