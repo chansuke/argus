@@ -532,4 +532,21 @@ mod tests {
         assert!(!path.exists());
         assert!(!git(&dir, &["worktree", "list"]).contains(path.to_str().unwrap()));
     }
+
+    #[test]
+    fn the_delta_groups_each_file_s_hunks_under_that_file() {
+        let (dir, base) = repo();
+        let job = JobId(Id128(1));
+        std::fs::write(dir.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        let first = snapshot(&dir, &base, None, job, &deny()).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\n2\n3\n4\n5\n6\n7\n8\n9\nten\n").unwrap();
+        std::fs::write(dir.join("src/c.txt"), "changed\n").unwrap();
+        let second = snapshot(&dir, &base, Some(&first.tree), job, &deny()).unwrap();
+        let delta: Vec<(&str, usize)> = second
+            .delta
+            .iter()
+            .map(|d| (d.path.as_str(), d.hunks.len()))
+            .collect();
+        assert_eq!(delta, vec![("a.txt", 2), ("src/c.txt", 1)]);
+    }
 }
