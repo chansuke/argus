@@ -1203,4 +1203,122 @@ mod tests {
         assert_eq!(get(&empty, "buckets"), &Json::Arr(vec![]));
         host.shutdown();
     }
+
+    /// Records `lines` as a plain-text source of the job's agent run; returns its id.
+    fn feed_source(host: &Host, job: &str, lines: &[&str]) -> String {
+        use argus_core::ids::{Attempt, Id128, JobId, RunId};
+        use argus_core::source::{RawFrame, SourceKind, SourceMeta, SourceOrigin};
+        let id = JobId(Id128::parse(job).unwrap());
+        let handle = host.inner.job(id).unwrap();
+        let run = RunId(Id128::derive("agent", &id.0.0.to_le_bytes()));
+        let origin = SourceOrigin::Stdin;
+        let meta = SourceMeta {
+            id: SourceMeta::derive_id(run, Attempt(0), &origin),
+            run,
+            attempt: Attempt(0),
+            kind: SourceKind::PlainText,
+            origin,
+        };
+        let source = meta.id;
+        crate::ledger_thread::open_source(&handle.sender(), meta).unwrap();
+        let mut offset = 0;
+        let frames = lines
+            .iter()
+            .map(|l| {
+                let frame = RawFrame::Bytes {
+                    offset,
+                    bytes: l.as_bytes().to_vec(),
+                };
+                offset += l.len() as u64;
+                frame
+            })
+            .collect();
+        crate::ledger_thread::observe(&handle.sender(), source, frames);
+        source.0.to_string()
+    }
+
+    fn records(page: &Json) -> Vec<&str> {
+        let Json::Arr(records) = get(page, "records") else {
+            panic!()
+        };
+        records.iter().map(|r| text(r, &["text"])).collect()
+    }
+
+    #[test]
+    fn the_raw_log_pages_a_source_and_shows_an_authored_event_as_stored() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-raw");
+        let source = feed_source(
+            &host,
+            &job,
+            &["line 0\n", "line 1\n", "line 2\n", "line 3\n", "line 4\n"],
+        );
+        let page = |around: Option<&str>, source: Option<&str>| {
+            let quote = |v: Option<&str>| v.map_or("null".to_owned(), |s| format!("\"{s}\""));
+            let ask = format!(
+                r#"{{"job":"{job}","source":{},"around_fact":{},"limit":2}}"#,
+                quote(source),
+                quote(around)
+            );
+            call(&host, &Caller::Local, "raw", &ask)
+        };
+        // The source is fed through the loop; wait until all of it is stored.
+        for _ in 0..200 {
+            if records(&page(None, Some(&source)).unwrap()).len() == 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let first = page(None, Some(&source)).unwrap();
+        assert_eq!(records(&first), ["line 0\n", "line 1\n"]);
+        let Json::Arr(rs) = get(&first, "records") else {
+            panic!()
+        };
+        assert_eq!(text(&rs[0], &["format"]), "Text");
+        assert_eq!(text(&rs[0], &["source"]), source);
+        assert_eq!(get(&rs[0], "is_utf8"), &Json::Bool(true));
+        assert_eq!(get(&rs[0], "repeat"), &Json::Bool(false));
+        let next = text(&first, &["next"]).to_owned();
+        let second = page(Some(&next), Some(&source)).unwrap();
+        assert_eq!(records(&second), ["line 2\n", "line 3\n"]);
+        // A fact of a source names its source.
+        assert_eq!(
+            records(&page(Some(&next), None).unwrap()),
+            ["line 2\n", "line 3\n"]
+        );
+        let last = page(Some(text(&second, &["next"])), Some(&source)).unwrap();
+        assert_eq!(records(&last), ["line 4\n"]);
+        assert_eq!(get(&last, "next"), &Json::Null);
+
+        let ask =
+            format!(r#"{{"job":"{job}","from_ms":0,"to_ms":9007199254740991,"bucket":null}}"#);
+        let timeline = call(&host, &Caller::Local, "timeline", &ask).unwrap();
+        let Json::Arr(items) = get(&timeline, "items") else {
+            panic!()
+        };
+        let opened = items
+            .iter()
+            .find(|i| text(i, &["lane", "kind"]) == "Host")
+            .unwrap();
+        let fact = text(opened, &["fact"]);
+        let authored = page(Some(fact), None).unwrap();
+        let Json::Arr(rs) = get(&authored, "records") else {
+            panic!()
+        };
+        assert_eq!(rs.len(), 1);
+        assert_eq!(text(&rs[0], &["format"]), "Event");
+        assert_eq!(get(&rs[0], "source"), &Json::Null);
+        assert_eq!(text(&rs[0], &["fact"]), fact);
+        assert!(text(&rs[0], &["text"]).contains("fix the gate"));
+        assert!(matches!(get(&rs[0], "reading"), Json::Obj(_)));
+        assert_eq!(get(&authored, "next"), &Json::Null);
+
+        assert!(matches!(page(None, None), Err(ApiError::BadInput { .. })));
+        let unknown = Some("0f8fad5d-d9cb-469f-a165-70867728950e");
+        assert!(matches!(
+            page(None, unknown),
+            Err(ApiError::NotFound { .. })
+        ));
+        host.shutdown();
+    }
 }
