@@ -211,3 +211,183 @@ impl Handler for ApiHandler<'_> {
         todo!("not implemented")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use argus_api::{ApiError, Caller};
+    use argus_json::{Json, parse};
+
+    use crate::Host;
+
+    fn scratch() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "argus-handler-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A host over a fresh store, and a repository on `main` with one commit.
+    fn host() -> (Host, PathBuf, PathBuf) {
+        let root = scratch();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let host = Host::start(crate::tests::config(root.join("data"))).unwrap();
+        (host, root, repo)
+    }
+
+    fn call(host: &Host, caller: &Caller, op: &str, input: &str) -> Result<Json, ApiError> {
+        host.call(caller, op, &parse(input.as_bytes()).unwrap())
+    }
+
+    fn text<'a>(v: &'a Json, path: &[&str]) -> &'a str {
+        let mut at = v;
+        for key in path {
+            at = at
+                .get(key)
+                .unwrap_or_else(|| panic!("no {key} in {}", argus_json::write(at)));
+        }
+        at.as_str().unwrap()
+    }
+
+    /// Starts one Codex job (Codex cannot run yet, so no process starts) and returns its id.
+    fn start(host: &Host, repo: &Path, request: &str) -> String {
+        let input = format!(
+            r#"{{"request_id":"{request}","repo":"{}","base":null,"title":"fix the gate","prompt":"go","agents":[{{"agent":"Codex","model":null}}]}}"#,
+            repo.display()
+        );
+        let started = call(host, &Caller::Local, "start_jobs", &input).unwrap();
+        let Some(Json::Arr(jobs)) = started.get("jobs") else {
+            panic!("{}", argus_json::write(&started))
+        };
+        assert_eq!(jobs.len(), 1);
+        jobs[0].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn starting_a_job_makes_its_worktree_and_shows_it_in_the_overview() {
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-1");
+        let worktree = root.join("data").join("worktrees").join(&job);
+        assert_eq!(
+            git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            format!("argus/{job}")
+        );
+        assert_eq!(
+            git(&worktree, &["rev-parse", "HEAD"]),
+            git(&repo, &["rev-parse", "main"])
+        );
+        // A retried request is the same job.
+        assert_eq!(start(&host, &repo, "req-1"), job);
+
+        let overview = call(&host, &Caller::Local, "overview", "{}").unwrap();
+        let Some(Json::Arr(cards)) = overview.get("jobs") else {
+            panic!("{}", argus_json::write(&overview))
+        };
+        assert_eq!(cards.len(), 1);
+        assert_eq!(text(&cards[0], &["job"]), job);
+        assert_eq!(text(&cards[0], &["title"]), "fix the gate");
+        assert_eq!(text(&cards[0], &["state", "kind"]), "Working");
+        host.shutdown();
+    }
+
+    #[test]
+    fn typed_input_and_cancels_are_recorded_for_the_run() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-2");
+        let overview = call(&host, &Caller::Local, "overview", "{}").unwrap();
+        let run = {
+            let Some(Json::Arr(cards)) = overview.get("jobs") else {
+                panic!()
+            };
+            let Some(Json::Arr(agents)) = cards[0].get("agents") else {
+                panic!()
+            };
+            text(&agents[0], &["run"]).to_owned()
+        };
+        let input = format!(r#"{{"request_id":"in-1","job":"{job}","run":"{run}","text":"y\r"}}"#);
+        let ack = call(&host, &Caller::Local, "send_input", &input).unwrap();
+        assert_eq!(ack.get("duplicate"), Some(&Json::Bool(false)));
+        let again = call(&host, &Caller::Local, "send_input", &input).unwrap();
+        assert_eq!(again.get("duplicate"), Some(&Json::Bool(true)));
+        let cancel = format!(r#"{{"job":"{job}","run":"{run}"}}"#);
+        call(&host, &Caller::Local, "cancel_run", &cancel).unwrap();
+
+        let id: argus_core::ids::JobId =
+            argus_core::ids::JobId(argus_core::ids::Id128::parse(&job).unwrap());
+        let run_id = argus_core::ids::RunId(argus_core::ids::Id128::parse(&run).unwrap());
+        let handle = host.inner.jobs.lock().unwrap()[&id].0.clone();
+        let (cancelled, typed) = handle.read(&mut Vec::new(), move |l| {
+            let cancelled = l.views().runs().get(&run_id).unwrap().cancel_requested;
+            let typed = l
+                .views()
+                .timeline()
+                .range(
+                    argus_core::ids::UnixMillis(0),
+                    argus_core::ids::UnixMillis(i64::MAX),
+                )
+                .filter(|(_, _, i)| {
+                    matches!(i.kind, argus_core::views::timeline::ItemKind::HumanInput)
+                })
+                .count();
+            (cancelled, typed)
+        });
+        assert!(cancelled);
+        assert_eq!(typed, 1);
+        host.shutdown();
+    }
+
+    #[test]
+    fn callers_are_who_they_say_and_ids_are_checked() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-3");
+        let agent = Caller::Agent {
+            run: "0f8fad5d-d9cb-469f-a165-70867728950e".into(),
+        };
+        let input = format!(
+            r#"{{"request_id":"in-1","job":"{job}","run":"0f8fad5d-d9cb-469f-a165-70867728950e","text":"x"}}"#
+        );
+        assert!(matches!(
+            call(&host, &agent, "send_input", &input),
+            Err(ApiError::Forbidden { .. })
+        ));
+        let bad = r#"{"job":"not-a-job","run":"also-not"}"#;
+        assert!(matches!(
+            call(&host, &Caller::Local, "cancel_run", bad),
+            Err(ApiError::BadInput { .. })
+        ));
+        let unknown = r#"{"job":"0f8fad5d-d9cb-469f-a165-70867728950e","run":"0f8fad5d-d9cb-469f-a165-70867728950e"}"#;
+        assert!(matches!(
+            call(&host, &Caller::Local, "cancel_run", unknown),
+            Err(ApiError::NotFound { .. })
+        ));
+        host.shutdown();
+    }
+}
