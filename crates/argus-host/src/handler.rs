@@ -913,4 +913,99 @@ mod tests {
         ));
         host.shutdown();
     }
+
+    fn get<'a>(v: &'a Json, key: &str) -> &'a Json {
+        v.get(key)
+            .unwrap_or_else(|| panic!("no {key} in {}", argus_json::write(v)))
+    }
+
+    #[test]
+    fn a_job_shows_its_worktree_plan_and_head_and_a_new_cursor_after_each_change() {
+        use argus_core::event::{Author, Event, TaskPatch};
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-job");
+        let ask = format!(r#"{{"job":"{job}"}}"#);
+        let first = call(&host, &Caller::Local, "job", &ask).unwrap();
+        let detail = get(&first, "detail");
+        assert_eq!(text(detail, &["card", "job"]), job);
+        let worktree = root.join("data").join("worktrees").join(&job);
+        assert_eq!(text(detail, &["worktree"]), worktree.display().to_string());
+        assert_eq!(text(detail, &["base"]), git(&repo, &["rev-parse", "main"]));
+        assert_eq!(get(detail, "head"), &Json::Null);
+        assert_eq!(get(detail, "plan"), &Json::Arr(vec![]));
+
+        let id = argus_core::ids::JobId(argus_core::ids::Id128::parse(&job).unwrap());
+        let task = argus_core::ids::TaskKey(argus_core::ids::Id128(5));
+        let patch = TaskPatch {
+            title: Some("ship it".into()),
+            ..TaskPatch::default()
+        };
+        host.inner
+            .job(id)
+            .unwrap()
+            .submit(Author::Human, Event::TaskSet { task, patch })
+            .unwrap();
+        let second = call(&host, &Caller::Local, "job", &ask).unwrap();
+        assert_ne!(text(&first, &["cursor"]), text(&second, &["cursor"]));
+        let Json::Arr(plan) = get(get(&second, "detail"), "plan") else {
+            panic!()
+        };
+        assert_eq!(plan.len(), 1);
+        assert_eq!(text(&plan[0], &["title"]), "ship it");
+        assert_eq!(text(&plan[0], &["source"]), "human");
+        assert_eq!(text(&plan[0], &["status", "kind"]), "Pending");
+        assert_eq!(text(&plan[0], &["key"]), task.0.to_string());
+
+        let tree = head_after_edit(&host, &root, &job);
+        let third = call(&host, &Caller::Local, "job", &ask).unwrap();
+        let head = get(get(&third, "detail"), "head");
+        assert_eq!(text(head, &["tree"]), tree);
+        assert_eq!(
+            get(head, "seq"),
+            &Json::Num(argus_json::Number::from_u64(1))
+        );
+
+        let missing = r#"{"job":"0f8fad5d-d9cb-469f-a165-70867728950e"}"#;
+        assert!(matches!(
+            call(&host, &Caller::Local, "job", missing),
+            Err(ApiError::NotFound { .. })
+        ));
+        host.shutdown();
+    }
+
+    #[test]
+    fn the_timeline_lists_what_happened_and_its_quarters() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-timeline");
+        let ask =
+            format!(r#"{{"job":"{job}","from_ms":0,"to_ms":9007199254740991,"bucket":"M15"}}"#);
+        let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
+        let Json::Arr(items) = get(&page, "items") else {
+            panic!()
+        };
+        let titles: Vec<&str> = items.iter().map(|i| text(i, &["title"])).collect();
+        assert!(titles.contains(&"requested agent"), "{titles:?}");
+        assert!(titles.contains(&"attempt 0 started"), "{titles:?}");
+        let lanes: Vec<&str> = items.iter().map(|i| text(i, &["lane", "kind"])).collect();
+        assert!(
+            lanes.iter().all(|l| *l == "Agent" || *l == "Host"),
+            "{lanes:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|i| argus_core::ids::FactId::parse(text(i, &["fact"])).is_some())
+        );
+        let Json::Arr(buckets) = get(&page, "buckets") else {
+            panic!()
+        };
+        assert!(!buckets.is_empty());
+        assert_eq!(text(&buckets[0], &["width"]), "M15");
+
+        let no_buckets = format!(r#"{{"job":"{job}","from_ms":0,"to_ms":1,"bucket":null}}"#);
+        let empty = call(&host, &Caller::Local, "timeline", &no_buckets).unwrap();
+        assert_eq!(get(&empty, "items"), &Json::Arr(vec![]));
+        assert_eq!(get(&empty, "buckets"), &Json::Arr(vec![]));
+        host.shutdown();
+    }
 }
