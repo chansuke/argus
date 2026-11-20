@@ -81,6 +81,10 @@ pub enum Due {
 }
 
 impl Runs {
+    /// What `JobOpened` said: where the job's runs execute and what it merges into.
+    pub fn job(&self) -> Option<&JobInfo> {
+        todo!("not implemented")
+    }
     pub fn get(&self, run: &RunId) -> Option<&RunState> {
         self.runs.get(run)
     }

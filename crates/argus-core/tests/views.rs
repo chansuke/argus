@@ -1509,3 +1509,27 @@ fn only_agent_runs_show_what_they_are_doing() {
     );
     assert_eq!(p.activities().count(), 0);
 }
+
+#[test]
+fn the_runs_view_knows_the_job_it_belongs_to() {
+    use argus_core::event::{JobInfo, JobOrigin};
+    use argus_core::ids::{GitOid, JobId};
+    let mut r = Runs::default();
+    let mut feed = Feed::default();
+    assert!(r.job().is_none());
+    let info = JobInfo {
+        job: JobId(Id128(1)),
+        title: "fix the gate".into(),
+        repo: PathBuf::from("/w/argus"),
+        base: GitOid::parse(&"b".repeat(40)).unwrap(),
+        target: "main".into(),
+        worktree: PathBuf::from("/w/jobs/1"),
+        group: None,
+        origin: JobOrigin::Launched,
+    };
+    assert!(
+        feed.authored(&mut r, T0, Author::Host, Event::JobOpened(info.clone()))
+            .1
+    );
+    assert_eq!(r.job(), Some(&info));
+}
