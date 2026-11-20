@@ -20,6 +20,8 @@
         pkgs.rustfmt
         pkgs.rust-analyzer
         pkgs.cargo-nextest
+        # Mutation testing (`tools/mutants`), diff-based as in Petrovic & Ivankovic 2018.
+        pkgs.cargo-mutants
       ];
 
       # Formal verification: TLC for the TLA+ specs, Lean 4 (with lake) for the proofs.
