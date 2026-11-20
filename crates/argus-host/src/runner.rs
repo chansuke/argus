@@ -376,7 +376,11 @@ mod tests {
     fn a_process_that_ignores_the_request_is_killed_after_the_grace() {
         let spec = sh(&format!("trap '' TERM; {BUSY}"));
         let (cancel, control) = control(Duration::from_millis(300));
-        cancel.send(()).unwrap();
+        // After the shell installed its trap: a signal before that would end it at once.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel.send(()).unwrap();
+        });
         let started = Instant::now();
         let (ended, _) = capture_with(&spec, Path::new("/"), &control);
         assert!(
