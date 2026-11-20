@@ -639,8 +639,43 @@ mod tests {
         let running = start(inv, env(), ws, ledger.clone());
         assert_eq!(running.run, RunId(Id128(1)));
         drop(ledger);
+        // Held until the run reported back: dropping it would stop the run.
+        let got = thread.join().unwrap();
         drop(running);
-        thread.join().unwrap()
+        got
+    }
+
+    #[test]
+    fn a_run_whose_handle_is_dropped_is_stopped() {
+        let dir = scratch_dir("dropped");
+        let (ledger, thread) = fake_ledger();
+        let started = Instant::now();
+        let running = start(
+            Invocation::Process(sh(BUSY)),
+            env(),
+            workspace(&dir),
+            ledger.clone(),
+        );
+        drop(ledger);
+        std::thread::sleep(Duration::from_millis(200));
+        drop(running);
+        let got = thread.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                finished(&got),
+                RunOutcome::Killed {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            finished(&got)
+        );
     }
 
     fn finished(got: &Received) -> RunOutcome {
