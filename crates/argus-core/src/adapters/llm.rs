@@ -248,4 +248,28 @@ mod tests {
         assert_eq!(f.lines, LineRange::new(10, 12));
         assert_eq!(f.severity, Severity::High);
     }
+
+    #[test]
+    fn a_summary_prompt_says_which_tool_calls_failed() {
+        use crate::ids::{RunId, ToolName};
+        use crate::views::timeline::{BucketWidth, Item, ItemKind, Lane, Window};
+        let call = |ok| Item {
+            lane: Lane::Agent(RunId(crate::ids::Id128(1))),
+            kind: ItemKind::ToolCall {
+                name: ToolName("Bash".into()),
+                ok,
+            },
+            title: "Bash".into(),
+            ended_at: None,
+        };
+        let window = Window {
+            width: BucketWidth::M15,
+            start: UnixMillis(0),
+        };
+        let items = [call(Some(false)), call(Some(true)), call(None)];
+        let prompt = summary_prompt(&window, items.iter().map(|i| (UnixMillis(0), i)));
+        assert_eq!(prompt.matches("tool Bash failed").count(), 1);
+        assert_eq!(prompt.matches("] tool Bash: ").count(), 2);
+        assert!(prompt.contains("00:00:00 to 00:15:00 UTC"), "{prompt}");
+    }
 }
