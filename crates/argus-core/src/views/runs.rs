@@ -19,6 +19,7 @@ pub struct Runs {
     leases: BTreeMap<LeaseId, LeaseState>,
     /// The agent run requested last (request order, not id order).
     latest_agent: Option<RunId>,
+    job: Option<JobInfo>,
 }
 
 #[derive(Debug)]
@@ -83,7 +84,7 @@ pub enum Due {
 impl Runs {
     /// What `JobOpened` said: where the job's runs execute and what it merges into.
     pub fn job(&self) -> Option<&JobInfo> {
-        todo!("not implemented")
+        self.job.as_ref()
     }
     pub fn get(&self, run: &RunId) -> Option<&RunState> {
         self.runs.get(run)
@@ -168,6 +169,10 @@ impl Projection for Runs {
         };
         let at = fact.at;
         match event {
+            Event::JobOpened(info) if self.job.is_none() => {
+                self.job = Some(info.clone());
+                true
+            }
             Event::RunRequested { run, purpose } => {
                 if self.runs.contains_key(run) {
                     return false;
