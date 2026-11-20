@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use argus_log::LogError;
+
 use crate::ids::*;
 use crate::ledger::{JobLedger, LedgerError, MetaLedger};
 use crate::period::Period;
@@ -15,18 +17,36 @@ pub struct Store {
 
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self, LedgerError> {
-        todo!("not implemented")
+        for dir in ["jobs", "meta"] {
+            std::fs::create_dir_all(root.join(dir)).map_err(LogError::from)?;
+        }
+        Ok(Store { root })
     }
+    /// Every job directory, in id order. Anything not named by a job id is not a job.
     pub fn jobs(&self) -> Result<Vec<JobId>, LedgerError> {
-        todo!("not implemented")
+        let entries = std::fs::read_dir(self.root.join("jobs")).map_err(LogError::from)?;
+        let mut jobs = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(LogError::from)?;
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            let id = entry.file_name().to_str().and_then(Id128::parse);
+            if let (true, Some(id)) = (is_dir, id) {
+                jobs.push(JobId(id));
+            }
+        }
+        jobs.sort();
+        Ok(jobs)
     }
     /// Writable; takes the job's locks. Only the host calls this. Creates the directory
     /// for a new job (the caller then submits `JobOpened`).
     pub fn open_job(&self, job: JobId) -> Result<JobLedger, LedgerError> {
-        todo!("not implemented")
+        JobLedger::open(&self.root.join("jobs").join(job.0.to_string()))
     }
     pub fn open_meta(&self) -> Result<MetaLedger, LedgerError> {
-        todo!("not implemented")
+        MetaLedger::open(&self.root.join("meta"))
+    }
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// Store-wide analytics without opening any ledger for writing.
