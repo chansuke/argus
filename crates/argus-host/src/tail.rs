@@ -16,6 +16,7 @@ use argus_core::ledger::SourceCursor;
 use argus_core::plan::WatchSpec;
 use argus_core::source::{Framer, RawFrame, SourceKind, SourceMeta, SourceOrigin};
 
+use crate::glob;
 use crate::ledger_thread::{self, Cmd};
 
 /// The state of following one file, without threads or timers: each `poll` reads what
@@ -137,7 +138,7 @@ pub(crate) fn expand(root: &Path, pattern: &str) -> Vec<PathBuf> {
                     continue;
                 };
                 let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-                if wildcard(segment, name) && (last || is_dir) {
+                if glob::wildcard(segment, name) && (last || is_dir) {
                     next.push(entry.path());
                 }
             }
@@ -147,21 +148,6 @@ pub(crate) fn expand(root: &Path, pattern: &str) -> Vec<PathBuf> {
     found.retain(|p| p.is_file());
     found.sort();
     found
-}
-
-/// `*` matches any run of characters; everything else matches itself.
-fn wildcard(pattern: &str, name: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == name,
-        Some((head, rest)) => {
-            let Some(name) = name.strip_prefix(head) else {
-                return false;
-            };
-            (0..=name.len())
-                .filter(|i| name.is_char_boundary(*i))
-                .any(|i| wildcard(rest, &name[i..]))
-        }
-    }
 }
 
 /// How often files are polled.

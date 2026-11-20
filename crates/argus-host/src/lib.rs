@@ -17,6 +17,7 @@
 #![allow(dead_code, unused_variables)]
 
 mod git;
+mod glob;
 mod handler;
 mod lease;
 mod ledger_thread;
