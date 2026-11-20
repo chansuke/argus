@@ -26,7 +26,6 @@ use crate::views::{GateState, JobViews, Projection};
 
 #[derive(Default, Debug)]
 pub struct ReviewBoard {
-    base: Option<CommitOid>,
     snapshots: Vec<SnapshotEntry>,
     /// Snapshot run -> its `RunStarted` stamp, which becomes the entry's `cut`.
     starting: BTreeMap<RunId, Stamp>,
@@ -380,10 +379,6 @@ impl ReviewBoard {
             sent_by: None,
         };
         match event {
-            Event::JobOpened(info) => {
-                self.base = Some(info.base.clone());
-                true
-            }
             Event::RunRequested { run, purpose } => match purpose {
                 RunPurpose::Snapshot { .. } => {
                     self.starting.insert(*run, fact.stamp);
