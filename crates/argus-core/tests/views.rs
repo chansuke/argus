@@ -1200,3 +1200,194 @@ fn a_usage_update_that_arrives_an_hour_later_stays_in_its_messages_hour() {
         0
     );
 }
+
+// ---------------------------------------------------------------- timeline, found by mutation testing
+
+#[test]
+fn buckets_count_replies_and_typed_input_per_lane_and_span_four_hours_at_the_widest() {
+    let mut tl = Timeline::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.authored(&mut tl, T0, Author::Human, agent_requested(1));
+    feed.agent(&mut tl, &src, T0 + 1, reply("one"));
+    feed.agent(
+        &mut tl,
+        &src,
+        T0 + 50 * 60_000,
+        reply("two, at 03:50, still in the 00:00-04:00 window"),
+    );
+    let typed = Event::RunInput {
+        input: argus_core::ids::InputId(Id128(1)),
+        run: run(1),
+        bytes: b"y\r".to_vec(),
+    };
+    feed.authored(&mut tl, T0 + 2, Author::Human, typed);
+    let four = tl.buckets(BucketWidth::H4, UnixMillis(T0), UnixMillis(T0 + 1));
+    assert_eq!(four.len(), 1);
+    assert_eq!(
+        four[0].window.end().0 - four[0].window.start.0,
+        4 * 3_600_000
+    );
+    assert_eq!(four[0].counts[&Lane::Agent(run(1))].replies, 2);
+    assert_eq!(four[0].counts[&Lane::Human].human_inputs, 1);
+}
+
+#[test]
+fn a_range_ending_on_a_window_boundary_does_not_reach_into_the_next_window() {
+    let mut tl = Timeline::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.agent(&mut tl, &src, T0 + 10, reply("first window"));
+    feed.agent(&mut tl, &src, T0 + M15, reply("second window"));
+    let fine = tl.buckets(BucketWidth::M15, UnixMillis(T0), UnixMillis(T0 + M15));
+    assert_eq!(
+        fine.iter()
+            .map(|b| b.window.start.0 - T0)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+}
+
+#[test]
+fn a_summary_of_the_window_after_the_range_is_not_included() {
+    let mut tl = Timeline::default();
+    let mut feed = Feed::default();
+    let second = Window {
+        width: BucketWidth::M15,
+        start: UnixMillis(T0 + M15),
+    };
+    let requested = Event::RunRequested {
+        run: run(9),
+        purpose: RunPurpose::Summarize {
+            window: second,
+            llm: llm(),
+        },
+    };
+    feed.authored(&mut tl, T0 + 2 * M15, Author::Policy, requested);
+    let summary = AgentWhat::Result {
+        text: "later".into(),
+        is_error: false,
+    };
+    feed.agent(&mut tl, &headless(run(9)), T0 + 2 * M15 + 1, summary);
+    let first = tl.buckets(BucketWidth::M15, UnixMillis(T0), UnixMillis(T0 + M15));
+    assert!(first.is_empty(), "{first:?}");
+    let both = tl.buckets(BucketWidth::M15, UnixMillis(T0), UnixMillis(T0 + 2 * M15));
+    assert!(
+        both.iter()
+            .any(|b| b.window == second && b.summary.is_some())
+    );
+}
+
+#[test]
+fn a_window_that_ends_exactly_now_has_ended() {
+    let mut tl = Timeline::default();
+    let mut feed = Feed::default();
+    feed.agent(&mut tl, &transcript(run(1)), T0 + 10, reply("a"));
+    let window = Window {
+        width: BucketWidth::M15,
+        start: UnixMillis(T0),
+    };
+    assert_eq!(
+        tl.unsummarized(BucketWidth::M15, UnixMillis(T0 + M15)),
+        vec![window]
+    );
+    assert_eq!(
+        tl.unsummarized(BucketWidth::M15, UnixMillis(T0 + M15 - 1)),
+        vec![]
+    );
+}
+
+#[test]
+fn snapshots_check_errors_and_run_titles_are_items() {
+    use argus_core::event::Snapshot;
+    use argus_core::ids::GitOid;
+    use argus_core::source::{LeanMessage, LeanSeverity, TlcMessage};
+    let mut tl = Timeline::default();
+    let mut feed = Feed::default();
+    feed.authored(
+        &mut tl,
+        T0,
+        Author::Policy,
+        Event::RunRequested {
+            run: run(2),
+            purpose: RunPurpose::Snapshot { after: None },
+        },
+    );
+    let snapshot = Snapshot {
+        tree: GitOid::parse(&"1".repeat(40)).unwrap(),
+        base: GitOid::parse(&"b".repeat(40)).unwrap(),
+        previous: None,
+        delta: Vec::new(),
+        files: Vec::new(),
+        withheld: Vec::new(),
+    };
+    feed.authored(
+        &mut tl,
+        T0 + 1,
+        Author::Host,
+        Event::RunFinished {
+            run: run(2),
+            attempt: Attempt(0),
+            outcome: RunOutcome::Snapshot(snapshot),
+        },
+    );
+    feed.authored(&mut tl, T0 + 2, Author::Host, finished(3, 3));
+    let checker = source(
+        run(4),
+        argus_core::source::SourceKind::LeanText,
+        argus_core::source::SourceOrigin::Stdout,
+    );
+    let lean = |severity| {
+        Observation::Lean(LeanMessage {
+            path: "P/A.lean".into(),
+            line: 3,
+            col: 1,
+            severity,
+            text: "unsolved goals\nn : Nat".into(),
+        })
+    };
+    assert!(
+        feed.observed(&mut tl, &checker, T0 + 3, lean(LeanSeverity::Error))
+            .1
+    );
+    assert!(
+        !feed
+            .observed(&mut tl, &checker, T0 + 4, lean(LeanSeverity::Warning))
+            .1
+    );
+    let tlc = |class| {
+        Observation::Tlc(TlcMessage {
+            code: 2110,
+            class,
+            text: "Invariant Tracked is violated.".into(),
+        })
+    };
+    assert!(feed.observed(&mut tl, &checker, T0 + 5, tlc(1)).1);
+    assert!(feed.observed(&mut tl, &checker, T0 + 6, tlc(2)).1);
+    assert!(!feed.observed(&mut tl, &checker, T0 + 7, tlc(0)).1);
+
+    let items: Vec<(String, String)> = tl
+        .range(UnixMillis(T0), UnixMillis(T0 + 10))
+        .map(|(_, _, i)| (format!("{:?}", i.kind), i.title.clone()))
+        .collect();
+    let titles = |kind: &str| {
+        items
+            .iter()
+            .filter(|(k, _)| k == kind)
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        titles("RunLifecycle"),
+        vec!["requested snapshot", "exited 3"]
+    );
+    assert_eq!(titles("Snapshot"), vec!["snapshot"]);
+    assert_eq!(
+        titles("Finding"),
+        vec![
+            "P/A.lean:3 unsolved goals",
+            "Invariant Tracked is violated.",
+            "Invariant Tracked is violated."
+        ]
+    );
+}
