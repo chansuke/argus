@@ -450,4 +450,42 @@ mod tests {
         };
         assert_eq!(delta, vec![("a.txt", vec![inserted_on_top])]);
     }
+
+    #[test]
+    fn a_reviewer_gets_a_checkout_of_exactly_the_snapshot_that_goes_away_after() {
+        let (dir, base) = repo();
+        let s = snapshot(&dir, &base, None, JobId(Id128(1)), &deny()).unwrap();
+        // The agent keeps editing after the snapshot.
+        std::fs::write(dir.join("a.txt"), "edited later\n").unwrap();
+
+        let checkout = materialize(&dir, &s.tree, &base).unwrap();
+        let path = checkout.path.clone();
+        assert_ne!(path, dir);
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("src/c.txt")).unwrap(),
+            "new\n"
+        );
+        assert!(!path.join("b.txt").exists());
+        assert!(!path.join(".env").exists());
+        // `git diff <base>` inside it shows the snapshot's change, which is what a reviewer runs.
+        let diff = git(&path, &["diff", "--name-only", base.as_str()]);
+        assert_eq!(
+            diff.lines().collect::<Vec<_>>(),
+            vec!["a.txt", "b.txt", "src/c.txt"]
+        );
+        assert_eq!(git(&path, &["rev-parse", "HEAD^{tree}"]), s.tree.as_str());
+        // The agent's worktree is untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "edited later\n"
+        );
+
+        drop(checkout);
+        assert!(!path.exists());
+        assert!(!git(&dir, &["worktree", "list"]).contains(path.to_str().unwrap()));
+    }
 }
