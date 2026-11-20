@@ -452,6 +452,24 @@ fn children(pid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// Whether `pgid` may be signalled as a group. `kill -- -0` means the caller's own group
+/// and `kill -- -1` every process the user owns (it logged a desktop session out once,
+/// under a mutant that made `children` return `[1]`). Neither, nor this host's own group,
+/// is ever a run's.
+fn may_signal(pgid: u32, own_group: Option<u32>) -> bool {
+    todo!("not implemented")
+}
+
+/// This process's group (`/proc/self/stat` field 5; the name in field 2 may hold spaces
+/// and parentheses, so fields are counted after the last `)`).
+fn own_group() -> Option<u32> {
+    parse_pgrp(&std::fs::read_to_string("/proc/self/stat").ok()?)
+}
+
+fn parse_pgrp(stat: &str) -> Option<u32> {
+    todo!("not implemented")
+}
+
 /// `kill -<signal> -<pgid>`: std can only SIGKILL one process, not ask a group to exit.
 fn signal_group(pgid: u32, signal: &str) {
     let _ = Command::new("kill")
@@ -927,6 +945,29 @@ mod tests {
             .values()
             .find(|(meta, _)| meta.origin == origin)
             .map(|(meta, frames)| (meta.kind, bytes(frames)))
+    }
+
+    // These never call `kill`: a broken check must not be able to signal anything.
+    #[test]
+    fn only_a_run_s_own_group_may_be_signalled() {
+        let own = Some(4242);
+        assert!(!may_signal(0, own), "0 is the caller's own group");
+        assert!(!may_signal(1, own), "-1 is every process the user owns");
+        assert!(!may_signal(4242, own), "the host's own group");
+        assert!(may_signal(2, own));
+        assert!(may_signal(98765, own));
+        // Without knowing its own group, the host still refuses 0 and 1.
+        assert!(!may_signal(1, None));
+        assert!(may_signal(98765, None));
+    }
+
+    #[test]
+    fn the_own_group_is_read_after_the_process_name() {
+        assert_eq!(parse_pgrp("123 (cat) S 1 77 77 0 -1"), Some(77));
+        // A name may contain spaces and parentheses.
+        assert_eq!(parse_pgrp("123 (a b) c) S 1 88 88 0 -1"), Some(88));
+        assert_eq!(parse_pgrp("garbage"), None);
+        assert!(own_group().is_some());
     }
 
     #[test]
