@@ -273,9 +273,44 @@ pub(crate) struct DiffCache {
 impl DiffCache {
     /// `git diff --no-color --no-renames --unified=3 <base> <tree>` -> `diff::parse_unified`.
     pub(crate) fn get(&self, repo: &Path, req: &DiffRequest) -> std::io::Result<Arc<HeadDiff>> {
-        todo!("not implemented")
+        let key = (req.base.clone(), req.tree.clone());
+        if let Some(diff) = self.entries.lock().unwrap().get(&key) {
+            return Ok(diff.clone());
+        }
+        // Both ids name immutable objects, so a diff computed twice by racing callers is
+        // the same diff; the lock is not held while git runs.
+        let out = git(
+            repo,
+            &[
+                "diff",
+                "--no-color",
+                "--no-renames",
+                "--unified=3",
+                req.base.as_str(),
+                req.tree.as_str(),
+            ],
+            &[],
+            None,
+        )?;
+        let diff = Arc::new(HeadDiff {
+            request: req.clone(),
+            hunks: argus_core::diff::parse_unified(&String::from_utf8_lossy(&out)),
+        });
+        let mut entries = self.entries.lock().unwrap();
+        if entries.len() >= DIFF_CACHE_MAX {
+            // Any entry may go: a dropped one is recomputed on the next read.
+            let first = entries
+                .keys()
+                .next()
+                .cloned()
+                .expect("a full cache is not empty");
+            entries.remove(&first);
+        }
+        Ok(entries.entry(key).or_insert(diff).clone())
     }
 }
+
+const DIFF_CACHE_MAX: usize = 32;
 
 /// `Effect::Merge`: brings the approved snapshot (`tree` on `base`) into `target`.
 ///
