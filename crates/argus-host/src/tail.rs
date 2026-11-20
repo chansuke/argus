@@ -1,21 +1,22 @@
 //! Tails files that other programs write (agent transcripts). Polling (250 ms) keeps it
 //! std-only; inotify would need FFI.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use argus_core::ids::{Attempt, RunId};
+use argus_core::ids::{Attempt, RunId, SourceId};
 use argus_core::ledger::SourceCursor;
 use argus_core::plan::WatchSpec;
-use argus_core::source::{Framer, RawFrame, SourceKind};
+use argus_core::source::{Framer, RawFrame, SourceKind, SourceMeta, SourceOrigin};
 
-use crate::ledger_thread::Cmd;
+use crate::ledger_thread::{self, Cmd};
 
 /// The state of following one file, without threads or timers: each `poll` reads what
 /// is new and returns the frames to store.
@@ -180,7 +181,48 @@ pub(crate) fn watch(
     stop: Arc<AtomicBool>,
     every: Duration,
 ) -> JoinHandle<()> {
-    todo!("not implemented")
+    std::thread::spawn(move || {
+        let mut tailers: BTreeMap<PathBuf, (SourceId, Tailer)> = BTreeMap::new();
+        loop {
+            // Read before the poll, so a stop set during it still gets one more pass.
+            let stopping = stop.load(Ordering::SeqCst);
+            for spec in &specs {
+                for path in expand(&home, &spec.pattern) {
+                    if tailers.contains_key(&path) {
+                        continue;
+                    }
+                    let origin = SourceOrigin::File(path.clone());
+                    let meta = SourceMeta {
+                        id: SourceMeta::derive_id(run, attempt, &origin),
+                        run,
+                        attempt,
+                        kind: spec.kind,
+                        origin,
+                    };
+                    // Without the ledger there is nowhere to store frames: try again later.
+                    let Ok(cursor) = ledger_thread::open_source(&ledger, meta) else {
+                        continue;
+                    };
+                    let tailer = Tailer::new(path.clone(), &cursor);
+                    tailers.insert(path, (cursor.meta.id, tailer));
+                }
+            }
+            for (id, tailer) in tailers.values_mut() {
+                let frames = match stopping {
+                    true => tailer.finish(),
+                    false => tailer.poll(),
+                };
+                // An unreadable file is retried on the next poll.
+                if let Ok(frames) = frames {
+                    ledger_thread::observe(&ledger, *id, frames);
+                }
+            }
+            if stopping {
+                return;
+            }
+            std::thread::sleep(every);
+        }
+    })
 }
 
 #[cfg(test)]
