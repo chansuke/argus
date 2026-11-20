@@ -451,6 +451,7 @@ mod watch_tests {
 
         let got = received.join().unwrap();
         let mut sources: Vec<_> = got
+            .sources
             .values()
             .map(|(meta, frames)| {
                 assert_eq!(

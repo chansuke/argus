@@ -394,7 +394,8 @@ mod tests {
     }
 
     fn by_origin(got: &Received, origin: SourceOrigin) -> Option<(SourceKind, Vec<Vec<u8>>)> {
-        got.values()
+        got.sources
+            .values()
             .find(|(meta, _)| meta.origin == origin)
             .map(|(meta, frames)| (meta.kind, bytes(frames)))
     }
@@ -415,7 +416,7 @@ mod tests {
             vec![b"err".to_vec()]
         );
         // Every source belongs to the run's attempt and has its derived id.
-        for (id, (meta, _)) in &got {
+        for (id, (meta, _)) in &got.sources {
             assert_eq!((meta.run, meta.attempt), (RunId(Id128(1)), Attempt(0)));
             assert_eq!(
                 *id,

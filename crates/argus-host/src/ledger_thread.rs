@@ -80,6 +80,27 @@ pub(crate) fn run(ledger: JobLedger, inbox: Receiver<Cmd>, live: BTreeSet<RunId>
     todo!("not implemented")
 }
 
+/// Appends an authored event on the ledger thread.
+pub(crate) fn submit(
+    ledger: &Sender<Cmd>,
+    author: Author,
+    event: Event,
+) -> std::io::Result<Submitted> {
+    let (reply, answer) = std::sync::mpsc::channel();
+    let gone = || std::io::Error::other("the ledger thread stopped");
+    ledger
+        .send(Cmd::Submit {
+            author,
+            event,
+            reply,
+        })
+        .map_err(|_| gone())?;
+    answer
+        .recv()
+        .map_err(|_| gone())?
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
 /// Opens (or reopens) a source on the ledger thread and returns where ingestion resumes.
 pub(crate) fn open_source(ledger: &Sender<Cmd>, meta: SourceMeta) -> std::io::Result<SourceCursor> {
     let (reply, answer) = std::sync::mpsc::channel();
@@ -107,24 +128,39 @@ pub(crate) mod testing {
     use std::sync::mpsc::{self, Sender};
     use std::thread::JoinHandle;
 
-    use argus_core::ids::SourceId;
-    use argus_core::ledger::SourceCursor;
+    use argus_core::event::{Author, Event};
+    use argus_core::ids::{EventId, SourceId};
+    use argus_core::ledger::{SourceCursor, Submitted};
     use argus_core::source::{RawFrame, SourceMeta};
 
     use super::Cmd;
 
-    /// What a fake ledger thread received: per source, its header and stored frames.
-    pub(crate) type Received = BTreeMap<SourceId, (SourceMeta, Vec<RawFrame>)>;
+    /// What a fake ledger thread received: per source, its header and stored frames; and
+    /// every submitted event, in order.
+    #[derive(Default)]
+    pub(crate) struct Received {
+        pub sources: BTreeMap<SourceId, (SourceMeta, Vec<RawFrame>)>,
+        pub events: Vec<(Author, Event)>,
+    }
 
     /// A ledger thread that opens every source fresh and keeps what it is sent.
     pub(crate) fn fake_ledger() -> (Sender<Cmd>, JoinHandle<Received>) {
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let mut got = Received::new();
+            let mut got = Received::default();
             for cmd in rx {
                 match cmd {
+                    Cmd::Submit {
+                        author,
+                        event,
+                        reply,
+                    } => {
+                        let id = EventId::parse(&format!("host:{}", got.events.len())).unwrap();
+                        got.events.push((author, event));
+                        reply.send(Ok(Submitted::Appended(id))).unwrap();
+                    }
                     Cmd::OpenSource { meta, reply } => {
-                        got.insert(meta.id, (meta.clone(), Vec::new()));
+                        got.sources.insert(meta.id, (meta.clone(), Vec::new()));
                         let cursor = SourceCursor {
                             meta,
                             resume_at: 0,
@@ -133,7 +169,8 @@ pub(crate) mod testing {
                         reply.send(Ok(cursor)).unwrap();
                     }
                     Cmd::Observe { source, frames } => {
-                        let stored = &mut got.get_mut(&source).expect("observed after open").1;
+                        let stored =
+                            &mut got.sources.get_mut(&source).expect("observed after open").1;
                         stored.extend(frames);
                     }
                     _ => {}
