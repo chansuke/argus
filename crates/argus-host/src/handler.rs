@@ -322,16 +322,10 @@ mod tests {
     fn typed_input_and_cancels_are_recorded_for_the_run() {
         let (host, _root, repo) = host();
         let job = start(&host, &repo, "req-2");
-        let overview = call(&host, &Caller::Local, "overview", "{}").unwrap();
-        let run = {
-            let Some(Json::Arr(cards)) = overview.get("jobs") else {
-                panic!()
-            };
-            let Some(Json::Arr(agents)) = cards[0].get("agents") else {
-                panic!()
-            };
-            text(&agents[0], &["run"]).to_owned()
-        };
+        // The agent run's id derives from its job (Codex fails at once, so the overview
+        // no longer lists it as active).
+        let job_id = argus_core::ids::Id128::parse(&job).unwrap();
+        let run = argus_core::ids::Id128::derive("agent", &job_id.0.to_le_bytes()).to_string();
         let input = format!(r#"{{"request_id":"in-1","job":"{job}","run":"{run}","text":"y\r"}}"#);
         let ack = call(&host, &Caller::Local, "send_input", &input).unwrap();
         assert_eq!(ack.get("duplicate"), Some(&Json::Bool(false)));
