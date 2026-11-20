@@ -688,3 +688,113 @@ fn small_accessors_say_what_they_hold() {
         vec![(&a, Seq::FIRST.next())]
     );
 }
+
+/// Appends frames one by one, returning each frame's bytes as stored.
+fn frames_of(dir: &LogDir, key: &str, stamps: &[(u64, &[u8])]) -> Vec<Vec<u8>> {
+    let a = actor(key);
+    let (mut w, _) = LogWriter::open(dir, &a, HEADER).unwrap();
+    let path = log_file(dir, &a);
+    let mut out = Vec::new();
+    for (wall_ns, payload) in stamps {
+        let before = fs::metadata(&path).unwrap().len() as usize;
+        w.append(
+            Stamp {
+                wall_ns: *wall_ns,
+                logical: 0,
+            },
+            payload,
+        )
+        .unwrap();
+        w.sync().unwrap();
+        out.push(fs::read(&path).unwrap()[before..].to_vec());
+    }
+    out
+}
+
+/// A frame with a valid checksum still ends the log if it repeats a stamp or a seq: a
+/// spliced or concatenated file is not trusted past that point.
+#[test]
+fn a_valid_frame_with_a_repeated_stamp_or_seq_ends_the_log() {
+    for (name, foreign) in [("same-stamp", 1usize), ("same-seq", 0usize)] {
+        let dir = scratch(name);
+        drop(frames_of(&dir, "agent-1", &[(5, b"a")]));
+        // Another log's frames. Same stamp: its seq 1 at stamp 5, right after our seq 0
+        // at stamp 5. Same seq: its seq 0 at stamp 6, a later stamp but seq 0 again.
+        let stamps: [(u64, &[u8]); 2] = match foreign {
+            1 => [(4, b"x"), (5, b"b")],
+            _ => [(6, b"x"), (7, b"b")],
+        };
+        let other = frames_of(&dir, "agent-2", &stamps);
+        let path = log_file(&dir, &actor("agent-1"));
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&other[foreign]);
+        fs::write(&path, &bytes).unwrap();
+        let (_, rec) = LogWriter::open(&dir, &actor("agent-1"), HEADER).unwrap();
+        assert_eq!(rec.truncated_bytes, other[foreign].len() as u64, "{name}");
+    }
+}
+
+#[test]
+fn a_header_of_exactly_the_largest_size_reads_back() {
+    let dir = scratch("big-header");
+    let a = actor("agent-1");
+    let header = vec![b'h'; 1 << 16];
+    drop(LogWriter::open(&dir, &a, &header).unwrap());
+    assert!(LogWriter::open(&dir, &a, &header).is_ok());
+    assert_eq!(LogReader::open(&dir, &a).unwrap().header(), &header[..]);
+}
+
+/// A log cut short under an open reader: the reader reports where the bad frame starts.
+#[test]
+fn a_frame_cut_short_after_indexing_is_corrupt_at_its_offset() {
+    let dir = scratch("late-cut");
+    let frames = frames_of(
+        &dir,
+        "agent-1",
+        &[(1, b"first frame"), (2, b"second frame")],
+    );
+    let a = actor("agent-1");
+    let reader = LogReader::open(&dir, &a).unwrap();
+    let path = log_file(&dir, &a);
+    let len = fs::metadata(&path).unwrap().len();
+    let second_at = len - frames[1].len() as u64;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(len - 3)
+        .unwrap();
+    let iterated: Vec<_> = reader.iter_from(Seq::FIRST).unwrap().collect();
+    assert!(iterated[0].is_ok());
+    match &iterated[1] {
+        Err(LogError::Corrupt { offset, .. }) => assert_eq!(*offset, second_at),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// When the cut-off bytes cannot be kept, opening fails instead of dropping them.
+#[test]
+fn a_tail_that_cannot_be_set_aside_fails_the_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("readonly");
+    drop(frames_of(&dir, "agent-1", &[(1, b"kept")]));
+    let path = log_file(&dir, &actor("agent-1"));
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"torn");
+    fs::write(&path, &bytes).unwrap();
+    fs::set_permissions(dir.root(), fs::Permissions::from_mode(0o555)).unwrap();
+    let started = std::time::Instant::now();
+    let opened = LogWriter::open(&dir, &actor("agent-1"), HEADER);
+    fs::set_permissions(dir.root(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(opened.is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(fs::read(&path).unwrap(), bytes, "nothing was cut");
+}
+
+#[test]
+fn a_log_directory_that_is_a_file_is_an_error() {
+    let dir = scratch("file-root");
+    let file = dir.root().join("not-a-dir");
+    fs::write(&file, b"").unwrap();
+    assert!(LogDir::new(file).actors().is_err());
+}
