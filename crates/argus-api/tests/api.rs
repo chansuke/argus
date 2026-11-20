@@ -69,3 +69,16 @@ fn basic_types_name_their_typescript_type() {
     Option::<argus_api::vm::PlanRow>::ts_collect(&mut decls);
     assert!(decls.contains_key("PlanRow"), "{decls:?}");
 }
+
+#[test]
+fn a_float_writes_json_that_reads_back_as_the_same_number() {
+    for x in [0.0, 1.0, 0.5, 0.1, 2.0 / 3.0, 1e-7, 1e21, -3.25] {
+        let text = argus_json::write(&x.to_json());
+        assert_eq!(f64::from_json(&json(&text)), Ok(x), "{text}");
+    }
+    assert_eq!(argus_json::write(&0.25f64.to_json()), "0.25");
+    // JSON has no NaN or infinity.
+    for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(x.to_json(), Json::Null);
+    }
+}
