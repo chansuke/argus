@@ -364,12 +364,16 @@ pub(crate) fn spawn_capture(
     command.process_group(0);
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take();
-    let writer = fed.zip(stdin.take()).map(|(bytes, mut pipe)| {
-        // A thread, so a process that writes before it reads cannot deadlock the host.
-        std::thread::spawn(move || {
-            let _ = pipe.write_all(&bytes);
-        })
-    });
+    // `then`, not `zip`: the pipe is taken only when there is something to write, so a
+    // terminal's input is not closed by accident.
+    let writer = fed
+        .and_then(|bytes| stdin.take().map(|pipe| (bytes, pipe)))
+        .map(|(bytes, mut pipe)| {
+            // A thread, so a process that writes before it reads cannot deadlock the host.
+            std::thread::spawn(move || {
+                let _ = pipe.write_all(&bytes);
+            })
+        });
     let readers = [
         pump(child.stdout.take(), out, ledger.clone()),
         pump(child.stderr.take(), err, ledger.clone()),
