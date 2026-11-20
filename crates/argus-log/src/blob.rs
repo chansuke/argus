@@ -189,3 +189,28 @@ impl Sha256 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Sha256;
+
+    /// Reads may return any number of bytes, so the hash must not depend on how the input
+    /// is split; with 64 KiB reads every split falls on a block boundary and hides this.
+    #[test]
+    fn the_hash_does_not_depend_on_how_the_input_is_split() {
+        let input: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let mut whole = Sha256::new();
+        whole.update(&input);
+        let mut pieces = Sha256::new();
+        let mut rest = &input[..];
+        for size in [3, 61, 1, 64, 200, 7, 63].iter().cycle() {
+            if rest.is_empty() {
+                break;
+            }
+            let (head, tail) = rest.split_at((*size).min(rest.len()));
+            pieces.update(head);
+            rest = tail;
+        }
+        assert_eq!(pieces.finish(), whole.finish());
+    }
+}
