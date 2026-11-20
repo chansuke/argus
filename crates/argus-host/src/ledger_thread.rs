@@ -419,14 +419,18 @@ mod tests {
         assert_eq!(job.started(), vec![(run(1), Attempt(0))]);
         assert_eq!(job.attempts(1), vec![(Attempt(0), None)]);
         // Planned from the purpose, in the job's own worktree.
-        let launched = &job.launcher.0.lock().unwrap()[0];
-        let Invocation::Process(spec) = &launched.inv else {
-            panic!("{:?}", launched.inv)
-        };
-        assert_eq!(spec.program, PathBuf::from("claude"));
-        assert!(matches!(spec.workdir, Workdir::JobWorktree));
-        assert_eq!(launched.ws.worktree, PathBuf::from("/w/jobs/1"));
-        assert_eq!(launched.ws.repo, PathBuf::from("/w/argus"));
+        {
+            // The guard must go before `started()` locks again.
+            let launcher = job.launcher.0.lock().unwrap();
+            let launched = &launcher[0];
+            let Invocation::Process(spec) = &launched.inv else {
+                panic!("{:?}", launched.inv)
+            };
+            assert_eq!(spec.program, PathBuf::from("claude"));
+            assert!(matches!(spec.workdir, Workdir::JobWorktree));
+            assert_eq!(launched.ws.worktree, PathBuf::from("/w/jobs/1"));
+            assert_eq!(launched.ws.repo, PathBuf::from("/w/argus"));
+        }
 
         // Nothing new happens on later batches while it runs.
         job.job.after_batch(NOW);
