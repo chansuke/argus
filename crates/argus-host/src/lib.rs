@@ -35,16 +35,15 @@ use std::thread::JoinHandle;
 
 use argus_api::{ApiError, Caller};
 use argus_core::Store;
-use argus_core::ids::JobId;
+use argus_core::ids::{JobId, LedgerRef};
 use argus_core::models::ModelPresets;
 use argus_core::period::UtcOffset;
-use argus_core::plan::ToolPaths;
-use argus_core::plan::{Invocation, PlanEnv};
+use argus_core::plan::{Invocation, PlanEnv, SNAPSHOT_DENY, ToolPaths};
 use argus_core::policy::PolicyConfig;
 use argus_core::views::packet::PacketConfig;
 use argus_json::Json;
 
-use ledger_thread::{Cmd, Launcher, LedgerHandle};
+use ledger_thread::{Cmd, JobLoop, Launcher, LedgerHandle, LoopConfig};
 
 pub use transport::{PairedDevice, PhoneAccess, PhoneListen, serve_socket, serve_websocket};
 
@@ -91,6 +90,48 @@ pub(crate) struct HostInner {
     pub(crate) diffs: git::DiffCache,
 }
 
+impl HostInner {
+    /// Opens a job's ledger and starts its loop. Its first pass reconciles: attempts that
+    /// were running when the last host died are abandoned, and safe ones retried.
+    pub(crate) fn open_job(&self, job: JobId) -> std::io::Result<()> {
+        let ledger = self.store.open_job(job).map_err(io_error)?;
+        let Some(info) = ledger.views().runs().job().cloned() else {
+            return Ok(());
+        };
+        let config = &self.config;
+        let mut snapshot_deny: Vec<String> = SNAPSHOT_DENY.iter().map(|s| s.to_string()).collect();
+        snapshot_deny.extend(config.snapshot_deny.iter().cloned());
+        let cfg = LoopConfig {
+            info,
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            policy: config.policy.clone(),
+            tools: config.tools.clone(),
+            socket: config.socket.clone(),
+            snapshot_deny,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job_loop = JobLoop::new(ledger, tx.clone(), ProcessLauncher, cfg);
+        let thread = std::thread::spawn(move || job_loop.run(rx));
+        let handle = LedgerHandle::new(tx, LedgerRef::Job(job));
+        self.jobs.lock().unwrap().insert(job, (handle, thread));
+        Ok(())
+    }
+
+    fn stop_all(&self) {
+        let jobs = std::mem::take(&mut *self.jobs.lock().unwrap());
+        for (handle, thread) in jobs.into_values() {
+            let _ = handle.sender().send(Cmd::Stop);
+            let _ = thread.join();
+        }
+    }
+}
+
+fn io_error(e: argus_core::LedgerError) -> std::io::Error {
+    std::io::Error::other(format!("{e:?}"))
+}
+
 /// Starts runs for real: processes, PTYs, in-process effects.
 pub(crate) struct ProcessLauncher;
 
@@ -113,8 +154,25 @@ impl Host {
     /// Opens the store (taking every lock), starts ledger threads for open jobs, and
     /// reconciles: each ledger's `runs.due(&empty)` abandons interrupted attempts and
     /// releases unclosed leases before anything new starts.
+    ///
+    /// A job directory without a `JobOpened` is skipped. If any job cannot be opened (another
+    /// host holds it), the loops started so far are stopped and the error returned.
     pub fn start(config: HostConfig) -> std::io::Result<Host> {
-        todo!("not implemented")
+        let store = Store::open(config.data_root.clone()).map_err(io_error)?;
+        let inner = Arc::new(HostInner {
+            config,
+            store,
+            jobs: Mutex::new(BTreeMap::new()),
+            registry: Mutex::default(),
+            diffs: git::DiffCache::default(),
+        });
+        for job in inner.store.jobs().map_err(io_error)? {
+            if let Err(e) = inner.open_job(job) {
+                inner.stop_all();
+                return Err(e);
+            }
+        }
+        Ok(Host { inner })
     }
 
     /// One-shot op (query, command, or the current value of a subscription).
@@ -144,11 +202,26 @@ impl Host {
     /// File behind an `Evidence.blob` id (screenshots, recordings) for the transport to
     /// serve: Tauri custom protocol `argus-blob://<id>`, or `GET /blob/<id>` for the phone.
     pub fn blob_path(&self, job: &str, blob: &str) -> Option<PathBuf> {
-        todo!("not implemented")
+        let job = argus_core::ids::Id128::parse(job)?;
+        if blob.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(blob.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        let dir = self.inner.store.root().join("jobs").join(job.to_string());
+        Some(
+            argus_log::LogDir::new(dir)
+                .blobs()
+                .path(&argus_log::BlobId(bytes)),
+        )
     }
 
+    /// Stops every job's loop. Runs still executing are stopped with them (a dropped
+    /// `Running` is a cancel), and the next start abandons or retries them.
     pub fn shutdown(self) {
-        todo!("not implemented")
+        self.inner.stop_all();
     }
 }
 
