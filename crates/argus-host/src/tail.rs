@@ -119,6 +119,12 @@ pub(crate) fn tail(
     todo!("not implemented")
 }
 
+/// Files under `root` matching `pattern`, a `/`-separated path whose segments may use
+/// `*` (any run of characters within one segment). Sorted, so polls agree.
+pub(crate) fn expand(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    todo!("not implemented")
+}
+
 /// Expands `watch` globs under $HOME on each poll; every new match becomes a source
 /// (`SourceOrigin::File(path)`, deterministic id) and gets a tailer. This is how subagent
 /// transcripts that appear mid-run are picked up.
@@ -129,6 +135,48 @@ pub(crate) fn watch(specs: Vec<WatchSpec>, ledger: Sender<Cmd>) -> std::thread::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_watch_pattern_finds_main_and_subagent_transcripts() {
+        let home = scratch_file().parent().unwrap().to_path_buf();
+        let run = "0f8fad5d-d9cb-469f-a165-70867728950e";
+        let files = [
+            format!(".claude/projects/-w-jobs-1/{run}.jsonl"),
+            format!(".claude/projects/-w-jobs-1/{run}/subagents/agent-a.jsonl"),
+            format!(".claude/projects/-w-jobs-1/{run}/subagents/agent-b.jsonl"),
+            format!(".claude/projects/-other/{run}.jsonl"),
+            ".claude/projects/-w-jobs-1/someone-else.jsonl".to_owned(),
+            format!(".claude/projects/-w-jobs-1/{run}/subagents/notes.txt"),
+        ];
+        for f in &files {
+            let path = home.join(f);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let rel = |paths: Vec<PathBuf>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&home)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
+        assert_eq!(
+            rel(expand(&home, &format!(".claude/projects/*/{run}.jsonl"))),
+            vec![files[3].clone(), files[0].clone()]
+        );
+        assert_eq!(
+            rel(expand(
+                &home,
+                &format!(".claude/projects/*/{run}/subagents/*.jsonl")
+            )),
+            vec![files[1].clone(), files[2].clone()]
+        );
+        assert!(expand(&home, ".codex/sessions/*.jsonl").is_empty());
+    }
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
