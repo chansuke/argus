@@ -13,7 +13,8 @@ use crate::LogError;
 pub struct BlobId(pub [u8; 32]);
 
 impl BlobId {
-    fn hex(&self) -> String {
+    /// 64 lowercase hex digits: the blob's name in the store and on the API.
+    pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
