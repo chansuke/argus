@@ -153,3 +153,26 @@ pub(crate) fn verdict(messages: &[(FactId, TlcMessage)], exit_code: i32) -> Chec
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(code: u32, class: u8) -> (FactId, TlcMessage) {
+        let fact = FactId::parse("src-0f8fad5d-d9cb-469f-a165-70867728950e:0.0").unwrap();
+        let text = format!("message {code}");
+        (fact, TlcMessage { code, class, text })
+    }
+
+    /// Exit 0 alone is not a proof: TLC must also have said it succeeded.
+    #[test]
+    fn success_needs_both_the_exit_code_and_the_success_message() {
+        let finished = [message(2185, 0), message(2193, 0), message(2186, 0)];
+        assert_eq!(verdict(&finished, 0), CheckVerdict::Proved);
+        let silent = [message(2185, 0), message(2186, 0)];
+        assert!(matches!(
+            verdict(&silent, 0),
+            CheckVerdict::ToolError { .. }
+        ));
+    }
+}
