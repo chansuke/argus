@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use argus_core::ids::{Attempt, Id128, RunId};
+use argus_core::ids::{Attempt, Id128, RunId, UnixMillis};
 use argus_core::source::{RawFrame, SourceKind, SourceMeta, SourceOrigin};
 
 #[test]
@@ -223,7 +223,6 @@ fn lean_diagnostics_are_framed_with_their_continuation_lines() {
 
 #[test]
 fn rfc3339_timestamps_parse_to_unix_millis() {
-    use argus_core::ids::UnixMillis;
     let p = |s| UnixMillis::parse_rfc3339(s).map(|m| m.0);
     assert_eq!(p("1970-01-01T00:00:00Z"), Some(0));
     assert_eq!(p("2026-10-24T03:16:30.255Z"), Some(1_792_811_790_255));
@@ -251,4 +250,90 @@ fn a_decision_has_one_delivery_run() {
     assert_eq!(d.delivery_run(), d.delivery_run());
     assert_ne!(d.delivery_run(), DecisionId(Id128(8)).delivery_run());
     assert_ne!(d.delivery_run().0, d.0);
+}
+
+/// A repo path never escapes the repository: each way out is refused on its own.
+#[test]
+fn a_repo_path_refuses_every_way_out_of_the_repository() {
+    use argus_core::ids::RepoPath;
+    assert!(RepoPath::parse("src/lib.rs").is_some());
+    assert!(RepoPath::parse(".github/workflows/ci.yaml").is_some());
+    for bad in ["", "/etc/passwd", "../x", "a/../b", "a//b", "a/", "..", "/"] {
+        assert!(RepoPath::parse(bad).is_none(), "{bad:?} accepted");
+    }
+}
+
+#[test]
+fn git_ids_and_skill_names_accept_only_their_alphabet() {
+    use argus_core::ids::{GitOid, SkillName};
+    let upper = "ABCDEF0123456789abcdef0123456789abcdef01";
+    assert_eq!(
+        GitOid::parse(upper).unwrap().as_str(),
+        upper.to_ascii_lowercase()
+    );
+    assert!(GitOid::parse(&"a".repeat(64)).is_some());
+    for bad in [
+        "g".repeat(40),
+        "a".repeat(39),
+        "a".repeat(41),
+        String::new(),
+    ] {
+        assert!(GitOid::parse(&bad).is_none(), "{bad:?} accepted");
+    }
+    assert!(SkillName::parse("write-tests-2").is_some());
+    for bad in ["", "Bad", "a_b", "a b", "a/b"] {
+        assert!(SkillName::parse(bad).is_none(), "{bad:?} accepted");
+    }
+}
+
+#[test]
+fn rfc3339_refuses_each_malformed_part() {
+    let p = UnixMillis::parse_rfc3339;
+    let base = p("2026-10-24T03:16:30Z").unwrap();
+    // Every separator is checked on its own.
+    for bad in [
+        "2026/10-24T03:16:30Z",
+        "2026-10/24T03:16:30Z",
+        "2026-10-24 03:16:30Z",
+        "2026-10-24T03-16:30Z",
+        "2026-10-24T03:16-30Z",
+    ] {
+        assert_eq!(p(bad), None, "{bad}");
+    }
+    // Leap years: every 4th, but not every 100th, unless every 400th.
+    assert!(p("2024-02-29T00:00:00Z").is_some());
+    assert!(p("2000-02-29T00:00:00Z").is_some());
+    assert_eq!(p("2023-02-29T00:00:00Z"), None);
+    assert_eq!(p("1900-02-29T00:00:00Z"), None);
+    // Field ranges, with a leap second allowed.
+    assert!(p("2026-10-24T23:59:60Z").is_some());
+    for bad in [
+        "2026-10-24T24:00:00Z",
+        "2026-10-24T03:60:00Z",
+        "2026-10-24T03:16:61Z",
+        "2026-10-00T03:16:30Z",
+        "2026-13-24T03:16:30Z",
+        "2026-04-31T03:16:30Z",
+    ] {
+        assert_eq!(p(bad), None, "{bad}");
+    }
+    // Fractions are milliseconds, truncated.
+    assert_eq!(p("2026-10-24T03:16:30.5Z"), Some(UnixMillis(base.0 + 500)));
+    assert_eq!(p("2026-10-24T03:16:30.05Z"), Some(UnixMillis(base.0 + 50)));
+    assert_eq!(
+        p("2026-10-24T03:16:30.0459Z"),
+        Some(UnixMillis(base.0 + 45))
+    );
+    // Offsets move the instant by their exact value and sign.
+    assert_eq!(p("2026-10-24T12:46:30+09:30"), Some(base));
+    assert_eq!(p("2026-10-23T21:46:30-05:30"), Some(base));
+    // Nothing may follow the zone.
+    for bad in [
+        "2026-10-24T03:16:30Zx",
+        "2026-10-24T03:16:30+0900",
+        "2026-10-24T03:16:30+09:00x",
+        "2026-10-24T03:16:30",
+    ] {
+        assert_eq!(p(bad), None, "{bad}");
+    }
 }
