@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use argus_core::diff::{DiffRequest, HeadDiff, parse_unified};
-use argus_core::event::{ApprovedHead, FileDelta, FileState, Snapshot};
+use argus_core::event::{FileDelta, FileState, Snapshot};
 use argus_core::ids::{CommitOid, GitOid, JobId, RepoPath, TreeOid};
 
 use crate::glob;
@@ -230,14 +230,24 @@ impl DiffCache {
     }
 }
 
-/// `Effect::Merge`: merge the approved snapshot commit into `target` without a checkout:
-/// `git merge-tree --write-tree <target> <snapshot commit>`, `git commit-tree`, then
-/// `git update-ref refs/heads/<target> <new> <old>` (compare-and-swap, so a target that
-/// moved meanwhile fails cleanly and a retried merge of an applied one is a no-op).
-/// Conflicts -> `Err` with the paths, recorded as `RunOutcome::Failed`.
+/// `Effect::Merge`: brings the approved snapshot (`tree` on `base`) into `target`.
+///
+/// - The snapshot's commit is `refs/argus/<job>/<tree>` (made if missing).
+/// - Already in `target` -> nothing to do; a retried merge is a no-op.
+/// - `target` not moved since `base` -> fast-forward; else a merge commit of
+///   `git merge-tree --write-tree`, authored by the repository's configured user (the
+///   human approved it). Conflicts -> `Err` naming the paths.
+/// - `target` checked out in a worktree: a clean one is fast-forwarded there
+///   (`git merge --ff-only`), as the user would; one with local changes is refused, and
+///   nothing moves. Otherwise `git update-ref <new> <old>` (compare-and-swap), so a
+///   target that moved meanwhile fails cleanly.
+///
+/// `Err` is recorded as `RunOutcome::Failed { reason }`.
 pub(crate) fn merge(
     repo: &Path,
-    approved: &ApprovedHead,
+    job: JobId,
+    tree: &TreeOid,
+    base: &CommitOid,
     target: &str,
 ) -> Result<CommitOid, String> {
     todo!("not implemented")
@@ -548,5 +558,120 @@ mod tests {
             .map(|d| (d.path.as_str(), d.hunks.len()))
             .collect();
         assert_eq!(delta, vec![("a.txt", 2), ("src/c.txt", 1)]);
+    }
+
+    // ------------------------------------------------------------ merge
+
+    /// A job snapshot of `repo()`'s worktree, and a `release` branch at the base that
+    /// nothing has checked out.
+    fn merge_setup() -> (PathBuf, CommitOid, Snapshot) {
+        let (dir, base) = repo();
+        git(&dir, &["config", "user.name", "Reviewer"]);
+        git(&dir, &["config", "user.email", "reviewer@example.invalid"]);
+        git(&dir, &["branch", "release", base.as_str()]);
+        let s = snapshot(&dir, &base, None, JobId(Id128(1)), &deny()).unwrap();
+        (dir, base, s)
+    }
+
+    fn rev(dir: &Path, name: &str) -> String {
+        git(dir, &["rev-parse", name])
+    }
+
+    #[test]
+    fn an_unmoved_target_is_fast_forwarded_to_the_snapshot() {
+        let (dir, base, s) = merge_setup();
+        let job = JobId(Id128(1));
+        let merged = merge(&dir, job, &s.tree, &base, "release").unwrap();
+        assert_eq!(rev(&dir, "release"), merged.as_str());
+        assert_eq!(rev(&dir, "release^{tree}"), s.tree.as_str());
+        assert_eq!(
+            rev(&dir, &format!("refs/argus/{}/{}", job.0, s.tree.as_str())),
+            merged.as_str()
+        );
+        // A retry changes nothing.
+        assert_eq!(merge(&dir, job, &s.tree, &base, "release").unwrap(), merged);
+        assert_eq!(rev(&dir, "release"), merged.as_str());
+    }
+
+    #[test]
+    fn a_moved_target_gets_a_merge_commit_with_both_sides() {
+        let (dir, base, s) = merge_setup();
+        let other = std::env::temp_dir().join(format!("argus-git-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        git(
+            &dir,
+            &["worktree", "add", "-q", other.to_str().unwrap(), "release"],
+        );
+        std::fs::write(other.join("notes.md"), "elsewhere\n").unwrap();
+        git(&other, &["add", "notes.md"]);
+        git(&other, &["commit", "-qm", "meanwhile"]);
+        let moved = rev(&dir, "release");
+        git(
+            &dir,
+            &["worktree", "remove", "--force", other.to_str().unwrap()],
+        );
+
+        let merged = merge(&dir, JobId(Id128(1)), &s.tree, &base, "release").unwrap();
+        let parents = git(&dir, &["rev-list", "--parents", "-n", "1", merged.as_str()]);
+        assert_eq!(parents.split(' ').count(), 3, "{parents}");
+        assert!(parents.contains(&moved));
+        let files = git(&dir, &["ls-tree", "-r", "--name-only", merged.as_str()]);
+        assert!(
+            files.contains("notes.md") && files.contains("src/c.txt"),
+            "{files}"
+        );
+        assert_eq!(
+            git(&dir, &["log", "-1", "--format=%an", merged.as_str()]),
+            "Reviewer"
+        );
+    }
+
+    #[test]
+    fn a_conflict_names_its_paths_and_moves_nothing() {
+        let (dir, base, s) = merge_setup();
+        let other = std::env::temp_dir().join(format!("argus-git-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        git(
+            &dir,
+            &["worktree", "add", "-q", other.to_str().unwrap(), "release"],
+        );
+        std::fs::write(other.join("a.txt"), "one\nTHREE-WAY\nthree\n").unwrap();
+        git(&other, &["commit", "-qam", "conflicting"]);
+        git(
+            &dir,
+            &["worktree", "remove", "--force", other.to_str().unwrap()],
+        );
+        let before = rev(&dir, "release");
+
+        let err = merge(&dir, JobId(Id128(1)), &s.tree, &base, "release").unwrap_err();
+        assert!(err.contains("a.txt"), "{err}");
+        assert_eq!(rev(&dir, "release"), before);
+    }
+
+    #[test]
+    fn a_checked_out_target_moves_with_its_checkout_only_when_clean() {
+        let (dir, base, s) = merge_setup();
+        let other = std::env::temp_dir().join(format!("argus-git-checkout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other);
+        git(
+            &dir,
+            &["worktree", "add", "-q", other.to_str().unwrap(), "release"],
+        );
+
+        std::fs::write(other.join("b.txt"), "local edit\n").unwrap();
+        let before = rev(&dir, "release");
+        let err = merge(&dir, JobId(Id128(1)), &s.tree, &base, "release").unwrap_err();
+        assert!(err.contains("local changes"), "{err}");
+        assert_eq!(rev(&dir, "release"), before);
+
+        git(&other, &["checkout", "--", "b.txt"]);
+        let merged = merge(&dir, JobId(Id128(1)), &s.tree, &base, "release").unwrap();
+        assert_eq!(rev(&dir, "release"), merged.as_str());
+        // The checkout followed: its files are the snapshot's, and nothing is left changed.
+        assert_eq!(
+            std::fs::read_to_string(other.join("a.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        assert_eq!(git(&other, &["status", "--porcelain"]), "");
     }
 }
