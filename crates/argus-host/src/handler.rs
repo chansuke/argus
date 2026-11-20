@@ -660,4 +660,136 @@ mod tests {
         ));
         host.shutdown();
     }
+
+    /// Edits the job's worktree and records a snapshot of it through the job's loop,
+    /// the way the policy would; returns the head tree.
+    fn head_after_edit(host: &Host, root: &Path, job: &str) -> String {
+        use argus_core::event::{Author, Event, RunPurpose};
+        use argus_core::ids::{Id128, JobId, RunId};
+        let worktree = root.join("data").join("worktrees").join(job);
+        std::fs::write(worktree.join("a.txt"), "one\ntwo\n").unwrap();
+        let id = JobId(Id128::parse(job).unwrap());
+        let handle = host.inner.job(id).unwrap();
+        let run = RunId(Id128::derive("test-snapshot", job.as_bytes()));
+        let request = Event::RunRequested {
+            run,
+            purpose: RunPurpose::Snapshot { after: None },
+        };
+        handle.submit(Author::Policy, request).unwrap();
+        for _ in 0..200 {
+            let head = handle.read(&mut Vec::new(), |l| {
+                l.views()
+                    .review()
+                    .head()
+                    .map(|h| h.snapshot.tree.as_str().to_owned())
+            });
+            if let Some(tree) = head {
+                return tree;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("no snapshot");
+    }
+
+    #[test]
+    fn a_verdict_on_the_head_then_a_merge_moves_the_target() {
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-merge");
+        let tree = head_after_edit(&host, &root, &job);
+
+        let stale = format!(
+            r#"{{"request_id":"d-0","job":"{job}","tree":"{}","verdict":"Approve","note":""}}"#,
+            "1".repeat(40)
+        );
+        match call(&host, &Caller::Local, "decide", &stale) {
+            Err(ApiError::StaleHead { head }) => assert_eq!(head.as_deref(), Some(tree.as_str())),
+            other => panic!("{other:?}"),
+        }
+        let early = format!(r#"{{"job":"{job}","tree":"{tree}"}}"#);
+        assert!(matches!(
+            call(&host, &Caller::Local, "merge", &early),
+            Err(ApiError::StaleHead { .. })
+        ));
+
+        let approve = format!(
+            r#"{{"request_id":"d-1","job":"{job}","tree":"{tree}","verdict":"Approve","note":"lgtm"}}"#
+        );
+        call(&host, &Caller::Local, "decide", &approve).unwrap();
+        let merged = call(&host, &Caller::Local, "merge", &early).unwrap();
+        assert_eq!(text(&merged, &["job"]), job);
+        for _ in 0..200 {
+            if git(&repo, &["rev-parse", "main^{tree}"]) == tree {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(git(&repo, &["rev-parse", "main^{tree}"]), tree);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        host.shutdown();
+    }
+
+    #[test]
+    fn threads_build_the_feedback_the_agent_would_receive() {
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-threads");
+        let tree = head_after_edit(&host, &root, &job);
+        let open = format!(
+            r#"{{"request_id":"t-1","job":"{job}","anchor":{{"kind":"Code","tree":"{tree}","path":"a.txt","start":1,"end":1}},"body":"keep it"}}"#
+        );
+        call(&host, &Caller::Local, "open_thread", &open).unwrap();
+        let thread = argus_core::ids::Id128::derive("thread", b"t-1").to_string();
+        let reply = format!(
+            r#"{{"request_id":"t-2","job":"{job}","thread":"{thread}","body":"and test it"}}"#
+        );
+        call(&host, &Caller::Local, "reply", &reply).unwrap();
+
+        let preview = format!(r#"{{"job":"{job}","note":"Almost."}}"#);
+        let text_of = |v: &Json| (text(v, &["text"]).to_owned(), v.get("comments").cloned());
+        let (body, comments) =
+            text_of(&call(&host, &Caller::Local, "preview_feedback", &preview).unwrap());
+        assert_eq!(
+            body,
+            "Almost.\n\n- a.txt:1: keep it\n- a.txt:1: and test it\n"
+        );
+        assert_eq!(comments, Some(Json::Num(argus_json::Number::from_u64(2))));
+
+        let resolve = format!(r#"{{"job":"{job}","thread":"{thread}","resolved":true}}"#);
+        call(&host, &Caller::Local, "resolve", &resolve).unwrap();
+        let (_, comments) =
+            text_of(&call(&host, &Caller::Local, "preview_feedback", &preview).unwrap());
+        assert_eq!(comments, Some(Json::Num(argus_json::Number::from_u64(0))));
+
+        let bad = format!(
+            r#"{{"request_id":"t-3","job":"{job}","anchor":{{"kind":"Code","tree":"{tree}","path":"../x","start":1,"end":1}},"body":"x"}}"#
+        );
+        assert!(matches!(
+            call(&host, &Caller::Local, "open_thread", &bad),
+            Err(ApiError::BadInput { .. })
+        ));
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_finding_can_be_dismissed_by_its_id() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-finding");
+        let finding = "src-0f8fad5d-d9cb-469f-a165-70867728950e:3.0#1";
+        let dismiss = format!(r#"{{"job":"{job}","finding":"{finding}","dismissed":true}}"#);
+        call(&host, &Caller::Local, "dismiss_finding", &dismiss).unwrap();
+        let id = argus_core::ids::JobId(argus_core::ids::Id128::parse(&job).unwrap());
+        let parsed = argus_core::ids::FindingId::parse(finding).unwrap();
+        let dismissed = host.inner.job(id).unwrap().read(&mut Vec::new(), move |l| {
+            l.views().review().is_dismissed(&parsed)
+        });
+        assert!(dismissed);
+        let bad = format!(r#"{{"job":"{job}","finding":"nope","dismissed":true}}"#);
+        assert!(matches!(
+            call(&host, &Caller::Local, "dismiss_finding", &bad),
+            Err(ApiError::BadInput { .. })
+        ));
+        host.shutdown();
+    }
 }
