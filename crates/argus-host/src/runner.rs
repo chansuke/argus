@@ -3,52 +3,72 @@
 
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use argus_core::ids::{Attempt, RunId};
+use argus_core::ids::{Attempt, CommitOid, JobId, RunId, TreeOid};
 use argus_core::ledger::SourceCursor;
 use argus_core::plan::{CommandSpec, Effect, Invocation, PlanEnv};
 use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
+use argus_log::BlobStore;
 
 use crate::ledger_thread::{self, Cmd, observe};
 use crate::pty;
 
 pub(crate) struct Running {
     pub run: RunId,
-    pub pid: Option<u32>,
-    kill: Sender<()>,
+    cancel: Sender<()>,
 }
 
-/// TODO:
-/// - Process(spec): materialize workdir (git::materialize for Snapshot); open sources
-///   (stdin -> write bytes as frames first; stdout/stderr or one Terminal source);
-///   spawn (PTY via `script -qfec` or openpty FFI, see open question); one reader thread
-///   per stream: Framer::push -> Cmd::Observe; tailers for `watch` globs;
-///   wait (timeout -> kill); collect artifacts; submit RunFinished; send Released.
-/// - Leased{lease, inner}: lease::run_leased(lease, inner, ...) wraps the same steps.
-/// - InProcess(Snapshot): git::snapshot(.., &env.snapshot_deny) -> RunFinished{ Snapshot(..) }.
-/// - InProcess(Merge(token)): git::merge(repo, &token, &job.target) ->
-///   RunFinished{ Merged{commit} | Failed{reason} }.
-/// - InProcess(WriteSkill): write `<target>/<name>/SKILL.md` (frontmatter name +
-///   description, then body) via temp + rename -> RunFinished{ SkillWritten }.
-/// - InProcess(Import): stream the file through the kind's framer -> Observe; finish.
-pub(crate) fn start(inv: Invocation, env: PlanEnv, ledger: Sender<Cmd>) -> Running {
+impl Running {
+    /// Asks the run to stop (`RunCancelRequested` reached the host). Idempotent.
+    pub(crate) fn cancel(&self) {
+        let _ = self.cancel.send(());
+    }
+}
+
+/// Where a job's runs execute and what they record into. `PlanEnv` says what to run;
+/// this says where, from the job's `JobInfo` and the views at start.
+#[derive(Clone)]
+pub(crate) struct Workspace {
+    pub repo: PathBuf,
+    pub worktree: PathBuf,
+    pub home: PathBuf,
+    pub blobs: BlobStore,
+    pub job: JobId,
+    pub base: CommitOid,
+    /// The head snapshot's tree when the run starts (a new snapshot's `previous`).
+    pub previous: Option<TreeOid>,
+}
+
+/// How long a cancelled run has to exit before it is killed.
+pub(crate) const GRACE: Duration = Duration::from_secs(10);
+
+/// Executes `inv` on its own thread and reports back as facts: sources while it runs,
+/// then `RunFinished` (by the host), then `Released`.
+///
+/// - `Process`: in the job worktree, home, or a throwaway checkout of the snapshot; with
+///   its `watch` files followed and its artifact directory collected afterwards.
+/// - `Snapshot`: `git::snapshot` of the worktree.
+/// - `Import`: the file streamed through its kind's framer, as one source.
+/// - Leased (device checks), `Merge`, and `WriteSkill` are not written yet: they finish
+///   as `Failed`, so nothing waits on them forever.
+pub(crate) fn start(inv: Invocation, env: PlanEnv, ws: Workspace, ledger: Sender<Cmd>) -> Running {
     todo!("not implemented")
 }
 
-/// Files left in `$ARGUS_ARTIFACT_DIR`: BlobStore::put_file each (fsync), then submit
-/// `ArtifactCaptured` (blob written before the event that names it).
+/// Files left in `dir` (`$ARGUS_ARTIFACT_DIR`): each is put in the blob store (fsynced)
+/// before the `ArtifactCaptured` that names it is submitted, in name order.
 pub(crate) fn collect_artifacts(
-    dir: &std::path::Path,
-    run: RunId,
-    attempt: Attempt,
+    dir: &Path,
+    env: &PlanEnv,
+    blobs: &BlobStore,
     ledger: &Sender<Cmd>,
-) {
+) -> std::io::Result<()> {
     todo!("not implemented")
 }
 
@@ -250,10 +270,6 @@ fn pump(
     }))
 }
 
-pub(crate) fn run_effect(effect: Effect, env: &PlanEnv, ledger: &Sender<Cmd>) {
-    todo!("not implemented")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +335,240 @@ mod tests {
         let ended = spawn_capture(spec, dir, &env(), &ledger, control).unwrap();
         drop(ledger);
         (ended, thread.join().unwrap())
+    }
+
+    // ------------------------------------------------------------ start
+
+    use argus_core::event::{Author, Event, RunOutcome};
+    use argus_core::plan::{Effect, Invocation};
+
+    fn workspace(worktree: &Path) -> Workspace {
+        let data = worktree.join(".argus-data");
+        Workspace {
+            repo: worktree.to_path_buf(),
+            worktree: worktree.to_path_buf(),
+            home: worktree.to_path_buf(),
+            blobs: argus_log::LogDir::new(data).blobs(),
+            job: argus_core::ids::JobId(Id128(1)),
+            base: CommitOid::parse(&"b".repeat(40)).unwrap(),
+            previous: None,
+        }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("argus-start-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Runs `inv` to its end and returns what the ledger received.
+    fn run_to_end(inv: Invocation, ws: Workspace) -> Received {
+        let (ledger, thread) = fake_ledger();
+        let running = start(inv, env(), ws, ledger.clone());
+        assert_eq!(running.run, RunId(Id128(1)));
+        drop(ledger);
+        drop(running);
+        thread.join().unwrap()
+    }
+
+    fn finished(got: &Received) -> RunOutcome {
+        match got.events.last() {
+            Some((
+                Author::Host,
+                Event::RunFinished {
+                    run,
+                    attempt,
+                    outcome,
+                },
+            )) => {
+                assert_eq!((*run, *attempt), (RunId(Id128(1)), Attempt(0)));
+                outcome.clone()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_process_run_finishes_with_its_exit_code() {
+        let dir = scratch_dir("exit");
+        let got = run_to_end(Invocation::Process(sh("echo hi; exit 3")), workspace(&dir));
+        assert_eq!(finished(&got), RunOutcome::Exited { code: 3 });
+        assert_eq!(
+            by_origin(&got, SourceOrigin::Stdout).unwrap().1.concat(),
+            b"hi\n"
+        );
+    }
+
+    #[test]
+    fn a_program_that_cannot_start_is_a_spawn_failure() {
+        let dir = scratch_dir("spawn");
+        let mut spec = sh("");
+        spec.program = PathBuf::from("/nonexistent/argus-test-program");
+        let got = run_to_end(Invocation::Process(spec), workspace(&dir));
+        assert!(
+            matches!(finished(&got), RunOutcome::SpawnFailed { .. }),
+            "{:?}",
+            finished(&got)
+        );
+    }
+
+    #[test]
+    fn files_left_in_the_artifact_directory_are_stored_before_the_run_finishes() {
+        let dir = scratch_dir("artifacts");
+        let mut spec = sh(
+            "printf png > \"$ARGUS_ARTIFACT_DIR/shot.png\"; printf log > \"$ARGUS_ARTIFACT_DIR/a.txt\"",
+        );
+        spec.artifacts = true;
+        let ws = workspace(&dir);
+        let got = run_to_end(Invocation::Process(spec), ws.clone());
+        assert_eq!(finished(&got), RunOutcome::Exited { code: 0 });
+        let captured: Vec<_> = got
+            .events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::ArtifactCaptured {
+                    name,
+                    media_type,
+                    len,
+                    blob,
+                    ..
+                } => Some((
+                    name.clone(),
+                    media_type.clone(),
+                    *len,
+                    std::fs::read(ws.blobs.path(blob)).unwrap(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            captured,
+            vec![
+                (
+                    "a.txt".to_owned(),
+                    "text/plain".to_owned(),
+                    3,
+                    b"log".to_vec()
+                ),
+                (
+                    "shot.png".to_owned(),
+                    "image/png".to_owned(),
+                    3,
+                    b"png".to_vec()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_finishes_as_killed_by_request() {
+        let dir = scratch_dir("cancel");
+        let (ledger, thread) = fake_ledger();
+        let running = start(
+            Invocation::Process(sh(BUSY)),
+            env(),
+            workspace(&dir),
+            ledger.clone(),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        running.cancel();
+        drop(ledger);
+        let got = thread.join().unwrap();
+        assert!(
+            matches!(
+                finished(&got),
+                RunOutcome::Killed {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            finished(&got)
+        );
+    }
+
+    #[test]
+    fn an_import_streams_the_file_as_one_source() {
+        let dir = scratch_dir("import");
+        let file = dir.join("old.jsonl");
+        std::fs::write(&file, "{\"a\":1}\n{\"b\":2}").unwrap();
+        let inv = Invocation::InProcess(Effect::Import {
+            transcript: file.clone(),
+            kind: SourceKind::ClaudeTranscript,
+        });
+        let got = run_to_end(inv, workspace(&dir));
+        assert_eq!(finished(&got), RunOutcome::Exited { code: 0 });
+        let (kind, frames) = by_origin(&got, SourceOrigin::File(file)).unwrap();
+        assert_eq!(kind, SourceKind::ClaudeTranscript);
+        assert_eq!(frames, vec![b"{\"a\":1}\n".to_vec(), b"{\"b\":2}".to_vec()]);
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A repository whose worktree changed `a.txt` after the base commit.
+    fn job_repo(name: &str) -> Workspace {
+        let dir = scratch_dir(name);
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "base"]);
+        let mut ws = workspace(&dir);
+        ws.base = CommitOid::parse(&git(&dir, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
+        ws
+    }
+
+    #[test]
+    fn a_snapshot_run_finishes_with_the_snapshot() {
+        let ws = job_repo("snapshot");
+        let got = run_to_end(Invocation::InProcess(Effect::Snapshot), ws.clone());
+        let RunOutcome::Snapshot(s) = finished(&got) else {
+            panic!("{:?}", finished(&got))
+        };
+        assert_eq!(s.base, ws.base);
+        let blob = git(&ws.repo, &["show", &format!("{}:a.txt", s.tree.as_str())]);
+        assert_eq!(blob, "changed");
+    }
+
+    #[test]
+    fn a_checker_runs_in_a_checkout_of_its_snapshot() {
+        let ws = job_repo("checkout");
+        let got = run_to_end(Invocation::InProcess(Effect::Snapshot), ws.clone());
+        let RunOutcome::Snapshot(s) = finished(&got) else {
+            panic!()
+        };
+        // The agent edits again; the checker must judge the snapshot, not this.
+        std::fs::write(ws.worktree.join("a.txt"), "later\n").unwrap();
+        let mut spec = sh("cat a.txt; basename \"$PWD\"");
+        spec.workdir = Workdir::Snapshot {
+            tree: s.tree,
+            base: s.base,
+        };
+        let got = run_to_end(Invocation::Process(spec), ws.clone());
+        let out =
+            String::from_utf8(by_origin(&got, SourceOrigin::Stdout).unwrap().1.concat()).unwrap();
+        let mut lines = out.lines();
+        assert_eq!(lines.next(), Some("changed"));
+        assert!(
+            lines.next().unwrap().starts_with("argus-checkout-"),
+            "{out}"
+        );
     }
 
     /// Loops for about five seconds unless stopped.
