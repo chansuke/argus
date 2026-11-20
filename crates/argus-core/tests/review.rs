@@ -503,3 +503,91 @@ fn feedback_text_is_the_note_then_one_located_item_per_comment() {
     assert_eq!(render_feedback("Looks wrong.", &[]), "Looks wrong.\n");
     assert_eq!(render_feedback(" ", &[]), "");
 }
+
+#[test]
+fn the_head_names_what_the_host_must_diff() {
+    let mut board = ReviewBoard::default();
+    let mut feed = Feed::default();
+    assert_eq!(board.diff_request(), None);
+    snapshot(&mut board, &mut feed, 1, oid('1'), None, vec![]);
+    let request = board.diff_request().unwrap();
+    assert_eq!((request.base, request.tree), (oid('b'), oid('1')));
+}
+
+#[test]
+fn each_answer_without_the_contract_is_one_open_item() {
+    let mut board = ReviewBoard::default();
+    let mut feed = Feed::default();
+    snapshot(&mut board, &mut feed, 1, oid('1'), None, vec![]);
+    let head = Some(oid('1'));
+    review(&mut board, &mut feed, 5, '1', "Looks fine, I think.");
+    assert_eq!(board.gate(head.as_ref()), GateState::Red { open: 1 });
+    review(&mut board, &mut feed, 6, '1', "No block either.");
+    assert_eq!(board.gate(head.as_ref()), GateState::Red { open: 2 });
+}
+
+#[test]
+fn a_thread_moves_only_through_snapshots_after_its_own() {
+    let mut board = ReviewBoard::default();
+    let mut feed = Feed::default();
+    snapshot(&mut board, &mut feed, 1, oid('1'), None, vec![]);
+    // The snapshot the thread is on has its own delta from the one before; that edit is
+    // already in the lines the thread names, so it must not move them again.
+    snapshot(
+        &mut board,
+        &mut feed,
+        2,
+        oid('2'),
+        Some(oid('1')),
+        vec![("src/a.rs", vec![hunk(0, 0, 1, 5)])],
+    );
+    let code = Anchor::Code {
+        tree: oid('2'),
+        path: path("src/a.rs"),
+        lines: lines(10, 12),
+    };
+    thread(&mut board, &mut feed, 1, code, "check the bounds");
+    snapshot(
+        &mut board,
+        &mut feed,
+        3,
+        oid('3'),
+        Some(oid('2')),
+        vec![("src/b.rs", vec![hunk(1, 1, 1, 1)])],
+    );
+    assert_eq!(
+        board.feedback(None)[0].at.map(|(_, l)| l),
+        Some(lines(10, 12))
+    );
+}
+
+#[test]
+fn resolving_a_thread_twice_changes_nothing_the_second_time() {
+    let mut board = ReviewBoard::default();
+    let mut feed = Feed::default();
+    snapshot(&mut board, &mut feed, 1, oid('1'), None, vec![]);
+    thread(
+        &mut board,
+        &mut feed,
+        1,
+        Anchor::Task(argus_core::ids::TaskKey(Id128(3))),
+        "split this",
+    );
+    let resolve = |resolved| Event::ThreadResolved {
+        thread: ThreadId(Id128(1)),
+        resolved,
+    };
+    assert!(
+        feed.authored(&mut board, T0 + 40_000, Author::Human, resolve(true))
+            .1
+    );
+    assert!(
+        !feed
+            .authored(&mut board, T0 + 40_001, Author::Human, resolve(true))
+            .1
+    );
+    assert!(
+        feed.authored(&mut board, T0 + 40_002, Author::Human, resolve(false))
+            .1
+    );
+}
