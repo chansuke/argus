@@ -394,6 +394,22 @@ mod tests {
             &[bytes(0, "z\n"), bytes(2, "b\n"), bytes(4, "new\n")]
         );
     }
+
+    #[test]
+    fn a_discontinuity_says_how_much_was_stored_before_it() {
+        let path = scratch_file();
+        append(&path, "abc\nde\n");
+        let mut t = Tailer::new(path.clone(), &cursor(&path, 0, None));
+        t.poll().unwrap();
+        fs::write(&path, "x\n").unwrap();
+        assert_eq!(
+            t.poll().unwrap()[0],
+            RawFrame::Discontinuity {
+                stored_end: 7,
+                file_len: 2
+            }
+        );
+    }
 }
 
 #[cfg(test)]
