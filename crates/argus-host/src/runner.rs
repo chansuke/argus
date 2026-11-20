@@ -861,6 +861,119 @@ mod tests {
         ws
     }
 
+    /// An approval token, as only the review board mints them: a snapshot of `tree`,
+    /// then the human's approval of it.
+    fn approved(
+        tree: &argus_core::ids::TreeOid,
+        base: &CommitOid,
+    ) -> argus_core::event::ApprovedHead {
+        use argus_core::event::{Decision, RunPurpose, Snapshot};
+        use argus_core::fact::{Fact, FactBody};
+        use argus_core::ids::{DecisionId, EventId, FactId, Stamp, UnixMillis};
+        use argus_core::views::Projection;
+        use argus_core::views::review::ReviewBoard;
+        let mut board = ReviewBoard::default();
+        let run = RunId(Id128(9));
+        let snapshot = Snapshot {
+            tree: tree.clone(),
+            base: base.clone(),
+            previous: None,
+            delta: Vec::new(),
+            files: Vec::new(),
+            withheld: Vec::new(),
+        };
+        let events = [
+            (
+                Author::Policy,
+                Event::RunRequested {
+                    run,
+                    purpose: RunPurpose::Snapshot { after: None },
+                },
+            ),
+            (
+                Author::Host,
+                Event::RunStarted {
+                    run,
+                    attempt: Attempt(0),
+                    pid: None,
+                },
+            ),
+            (
+                Author::Host,
+                Event::RunFinished {
+                    run,
+                    attempt: Attempt(0),
+                    outcome: RunOutcome::Snapshot(snapshot),
+                },
+            ),
+            (
+                Author::Human,
+                Event::Decided {
+                    decision: DecisionId(Id128(1)),
+                    tree: Some(tree.clone()),
+                    verdict: Decision::Approve,
+                    note: String::new(),
+                },
+            ),
+        ];
+        for (n, (author, event)) in events.iter().enumerate() {
+            let fact = Fact {
+                id: FactId {
+                    event: EventId::parse(&format!("host:{n}")).unwrap(),
+                    part: 0,
+                },
+                stamp: Stamp {
+                    wall_ns: n as u64 + 1,
+                    logical: 0,
+                },
+                at: UnixMillis(n as i64),
+                body: FactBody::Authored { author, event },
+            };
+            board.apply(&fact);
+        }
+        board.approved_head().unwrap()
+    }
+
+    #[test]
+    fn a_merge_run_brings_the_approved_snapshot_into_the_target() {
+        let ws = job_repo("merge");
+        git(&ws.repo, &["branch", &ws.target, ws.base.as_str()]);
+        let got = run_to_end(Invocation::InProcess(Effect::Snapshot), ws.clone());
+        let RunOutcome::Snapshot(s) = finished(&got) else {
+            panic!()
+        };
+        let token = approved(&s.tree, &s.base);
+        let got = run_to_end(Invocation::InProcess(Effect::Merge(token)), ws.clone());
+        let RunOutcome::Merged { commit } = finished(&got) else {
+            panic!("{:?}", finished(&got))
+        };
+        assert_eq!(git(&ws.repo, &["rev-parse", &ws.target]), commit.as_str());
+        assert_eq!(
+            git(&ws.repo, &["rev-parse", &format!("{}^{{tree}}", ws.target)]),
+            s.tree.as_str()
+        );
+    }
+
+    #[test]
+    fn a_merge_that_cannot_happen_fails_with_its_reason() {
+        let ws = job_repo("merge-missing");
+        let got = run_to_end(Invocation::InProcess(Effect::Snapshot), ws.clone());
+        let RunOutcome::Snapshot(s) = finished(&got) else {
+            panic!()
+        };
+        // No `release` branch exists in this repository.
+        let got = run_to_end(
+            Invocation::InProcess(Effect::Merge(approved(&s.tree, &s.base))),
+            ws,
+        );
+        assert_eq!(
+            finished(&got),
+            RunOutcome::Failed {
+                reason: "no branch release".into()
+            }
+        );
+    }
+
     #[test]
     fn a_snapshot_run_finishes_with_the_snapshot() {
         let ws = job_repo("snapshot");
