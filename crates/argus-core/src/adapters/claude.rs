@@ -797,4 +797,69 @@ mod tests {
             &unrecognized[..unrecognized.len().min(10)]
         );
     }
+
+    #[test]
+    fn only_a_notification_about_permission_is_a_permission_wait() {
+        let hook = |name: &str, message: &str| {
+            let line = format!(r#"{{"hook_event_name":"{name}","message":"{message}"}}"#);
+            whats(&decode_hook(line.as_bytes()))[0].clone()
+        };
+        assert!(matches!(
+            hook("Notification", "Claude needs your permission to use Bash"),
+            AgentWhat::PermissionWait { .. }
+        ));
+        assert_eq!(
+            hook("Notification", "Claude is waiting for your input"),
+            AgentWhat::Other {
+                tag: "hook:Notification".into()
+            }
+        );
+        assert_eq!(
+            hook("PreToolUse", "asks for permission"),
+            AgentWhat::Other {
+                tag: "hook:PreToolUse".into()
+            }
+        );
+    }
+
+    /// Coarse on purpose, but each rule is pinned: a hunk a shell command names is "via
+    /// shell" instead of unexplained.
+    #[test]
+    fn shell_commands_name_the_paths_they_touch() {
+        let cases: [(&str, &[&str]); 9] = [
+            ("sed -i s/a/b/ src/lib.rs", &["src/lib.rs"]),
+            ("cargo fmt -- --check", &[]),
+            ("rm -rf target/ && touch out.txt", &["out.txt"]),
+            ("cat 'docs/a.md'|wc -l", &["docs/a.md"]),
+            ("./run.sh;make", &["./run.sh"]),
+            ("echo hello > .env", &[]),
+            ("cp a.rs a.rs", &["a.rs"]),
+            ("python -c x.y(1)", &["x.y"]),
+            ("ls ~/notes/todo.md -o -f.txt", &["~/notes/todo.md"]),
+        ];
+        for (command, want) in cases {
+            assert_eq!(shell_paths(command), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn task_updates_read_every_status_the_agent_writes() {
+        let update = |status: &str| {
+            let line = format!(
+                r#"{{"type":"assistant","uuid":"a","message":{{"id":"m","content":[{{"type":"tool_use","id":"t","name":"TaskUpdate","input":{{"taskId":"2","status":"{status}"}}}}]}}}}"#
+            );
+            whats(&decode_transcript(line.as_bytes()))
+                .into_iter()
+                .find_map(|w| match w {
+                    AgentWhat::Plan(PlanOp::Upsert { status, .. }) => Some(*status),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(update("pending"), Some(PlanStatus::Pending));
+        assert_eq!(update("in_progress"), Some(PlanStatus::InProgress));
+        assert_eq!(update("completed"), Some(PlanStatus::Completed));
+        assert_eq!(update("deleted"), Some(PlanStatus::Deleted));
+        assert_eq!(update("someday"), None);
+    }
 }
