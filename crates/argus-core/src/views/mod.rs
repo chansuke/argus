@@ -68,6 +68,12 @@ pub struct ViewMask(u32);
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct ViewStamp(u64);
 
+impl ViewStamp {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// A fixed set of views a ledger keeps live.
 pub trait ViewSet: Default {
     const KIND: LedgerKind;
