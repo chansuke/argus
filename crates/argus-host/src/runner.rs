@@ -704,6 +704,21 @@ mod tests {
         assert_eq!(frames, vec![b"{\"a\":1}\n".to_vec(), b"{\"b\":2}".to_vec()]);
     }
 
+    #[test]
+    fn importing_a_missing_file_fails() {
+        let dir = scratch_dir("import-missing");
+        let inv = Invocation::InProcess(Effect::Import {
+            transcript: dir.join("nowhere.jsonl"),
+            kind: SourceKind::ClaudeTranscript,
+        });
+        let got = run_to_end(inv, workspace(&dir));
+        assert!(
+            matches!(finished(&got), RunOutcome::Failed { .. }),
+            "{:?}",
+            finished(&got)
+        );
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .args(args)
