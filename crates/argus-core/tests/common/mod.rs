@@ -253,5 +253,5 @@ pub fn set(key: u128, parent: Option<u128>, weight: u32, state: TaskState) -> Ev
 
 pub const DONE: TaskState = TaskState::Done { result: None };
 pub const M15: i64 = 15 * 60 * 1000;
-/// 2026-10-24T03:00:00Z, aligned to every bucket width.
+/// 2026-10-24T03:00:00Z, aligned to 15-minute and hour windows (not to 4-hour ones).
 pub const T0: i64 = 1_792_810_800_000;
