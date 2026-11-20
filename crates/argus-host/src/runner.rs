@@ -2,6 +2,7 @@
 //! nothing about any particular tool (that is `argus_core::adapters`, reached via `plan`).
 
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
@@ -123,6 +124,8 @@ pub(crate) fn spawn_capture(
     let out = open_source(ledger, env, out_origin, out_kind)?;
     let err = open_source(ledger, env, SourceOrigin::Stderr, spec.stderr)?;
 
+    // Its own process group, so a stop reaches what it started too.
+    command.process_group(0);
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take();
     let writer = fed.zip(stdin.take()).map(|(bytes, mut pipe)| {
@@ -136,26 +139,34 @@ pub(crate) fn spawn_capture(
         pump(child.stderr.take(), err, ledger.clone()),
     ];
 
-    let status = match spec.timeout {
-        None => child.wait()?,
-        Some(limit) => {
-            let started = Instant::now();
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                if started.elapsed() >= limit {
-                    child.kill()?;
-                    break child.wait()?;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+    // Stopping: SIGTERM to the process group, then SIGKILL once the grace has passed.
+    let started = Instant::now();
+    let mut stopping: Option<Instant> = None;
+    let mut cancelled = false;
+    let pgid = child.id();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
+        match stopping {
+            None => {
+                let cancel = control.cancel.try_recv().is_ok();
+                let timed_out = spec.timeout.is_some_and(|t| started.elapsed() >= t);
+                if cancel || timed_out {
+                    cancelled = cancel;
+                    signal_group(pgid, "TERM");
+                    stopping = Some(Instant::now());
+                }
+            }
+            Some(since) if since.elapsed() >= control.grace => {
+                signal_group(pgid, "KILL");
+                break child.wait()?;
+            }
+            Some(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(20));
     };
-    let status = Ended {
-        status,
-        cancelled: false,
-    };
+    let status = Ended { status, cancelled };
     drop(stdin);
     if let Some(writer) = writer {
         let _ = writer.join();
@@ -164,6 +175,17 @@ pub(crate) fn spawn_capture(
         let _ = reader.join();
     }
     Ok(status)
+}
+
+/// `kill -<signal> -<pgid>`: std can only SIGKILL one process, not ask a group to exit.
+fn signal_group(pgid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pgid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn open_source(
@@ -303,6 +325,30 @@ mod tests {
         assert_eq!(
             by_origin(&got, SourceOrigin::Stdout).unwrap().1.concat(),
             b"bye\n"
+        );
+    }
+
+    #[test]
+    fn a_cancel_reaches_a_program_on_a_terminal() {
+        let mut spec = sh(&format!("trap 'echo bye; exit 0' TERM; {BUSY}"));
+        spec.terminal = true;
+        let (cancel, control) = control(Duration::from_secs(5));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            cancel.send(()).unwrap();
+        });
+        let started = Instant::now();
+        let (ended, got) = capture_with(&spec, Path::new("/"), &control);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(ended.cancelled);
+        let screen = by_origin(&got, SourceOrigin::Terminal).unwrap().1.concat();
+        assert!(
+            String::from_utf8_lossy(&screen).contains("bye"),
+            "{screen:?}"
         );
     }
 
