@@ -13,13 +13,16 @@ use argus_core::event::{
 };
 use argus_core::ids::{
     CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange, ModelId,
-    RepoPath, RunId, TaskKey, ThreadId, UnixMillis,
+    RepoPath, RunId, SourceId, TaskKey, ThreadId, UnixMillis,
 };
+use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
-use argus_core::source::PlanStatus;
+use argus_core::source::{PlanStatus, SourceKind};
 use argus_core::views::timeline::{BucketWidth, Window};
 use argus_core::views::{GateState, glance, progress, timeline};
+use argus_json::Json;
+use argus_log::{EventId, Seq};
 
 use crate::ledger_thread::LedgerHandle;
 use crate::pulse::Dep;
@@ -103,6 +106,89 @@ fn anchor(input: AnchorInput) -> Result<Anchor, ApiError> {
             start: UnixMillis(start_ms),
         }),
     })
+}
+
+const RAW_PAGE_MAX: u16 = 500;
+
+/// The source a frame belongs to, when its actor is a source (`src-<id>`).
+fn source_of(event: &EventId) -> Option<SourceId> {
+    let id = event.actor.as_str().strip_prefix("src-")?;
+    Id128::parse(id).map(SourceId)
+}
+
+fn fact_of(event: EventId) -> FactId {
+    FactId { event, part: 0 }
+}
+
+fn not_found(e: LedgerError) -> ApiError {
+    match e {
+        LedgerError::UnknownSource(s) => ApiError::NotFound {
+            what: format!("source {}", s.0),
+        },
+        LedgerError::Log(argus_log::LogError::NotFound { .. }) => ApiError::NotFound {
+            what: "no such frame".into(),
+        },
+        other => ledger_error(other),
+    }
+}
+
+fn raw_format(kind: SourceKind) -> RawFormat {
+    match kind {
+        SourceKind::Terminal => RawFormat::Terminal,
+        SourceKind::TlcTool | SourceKind::LeanText | SourceKind::PlainText => RawFormat::Text,
+        SourceKind::ClaudeTranscript
+        | SourceKind::ClaudeStreamJson
+        | SourceKind::ClaudeHook
+        | SourceKind::CodexRollout
+        | SourceKind::CodexExec
+        | SourceKind::LeanJson
+        | SourceKind::EasEvents => RawFormat::Json,
+    }
+}
+
+/// Exact bytes, and argus's reading beside them: an authored event is its stored JSON;
+/// an observed frame lists what argus decoded from it (display only).
+fn raw_record(r: argus_core::ledger::RawRecord) -> RawRecord {
+    let (text, is_utf8) = match String::from_utf8(r.bytes) {
+        Ok(t) => (t, true),
+        Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), false),
+    };
+    let (source, format, repeat, reading) = match &r.reading {
+        Reading::Authored { .. } => {
+            let reading = argus_json::parse(text.as_bytes()).unwrap_or_else(|_| Json::str(&text));
+            (None, RawFormat::Event, false, reading)
+        }
+        Reading::Observed {
+            source,
+            decoded,
+            repeat,
+        } => {
+            let observations = decoded
+                .iter()
+                .map(|o| Json::str(format!("{o:?}")))
+                .collect();
+            let reading = Json::Obj(vec![
+                ("kind".into(), Json::str(format!("{:?}", source.kind))),
+                ("observations".into(), Json::Arr(observations)),
+            ]);
+            (
+                Some(source.id.0.to_string()),
+                raw_format(source.kind),
+                *repeat,
+                reading,
+            )
+        }
+    };
+    RawRecord {
+        fact: fact_of(r.id).to_string(),
+        source,
+        format,
+        stamp: format!("{}.{}", r.stamp.wall_ns, r.stamp.logical),
+        text,
+        is_utf8,
+        repeat,
+        reading,
+    }
 }
 
 fn ledger_error(e: LedgerError) -> ApiError {
@@ -539,10 +625,60 @@ impl Handler for ApiHandler<'_> {
         });
         Ok(page)
     }
+    /// Stored frames exactly as stored. With a source: a page of it in order, from
+    /// `around_fact` (or its start); `next` is the fact to ask from for the page after.
+    /// With only a fact: its source's page from there, or the one authored event.
     fn raw(&mut self, caller: &Caller, input: RawQuery) -> Result<RawPage, ApiError> {
-        // TODO: ledger.raw_page / ledger.raw around a fact (`FactId::parse`); bytes as text
-        //       when UTF-8; format from the source family; repeat from `Reading`.
-        todo!("not implemented")
+        let (_, handle) = self.job_handle(&input.job)?;
+        if input.limit == 0 || input.limit > RAW_PAGE_MAX {
+            return Err(ApiError::BadInput {
+                path: "limit".into(),
+                what: format!("between 1 and {RAW_PAGE_MAX}"),
+            });
+        }
+        let around = input
+            .around_fact
+            .as_deref()
+            .map(|f| {
+                FactId::parse(f).ok_or_else(|| ApiError::BadInput {
+                    path: "around_fact".into(),
+                    what: format!("not a fact id: {f:?}"),
+                })
+            })
+            .transpose()?;
+        let source = match (input.source.as_deref(), &around) {
+            (Some(s), _) => Some(SourceId(id(s, "source")?)),
+            (None, Some(fact)) => source_of(&fact.event),
+            (None, None) => {
+                return Err(ApiError::BadInput {
+                    path: "source".into(),
+                    what: "a source or a fact to start from".into(),
+                });
+            }
+        };
+        let limit = usize::from(input.limit);
+        handle.read(&mut self.deps, move |l| match source {
+            Some(source) => {
+                let from = around
+                    .filter(|f| source_of(&f.event) == Some(source))
+                    .map_or(Seq::FIRST, |f| f.event.seq);
+                let mut records = l.raw_page(source, from, limit + 1).map_err(not_found)?;
+                let next = (records.len() > limit).then(|| {
+                    let extra = records.pop().expect("more than limit");
+                    fact_of(extra.id).to_string()
+                });
+                let records = records.into_iter().map(raw_record).collect();
+                Ok(RawPage { records, next })
+            }
+            None => {
+                let fact = around.expect("a fact when there is no source");
+                let record = l.raw(&fact.event).map_err(not_found)?;
+                Ok(RawPage {
+                    records: vec![raw_record(record)],
+                    next: None,
+                })
+            }
+        })
     }
     fn review(&mut self, caller: &Caller, input: JobRef) -> Result<ReviewScreen, ApiError> {
         // TODO: two short reads with git between them, on this API thread, so the job's
