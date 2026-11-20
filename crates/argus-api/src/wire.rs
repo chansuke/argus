@@ -92,7 +92,7 @@ impl Wire for f64 {
         "number".into()
     }
     fn to_json(&self) -> Json {
-        todo!("not implemented")
+        Number::from_f64(*self).map_or(Json::Null, Json::Num)
     }
     fn from_json(v: &Json) -> Result<Self, WireError> {
         match v {
