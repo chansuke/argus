@@ -970,6 +970,32 @@ mod tests {
         );
     }
 
+    /// The grace is for cleaning up: a process that takes a while to exit gets it.
+    #[test]
+    fn a_process_that_takes_a_moment_to_exit_is_given_the_grace() {
+        let spec = sh(&format!("trap 'sleep 0.3; echo bye; exit 0' TERM; {BUSY}"));
+        let (cancel, mut control) = control(Duration::from_secs(5));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel.send(()).unwrap();
+        });
+        let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
+        assert!(ended.cancelled);
+        assert_eq!(ended.status.code(), Some(0));
+        assert_eq!(
+            by_origin(&got, SourceOrigin::Stdout).unwrap().1.concat(),
+            b"bye\n"
+        );
+    }
+
+    #[test]
+    fn a_process_that_ends_within_its_timeout_is_left_alone() {
+        let mut spec = sh("sleep 0.1; exit 0");
+        spec.timeout = Some(Duration::from_secs(10));
+        let (status, _) = capture(&spec, Path::new("/"));
+        assert!(status.success());
+    }
+
     #[test]
     fn a_process_that_ignores_the_request_is_killed_after_the_grace() {
         let spec = sh(&format!("trap '' TERM; {BUSY}"));
