@@ -246,3 +246,44 @@ fn real_transcript_lines_round_trip_byte_for_byte() {
         &differ[..differ.len().min(5)]
     );
 }
+
+// ---------------------------------------------------------------- found by mutation testing
+
+#[test]
+fn numbers_read_as_integers_or_floats_without_losing_their_lexeme() {
+    let as_num = |s: &str| match parse(s.as_bytes()).unwrap() {
+        Json::Num(n) => n,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(as_num("12").as_i64(), Some(12));
+    assert_eq!(as_num("-7").as_i64(), Some(-7));
+    assert_eq!(as_num("1.5").as_i64(), None);
+    assert_eq!(as_num("1.5").as_f64(), Some(1.5));
+    assert_eq!(as_num("-2e3").as_f64(), Some(-2000.0));
+    assert_eq!(Number::from_i64(-3).as_i64(), Some(-3));
+}
+
+#[test]
+fn fields_and_strings_are_read_only_from_what_holds_them() {
+    let v = parse(br#"{"a":"x","b":1}"#).unwrap();
+    assert_eq!(v.get("a").and_then(Json::as_str), Some("x"));
+    assert_eq!(v.get("b").and_then(Json::as_str), None);
+    assert_eq!(v.get("c"), None);
+    assert_eq!(Json::Arr(vec![]).get("a"), None);
+    assert_eq!(Json::str("y").as_str(), Some("y"));
+    assert_eq!(Json::Null.as_str(), None);
+}
+
+#[test]
+fn invalid_utf8_is_reported_where_it_starts() {
+    let err = parse(b"\"ab\xffcd\"").unwrap_err();
+    assert_eq!(err.at, 3);
+    // After an escape, the position still counts from the start of the input.
+    let err = parse(b"\"a\\n\xff\"").unwrap_err();
+    assert_eq!(err.at, 4);
+}
+
+#[test]
+fn a_space_is_written_as_itself_and_only_controls_are_escaped() {
+    assert_eq!(write(&Json::str(" \u{1f}")), "\" \\u001f\"");
+}
