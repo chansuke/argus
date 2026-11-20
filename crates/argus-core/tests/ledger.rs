@@ -515,3 +515,42 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+
+#[test]
+fn a_source_is_listed_paged_and_pruned_whole() {
+    let dir = scratch("prune");
+    let mut ledger = TestLedger::open(&dir).unwrap();
+    let meta = transcript(run(1), "/h/.claude/projects/w/s.jsonl");
+    ledger.open_source(meta.clone()).unwrap();
+    let ids = ledger.observe(meta.id, frames(LINES, 0)).unwrap();
+    assert_eq!(ledger.source(meta.id), Some(&meta));
+
+    let page = ledger
+        .raw_page(meta.id, argus_log::Seq::FIRST.next(), 5)
+        .unwrap();
+    let bytes: Vec<_> = page.iter().map(|r| r.bytes.clone()).collect();
+    assert_eq!(
+        bytes,
+        vec![
+            format!("{}\n", LINES[1]).into_bytes(),
+            format!("{}\n", LINES[2]).into_bytes()
+        ]
+    );
+    assert_eq!(
+        ledger
+            .raw_page(meta.id, argus_log::Seq::FIRST, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    ledger.prune_source(meta.id).unwrap();
+    assert_eq!(ledger.source(meta.id), None);
+    assert!(matches!(ledger.raw(&ids[0]), Err(LedgerError::Pruned(id)) if id == meta.id));
+    let log = dir.join(format!("{}.alog", ids[0].actor.as_str()));
+    assert!(!log.exists());
+    // The removal is on record, so a reopened store says why the bytes are gone.
+    drop(ledger);
+    let reopened = TestLedger::open(&dir).unwrap();
+    assert!(matches!(reopened.raw(&ids[0]), Err(LedgerError::Pruned(_))));
+}
