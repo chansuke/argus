@@ -26,6 +26,11 @@ impl Number {
     pub fn from_u64(n: u64) -> Self {
         Number(n.to_string())
     }
+    /// `None` for NaN and the infinities, which JSON cannot write. `Display` gives the
+    /// shortest digits that read back as the same float, without an exponent.
+    pub fn from_f64(x: f64) -> Option<Self> {
+        x.is_finite().then(|| Number(x.to_string()))
+    }
     pub fn as_i64(&self) -> Option<i64> {
         self.0.parse().ok()
     }
