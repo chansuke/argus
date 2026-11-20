@@ -104,3 +104,25 @@ fn the_review_prompt_names_the_base_the_lens_and_the_output_contract() {
     assert!(prompt.contains("high, medium, low, nit"), "{prompt}");
     assert!(!panel_of(1, None)[0].1.llm.prompt.contains("lease recovery"));
 }
+
+#[test]
+fn preset_names_are_lowercase_words_joined_by_hyphens() {
+    use argus_core::models::{ModelPresets, PresetName};
+    use std::collections::BTreeMap;
+    assert_eq!(PresetName::parse("panel-2").unwrap().as_str(), "panel-2");
+    for bad in ["", "Panel", "panel 2", "panel_2", "pánel"] {
+        assert!(PresetName::parse(bad).is_none(), "{bad:?} accepted");
+    }
+    let set = ModelSet::new([choice(AgentCli::Claude, "opus", None)]).unwrap();
+    let quick = PresetName::parse("quick").unwrap();
+    let presets = ModelPresets::new(
+        BTreeMap::from([(quick.clone(), set.clone())]),
+        quick.clone(),
+    )
+    .unwrap();
+    let listed: Vec<_> = presets
+        .iter()
+        .map(|(name, s)| (name.as_str(), s.clone()))
+        .collect();
+    assert_eq!(listed, vec![("quick", set)]);
+}
