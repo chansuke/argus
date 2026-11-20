@@ -8,7 +8,7 @@ use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,7 @@ impl Running {
     }
 
     /// Asks the run to stop (`RunCancelRequested` reached the host). Idempotent.
+    /// Dropping the handle stops the run as well.
     pub(crate) fn cancel(&self) {
         let _ = self.cancel.send(());
     }
@@ -413,7 +414,9 @@ pub(crate) fn spawn_capture(
         }
         match stopping {
             None => {
-                let cancel = control.cancel.try_recv().is_ok();
+                // A dropped `Running` (the host is going away, or its caller gave up) is
+                // a cancel too: no process outlives the handle that could stop it.
+                let cancel = !matches!(control.cancel.try_recv(), Err(TryRecvError::Empty));
                 let timed_out = spec.timeout.is_some_and(|t| started.elapsed() >= t);
                 if cancel || timed_out {
                     cancelled = cancel;
