@@ -12,19 +12,14 @@ use argus_core::source::{Framer, RawFrame, SourceKind};
 
 use crate::ledger_thread::Cmd;
 
-/// Follows one file from `cursor.resume_at` until its run finishes (then a final read and
-/// `framer.finish()`). Never stops on a rewrite.
-///
-/// TODO, per poll:
-/// - rewritten = file len < resume_at, or the bytes at `cursor.last`'s offset no longer
-///   equal the last stored frame (the agent truncated, compacted, or rewrote its log).
-/// - rewritten -> Observe [RawFrame::Discontinuity { stored_end: resume_at, file_len }],
-///   reset the framer to offset 0, and ingest the whole new content. Stored frames are
-///   never edited, so every reference stays valid; records the new content repeats are
-///   dropped by `ledger::Applied`, so nothing is counted twice.
-/// - else read the new bytes -> framer.push -> Observe (complete units only).
 /// The state of following one file, without threads or timers: each `poll` reads what
 /// is new and returns the frames to store.
+///
+/// A file shorter than what was read, or with other bytes where the last stored frame
+/// was, was truncated or rewritten under us (an agent compacting its log). That becomes
+/// a `Discontinuity` frame, and the whole new content follows from offset 0. Stored
+/// frames are never edited, so every reference stays valid; records the new content
+/// repeats are dropped by `ledger::Applied`, so nothing is counted twice.
 pub(crate) struct Tailer {
     path: PathBuf,
     kind: SourceKind,
