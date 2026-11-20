@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use argus_core::event::{
     AgentLaunch, Anchor, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens,
-    RunPurpose,
+    RunPurpose, TaskState,
 };
 use argus_core::ids::{
     CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange, ModelId,
@@ -17,8 +17,9 @@ use argus_core::ids::{
 };
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
+use argus_core::source::PlanStatus;
 use argus_core::views::timeline::{BucketWidth, Window};
-use argus_core::views::{GateState, glance, progress};
+use argus_core::views::{GateState, glance, progress, timeline};
 
 use crate::ledger_thread::LedgerHandle;
 use crate::pulse::Dep;
@@ -98,11 +99,7 @@ fn anchor(input: AnchorInput) -> Result<Anchor, ApiError> {
             FactId::parse(&fact).ok_or_else(|| bad("fact", format!("not a fact id: {fact:?}")))?,
         ),
         AnchorInput::Window { start_ms, width } => Anchor::Window(Window {
-            width: match width {
-                Bucket::M15 => BucketWidth::M15,
-                Bucket::H1 => BucketWidth::H1,
-                Bucket::H4 => BucketWidth::H4,
-            },
+            width: bucket_width(width),
             start: UnixMillis(start_ms),
         }),
     })
@@ -226,6 +223,138 @@ fn attention(a: &glance::Attention) -> Attention {
     }
 }
 
+fn task_status(s: &TaskState) -> TaskStatus {
+    match s {
+        TaskState::Pending => TaskStatus::Pending {},
+        TaskState::InProgress => TaskStatus::InProgress {},
+        TaskState::Blocked { reason } => TaskStatus::Blocked {
+            reason: reason.clone(),
+        },
+        TaskState::Done { result } => TaskStatus::Done {
+            result: result.clone(),
+        },
+        TaskState::Dropped => TaskStatus::Dropped {},
+    }
+}
+
+fn plan_status(s: PlanStatus) -> TaskStatus {
+    match s {
+        PlanStatus::Pending => TaskStatus::Pending {},
+        PlanStatus::InProgress => TaskStatus::InProgress {},
+        PlanStatus::Completed => TaskStatus::Done { result: None },
+        PlanStatus::Deleted => TaskStatus::Dropped {},
+    }
+}
+
+/// Depth-first rows: a task, then its children one level deeper; an agent's own plan
+/// is one row per item, its source the run.
+fn plan_rows(node: &progress::PlanNode<'_>, depth: u16, out: &mut Vec<PlanRow>) {
+    match node {
+        progress::PlanNode::Task {
+            key,
+            node,
+            share,
+            children,
+        } => {
+            out.push(PlanRow {
+                depth,
+                key: Some(key.0.to_string()),
+                title: node.title.clone(),
+                status: task_status(&node.state),
+                share: share.get(),
+                source: match node.by {
+                    progress::PlanAuthor::Human => "human".into(),
+                    progress::PlanAuthor::Agent(run) => run.0.to_string(),
+                },
+                counted: node.state != TaskState::Dropped,
+            });
+            for child in children {
+                plan_rows(child, depth + 1, out);
+            }
+        }
+        progress::PlanNode::Observed {
+            run, plan, counted, ..
+        } => {
+            for (key, (title, status)) in &plan.items {
+                out.push(PlanRow {
+                    depth,
+                    key: Some(key.clone()),
+                    title: title.clone(),
+                    status: plan_status(*status),
+                    share: if *status == PlanStatus::Completed {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    source: run.0.to_string(),
+                    counted: *counted,
+                });
+            }
+        }
+    }
+}
+
+fn bucket_width(b: Bucket) -> BucketWidth {
+    match b {
+        Bucket::M15 => BucketWidth::M15,
+        Bucket::H1 => BucketWidth::H1,
+        Bucket::H4 => BucketWidth::H4,
+    }
+}
+
+fn bucket_wire(w: BucketWidth) -> Bucket {
+    match w {
+        BucketWidth::M15 => Bucket::M15,
+        BucketWidth::H1 => Bucket::H1,
+        BucketWidth::H4 => Bucket::H4,
+    }
+}
+
+fn timeline_item(at: UnixMillis, fact: &FactId, item: &timeline::Item) -> TimelineItem {
+    use timeline::ItemKind as K;
+    let lane = match item.lane {
+        timeline::Lane::Agent(run) => Lane::Agent {
+            run: run.0.to_string(),
+        },
+        timeline::Lane::Run(run) => Lane::Run {
+            run: run.0.to_string(),
+        },
+        timeline::Lane::Human => Lane::Human {},
+        timeline::Lane::Host => Lane::Host {},
+    };
+    let mut ok = None;
+    let kind = match &item.kind {
+        K::Prompt => ItemKind::Prompt,
+        K::Reply => ItemKind::Reply,
+        K::Thinking => ItemKind::Thinking,
+        K::ToolCall { ok: done, .. } => {
+            ok = *done;
+            ItemKind::ToolCall
+        }
+        K::PlanChange => ItemKind::PlanChange,
+        K::Snapshot => ItemKind::Snapshot,
+        K::RunLifecycle => ItemKind::RunLifecycle,
+        K::Finding => ItemKind::Finding,
+        K::CheckVerdict => ItemKind::CheckVerdict,
+        K::Artifact => ItemKind::Artifact,
+        K::Comment => ItemKind::Comment,
+        K::TaskChange => ItemKind::TaskChange,
+        K::HumanInput => ItemKind::HumanInput,
+        K::Decision => ItemKind::Decision,
+        K::Discontinuity => ItemKind::Discontinuity,
+        K::Unrecognized => ItemKind::Unrecognized,
+    };
+    TimelineItem {
+        fact: fact.to_string(),
+        lane,
+        kind,
+        title: item.title.clone(),
+        at_ms: at.0,
+        end_ms: item.ended_at.map(|t| t.0),
+        ok,
+    }
+}
+
 /// What one job contributes to the overview, read in one go on its loop.
 struct JobSummary {
     glance: glance::Glance,
@@ -334,15 +463,81 @@ impl Handler for ApiHandler<'_> {
         let jobs = summaries.into_iter().map(|(_, s)| s.card).collect();
         Ok(Overview { queue, jobs })
     }
+    /// The job's card, plan, and head. `cursor` is the stamp of what was read, so it moves
+    /// exactly when something shown here changed.
     fn job(&mut self, caller: &Caller, input: JobRef) -> Result<JobPulse, ApiError> {
-        todo!("not implemented")
+        let (_, handle) = self.job_handle(&input.job)?;
+        let now = now();
+        let mut deps = Vec::new();
+        let detail = handle.read(&mut deps, move |l| {
+            let summary = summarize(l, now)?;
+            let views = l.views();
+            let info = views.runs().job()?;
+            let mut plan = Vec::new();
+            for node in &views.progress().tree().roots {
+                plan_rows(node, 0, &mut plan);
+            }
+            Some(JobDetail {
+                card: summary.card,
+                plan,
+                worktree: info.worktree.display().to_string(),
+                base: info.base.as_str().to_owned(),
+                head: views.review().head().map(|h| HeadRef {
+                    tree: h.snapshot.tree.as_str().to_owned(),
+                    seq: views.review().snapshots().len() as u32,
+                }),
+            })
+        });
+        let cursor = deps.iter().map(|d| match d {
+            Dep::Views { stamp, .. } => stamp.get().to_string(),
+            _ => String::new(),
+        });
+        let cursor = cursor.collect::<Vec<_>>().join(".");
+        self.deps.extend(deps);
+        let detail = detail.ok_or_else(|| ApiError::NotFound {
+            what: format!("job {}", input.job),
+        })?;
+        Ok(JobPulse { cursor, detail })
     }
+    /// Items in `[from_ms, to_ms)`, and per-window counts when `bucket` is set.
     fn timeline(
         &mut self,
         caller: &Caller,
         input: TimelineQuery,
     ) -> Result<TimelinePage, ApiError> {
-        todo!("not implemented")
+        let (_, handle) = self.job_handle(&input.job)?;
+        let (from, to) = (UnixMillis(input.from_ms), UnixMillis(input.to_ms));
+        let width = input.bucket.map(bucket_width);
+        let page = handle.read(&mut self.deps, move |l| {
+            let timeline = l.views().timeline();
+            let items = timeline
+                .range(from, to)
+                .map(|(at, fact, item)| timeline_item(at, fact, item))
+                .collect();
+            let buckets = width
+                .map(|w| timeline.buckets(w, from, to))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| {
+                    let summary = b.summary.as_ref().and_then(|fact| {
+                        // A summary arrives after its window closed.
+                        timeline
+                            .range(b.window.end(), UnixMillis(i64::MAX))
+                            .find(|(_, f, _)| *f == fact)
+                            .map(|(_, _, i)| i.title.clone())
+                    });
+                    TimelineBucket {
+                        start_ms: b.window.start.0,
+                        width: bucket_wire(b.window.width),
+                        tool_calls: b.counts.values().map(|c| c.tool_calls).sum(),
+                        tool_errors: b.counts.values().map(|c| c.tool_errors).sum(),
+                        summary,
+                    }
+                })
+                .collect();
+            TimelinePage { items, buckets }
+        });
+        Ok(page)
     }
     fn raw(&mut self, caller: &Caller, input: RawQuery) -> Result<RawPage, ApiError> {
         // TODO: ledger.raw_page / ledger.raw around a fact (`FactId::parse`); bytes as text
