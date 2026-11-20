@@ -1421,3 +1421,84 @@ fn reviews_still_running_are_counted_not_tallied() {
     assert_eq!(packet.headline.pending_reviews, 2);
     assert!(packet.headline.ai.is_empty());
 }
+
+// ---------------------------------------------------------------- glance, found by mutation testing
+
+#[test]
+fn an_agent_stalls_after_exactly_ten_minutes_of_silence() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.transcript(1, &[tool_call("a1", T)]);
+    let stalled = |job: &Job, now: i64| {
+        job.glance(now)
+            .attention
+            .iter()
+            .any(|a| matches!(a, Attention::Stalled { .. }))
+    };
+    assert!(!stalled(&job, T + 600_000));
+    assert!(stalled(&job, T + 600_001));
+}
+
+#[test]
+fn an_agent_at_its_prompt_is_never_stalled_while_a_head_awaits_a_decision() {
+    let mut job = Job::open();
+    job.agent(1);
+    job.transcript(1, &[turn_end("a1", T)]);
+    job.snapshot(10, oid('1'));
+    let g = job.glance(T + 10 * STALL_AFTER_MS);
+    assert!(
+        matches!(g.attention.as_slice(), [Attention::AwaitingDecision { .. }]),
+        "{:?}",
+        g.attention
+    );
+}
+
+#[test]
+fn an_agent_that_could_not_start_or_was_killed_failed_but_a_cancelled_one_did_not() {
+    let failed = |outcome: RunOutcome| {
+        let mut job = Job::open();
+        job.agent(1);
+        job.finish(1, outcome);
+        job.glance(T)
+            .attention
+            .iter()
+            .any(|a| matches!(a, Attention::RunFailed { .. }))
+    };
+    assert!(failed(RunOutcome::SpawnFailed {
+        error: "no claude".into()
+    }));
+    assert!(failed(RunOutcome::Killed {
+        signal: 9,
+        cancelled: false
+    }));
+    assert!(!failed(RunOutcome::Killed {
+        signal: 15,
+        cancelled: true
+    }));
+    assert!(!failed(RunOutcome::Exited { code: 0 }));
+}
+
+#[test]
+fn the_overview_queue_puts_the_most_urgent_first_across_jobs() {
+    use argus_core::views::glance::queue;
+    let mut waiting = Job::open();
+    waiting.agent(1);
+    waiting.transcript(1, &[turn_end("a1", T)]);
+    let mut asking = Job::open();
+    asking.agent(1);
+    asking.transcript(1, &[tool_call("a1", T)]);
+    let hook = r#"{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#;
+    asking.feed(
+        1,
+        SourceKind::ClaudeHook,
+        SourceOrigin::Hook,
+        &[hook.to_owned()],
+    );
+    let (g1, g2) = (waiting.glance(T), asking.glance(T));
+    let q = queue([(JobId(Id128(1)), &g1), (JobId(Id128(2)), &g2)]);
+    let order: Vec<_> = q
+        .iter()
+        .map(|(job, a)| (job.0.0, matches!(a, Attention::AwaitingPermission { .. })))
+        .collect();
+    assert_eq!(order, vec![(2, true), (1, false)]);
+}
