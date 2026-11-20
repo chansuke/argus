@@ -1084,3 +1084,26 @@ fn every_ended_window_with_activity_is_summarized_once() {
     assert!(llm.prompt.contains("Bash"), "{}", llm.prompt);
     assert!(job.decide(&cfg, later).is_empty());
 }
+
+#[test]
+fn a_job_with_nothing_to_judge_can_only_be_abandoned() {
+    let mut job = Job::open();
+    let approve = job.submit(Author::Human, decided(1, None, Decision::Approve));
+    assert!(matches!(
+        approve,
+        Err(LedgerError::Rejected(Rejected::NotHead { head: None }))
+    ));
+    let changes = job.submit(Author::Human, decided(2, None, Decision::RequestChanges));
+    assert!(matches!(
+        changes,
+        Err(LedgerError::Rejected(Rejected::NotHead { .. }))
+    ));
+    job.ok(Author::Human, decided(3, None, Decision::Abandon));
+    // Once there is a head, abandoning names it like any verdict.
+    job.snapshot(10, oid('1'));
+    let blind = job.submit(Author::Human, decided(4, None, Decision::Abandon));
+    assert!(matches!(
+        blind,
+        Err(LedgerError::Rejected(Rejected::NotHead { .. }))
+    ));
+}
