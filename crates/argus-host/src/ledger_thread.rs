@@ -3,16 +3,18 @@
 //! run here, but each is a short fold-state lookup: anything slow (git, LLMs, processes)
 //! runs elsewhere and comes back as a command.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-use argus_core::event::{Author, Event, JobInfo};
-use argus_core::ids::{RunId, SourceId, UnixMillis};
+use argus_core::event::{Author, Event, JobInfo, LedgerKind, RunOutcome};
+use argus_core::ids::{Attempt, RunId, SourceId, UnixMillis};
 use argus_core::ledger::{JobLedger, LedgerError, SourceCursor, Submitted};
-use argus_core::plan::{Invocation, PlanEnv, ToolPaths};
-use argus_core::policy::PolicyConfig;
+use argus_core::plan::{Invocation, PlanEnv, ToolPaths, plan};
+use argus_core::policy::{self, PolicyConfig};
 use argus_core::source::{RawFrame, SourceMeta};
+use argus_core::views::runs::Due;
 
 use crate::pulse::Dep;
 use crate::runner::{Running, Workspace};
@@ -114,23 +116,175 @@ impl<L: Launcher> JobLoop<L> {
 
     /// Applies one command. Returns whether the views may have changed.
     pub(crate) fn handle(&mut self, cmd: Cmd) -> bool {
-        todo!("not implemented")
+        match cmd {
+            Cmd::Submit {
+                author,
+                event,
+                reply,
+            } => {
+                let result = self.ledger.submit(author, event);
+                let changed = matches!(result, Ok(Submitted::Appended(_)));
+                let _ = reply.send(result);
+                changed
+            }
+            Cmd::OpenSource { meta, reply } => {
+                let _ = reply.send(self.ledger.open_source(meta));
+                false
+            }
+            // A source that is not open (or a corrupt frame) has nowhere to go.
+            Cmd::Observe { source, frames } => self.ledger.observe(source, frames).is_ok(),
+            Cmd::Read(read) => {
+                read(&self.ledger);
+                false
+            }
+            Cmd::Released { run } => self.live.remove(&run).is_some(),
+            Cmd::Flush => {
+                let _ = self.ledger.flush();
+                false
+            }
+            Cmd::Stop | Cmd::Retain => false,
+        }
     }
 
     /// After a batch of commands: submits what the policy decides, then does what the
     /// runs view says the host owes (`Runs::due`), until neither has anything left.
     pub(crate) fn after_batch(&mut self, now: UnixMillis) {
-        todo!("not implemented")
+        // Each pass can enable the next (a decision requests a run, a finished run lets
+        // the policy decide again); the bound only guards against a policy bug.
+        for _ in 0..8 {
+            let mut acted = false;
+            for event in policy::decide(self.ledger.views(), &self.cfg.policy, now) {
+                acted |= self.submit(Author::Policy, event);
+            }
+            let live: BTreeSet<RunId> = self.live.keys().copied().collect();
+            for due in self.ledger.views().runs().due(&live) {
+                match due {
+                    Due::Start { run, attempt } => acted |= self.start(run, attempt),
+                    Due::Abandon { run, attempt } => {
+                        let outcome = RunOutcome::Abandoned;
+                        acted |= self.submit(
+                            Author::Host,
+                            Event::RunFinished {
+                                run,
+                                attempt,
+                                outcome,
+                            },
+                        );
+                    }
+                    Due::Kill { run } => {
+                        if let Some(running) = self.live.get(&run) {
+                            running.cancel();
+                        }
+                    }
+                    // Leases exist only for device checks, which are not supported yet.
+                    Due::Release { .. } => {}
+                }
+            }
+            if !acted {
+                break;
+            }
+        }
     }
 
-    /// Blocks on the inbox and applies commands in batches until `Cmd::Stop`.
+    /// Reconciles once (a restart abandons or retries interrupted runs), then blocks on
+    /// the inbox and applies commands in batches until `Cmd::Stop`.
     pub(crate) fn run(mut self, inbox: Receiver<Cmd>) {
-        todo!("not implemented")
+        self.after_batch(now());
+        while let Ok(first) = inbox.recv() {
+            let mut changed = false;
+            let mut stop = false;
+            for cmd in std::iter::once(first).chain(inbox.try_iter()) {
+                if let Cmd::Stop = cmd {
+                    stop = true;
+                    break;
+                }
+                changed |= self.handle(cmd);
+            }
+            if changed {
+                self.after_batch(now());
+            }
+            if stop {
+                return;
+            }
+        }
+    }
+
+    /// Whether the event was appended (not refused, not a duplicate).
+    fn submit(&mut self, author: Author, event: Event) -> bool {
+        matches!(
+            self.ledger.submit(author, event),
+            Ok(Submitted::Appended(_))
+        )
+    }
+
+    /// Records the attempt as started, then hands it to the launcher.
+    fn start(&mut self, run: RunId, attempt: Attempt) -> bool {
+        let views = self.ledger.views();
+        let Some(state) = views.runs().get(&run) else {
+            return false;
+        };
+        // Meta-ledger purposes never belong to a job.
+        if state.purpose.ledger_kind() != LedgerKind::Job {
+            return false;
+        }
+        let purpose = state.purpose.clone();
+        let previous = views.review().head().map(|h| h.snapshot.tree.clone());
+        if !self.submit(
+            Author::Host,
+            Event::RunStarted {
+                run,
+                attempt,
+                pid: None,
+            },
+        ) {
+            return false;
+        }
+        let info = &self.cfg.info;
+        let env = PlanEnv {
+            job: Some(info.job),
+            run,
+            attempt,
+            socket: self.cfg.socket.clone(),
+            tools: self.cfg.tools.clone(),
+            snapshot_deny: self.cfg.snapshot_deny.clone(),
+        };
+        // An adapter that is not written yet panics; that fails this run, not the job.
+        let planned = std::panic::catch_unwind(AssertUnwindSafe(|| plan(&purpose, &env)));
+        let Ok(inv) = planned else {
+            let reason = "argus cannot run this purpose yet".to_owned();
+            let outcome = RunOutcome::Failed { reason };
+            self.submit(
+                Author::Host,
+                Event::RunFinished {
+                    run,
+                    attempt,
+                    outcome,
+                },
+            );
+            return true;
+        };
+        let ws = Workspace {
+            repo: info.repo.clone(),
+            worktree: info.worktree.clone(),
+            home: self.cfg.home.clone(),
+            blobs: self.ledger.blobs(),
+            job: info.job,
+            base: info.base.clone(),
+            previous,
+        };
+        let running = self.launcher.start(inv, env, ws, self.inbox.clone());
+        self.live.insert(run, running);
+        true
     }
 
     pub(crate) fn ledger(&self) -> &JobLedger {
         &self.ledger
     }
+}
+
+fn now() -> UnixMillis {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    UnixMillis(since.map_or(0, |d| d.as_millis() as i64))
 }
 
 /// Appends an authored event on the ledger thread.
