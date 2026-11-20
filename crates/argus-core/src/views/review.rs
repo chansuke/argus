@@ -592,3 +592,46 @@ impl Projection for ReviewBoard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::shift;
+    use crate::event::Hunk;
+
+    fn hunk(old_start: u32, old_len: u32, new_len: u32) -> Hunk {
+        Hunk {
+            old_start,
+            old_len,
+            new_start: old_start,
+            new_len,
+        }
+    }
+
+    /// Lines 10-12 carried through one hunk at each position around them.
+    #[test]
+    fn a_range_moves_with_edits_around_it_and_ends_when_one_touches_it() {
+        let range = (10, 12);
+        // Insertions (old_len 0) go after line `old_start`.
+        assert_eq!(shift(range, &[hunk(9, 0, 2)]), Some((12, 14)));
+        assert_eq!(shift(range, &[hunk(10, 0, 2)]), None);
+        assert_eq!(shift(range, &[hunk(11, 0, 2)]), None);
+        assert_eq!(shift(range, &[hunk(12, 0, 2)]), Some((10, 12)));
+        // Replacements: lines 8-9 become five, just above the range.
+        assert_eq!(shift(range, &[hunk(8, 2, 5)]), Some((13, 15)));
+        // Lines 1-3 deleted.
+        assert_eq!(shift(range, &[hunk(1, 3, 0)]), Some((7, 9)));
+        // Touching the first or the last line, or just below.
+        assert_eq!(shift(range, &[hunk(9, 2, 2)]), None);
+        assert_eq!(shift(range, &[hunk(12, 1, 1)]), None);
+        assert_eq!(shift(range, &[hunk(13, 1, 4)]), Some((10, 12)));
+        // Offsets add up over several hunks.
+        assert_eq!(
+            shift(range, &[hunk(1, 1, 3), hunk(5, 2, 0), hunk(20, 1, 9)]),
+            Some((10, 12))
+        );
+        assert_eq!(
+            shift(range, &[hunk(1, 1, 4), hunk(5, 1, 2)]),
+            Some((14, 16))
+        );
+    }
+}
