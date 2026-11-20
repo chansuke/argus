@@ -283,6 +283,7 @@ impl<L: Launcher> JobLoop<L> {
             job: info.job,
             base: info.base.clone(),
             previous,
+            target: info.target.clone(),
         };
         let running = self.launcher.start(inv, env, ws, self.inbox.clone());
         self.live.insert(run, running);

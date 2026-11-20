@@ -57,6 +57,8 @@ pub(crate) struct Workspace {
     pub base: CommitOid,
     /// The head snapshot's tree when the run starts (a new snapshot's `previous`).
     pub previous: Option<TreeOid>,
+    /// The branch an approved head is merged into.
+    pub target: String,
 }
 
 /// How long a cancelled run has to exit before it is killed.
@@ -615,6 +617,7 @@ mod tests {
             job: argus_core::ids::JobId(Id128(1)),
             base: CommitOid::parse(&"b".repeat(40)).unwrap(),
             previous: None,
+            target: "release".into(),
         }
     }
 
