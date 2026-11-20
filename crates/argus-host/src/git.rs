@@ -250,7 +250,119 @@ pub(crate) fn merge(
     base: &CommitOid,
     target: &str,
 ) -> Result<CommitOid, String> {
-    todo!("not implemented")
+    let text = |out: Vec<u8>| String::from_utf8_lossy(&out).trim().to_owned();
+    let run = |dir: &Path, args: &[&str]| {
+        git(dir, args, &[], None)
+            .map(text)
+            .map_err(|e| e.to_string())
+    };
+    let branch = format!("refs/heads/{target}");
+    let snapshot_ref = format!("refs/argus/{}/{}", job.0, tree.as_str());
+    let commit = match run(repo, &["rev-parse", "--verify", "--quiet", &snapshot_ref]) {
+        Ok(commit) => commit,
+        Err(_) => {
+            let commit = commit_tree(
+                repo,
+                tree,
+                base,
+                &format!("argus snapshot of job {}", job.0),
+            )
+            .map_err(|e| e.to_string())?;
+            run(repo, &["update-ref", &snapshot_ref, &commit])?;
+            commit
+        }
+    };
+    let old = run(repo, &["rev-parse", "--verify", &branch])
+        .map_err(|_| format!("no branch {target}"))?;
+    let is_ancestor = |a: &str, b: &str| run(repo, &["merge-base", "--is-ancestor", a, b]).is_ok();
+    if is_ancestor(&commit, &old) {
+        return oid_of(&old);
+    }
+    let new = if is_ancestor(&old, &commit) {
+        commit.clone()
+    } else {
+        let tree = merge_tree(repo, &old, &commit)?;
+        let message = format!("Merge argus job {} into {target}", job.0);
+        run(
+            repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &old,
+                "-p",
+                &commit,
+                "-m",
+                &message,
+            ],
+        )?
+    };
+    match checkout_of(repo, &branch)? {
+        Some(worktree) => {
+            if !run(&worktree, &["status", "--porcelain"])?.is_empty() {
+                return Err(format!(
+                    "{target} is checked out in {} with local changes",
+                    worktree.display()
+                ));
+            }
+            run(&worktree, &["merge", "--ff-only", "--quiet", &new])?;
+        }
+        None => {
+            run(repo, &["update-ref", &branch, &new, &old])?;
+        }
+    }
+    oid_of(&new)
+}
+
+/// `git merge-tree --write-tree`: the merged tree, or the conflicted paths (exit 1 prints
+/// the tree, then one conflicted path per line).
+fn merge_tree(repo: &Path, ours: &str, theirs: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            ours,
+            theirs,
+        ])
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut lines = stdout.lines();
+    match out.status.code() {
+        Some(0) => Ok(lines.next().unwrap_or_default().to_owned()),
+        Some(1) => {
+            let paths: Vec<&str> = lines.skip(1).take_while(|l| !l.is_empty()).collect();
+            Err(format!("merge conflicts in {}", paths.join(", ")))
+        }
+        _ => Err(format!(
+            "git merge-tree: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+fn oid_of(hex: &str) -> Result<CommitOid, String> {
+    CommitOid::parse(hex).ok_or_else(|| format!("not an object id: {hex}"))
+}
+
+/// The worktree that has `branch` checked out, if any.
+fn checkout_of(repo: &Path, branch: &str) -> Result<Option<PathBuf>, String> {
+    let list =
+        git(repo, &["worktree", "list", "--porcelain"], &[], None).map_err(|e| e.to_string())?;
+    let list = String::from_utf8_lossy(&list).into_owned();
+    let mut path = None;
+    for line in list.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+        } else if line.strip_prefix("branch ") == Some(branch) {
+            return Ok(path);
+        }
+    }
+    Ok(None)
 }
 
 /// Throwaway checkout of `tree` on top of `base` (detached worktree under the host's
