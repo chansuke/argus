@@ -234,7 +234,10 @@ impl Job {
         let cursor = self.ledger.open_source(meta.clone()).unwrap();
         let mut framer = kind.framer(cursor.resume_at);
         let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        let frames = framer.push(text.as_bytes());
+        // Each call is a whole stream: what the framer holds back (Lean's last message) is
+        // stored too.
+        let mut frames = framer.push(text.as_bytes());
+        frames.extend(framer.finish());
         self.ledger.observe(meta.id, frames).unwrap();
     }
 
