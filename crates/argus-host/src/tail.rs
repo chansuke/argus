@@ -4,8 +4,13 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
+use argus_core::ids::{Attempt, RunId};
 use argus_core::ledger::SourceCursor;
 use argus_core::plan::WatchSpec;
 use argus_core::source::{Framer, RawFrame, SourceKind};
@@ -106,14 +111,6 @@ impl Tailer {
     }
 }
 
-pub(crate) fn tail(
-    path: PathBuf,
-    cursor: SourceCursor,
-    ledger: Sender<Cmd>,
-) -> std::thread::JoinHandle<()> {
-    todo!("not implemented")
-}
-
 /// Files under `root` matching `pattern`, a `/`-separated path whose segments may use
 /// `*` (any run of characters within one segment). Sorted, so polls agree.
 pub(crate) fn expand(root: &Path, pattern: &str) -> Vec<PathBuf> {
@@ -166,10 +163,23 @@ fn wildcard(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// Expands `watch` globs under $HOME on each poll; every new match becomes a source
-/// (`SourceOrigin::File(path)`, deterministic id) and gets a tailer. This is how subagent
-/// transcripts that appear mid-run are picked up.
-pub(crate) fn watch(specs: Vec<WatchSpec>, ledger: Sender<Cmd>) -> std::thread::JoinHandle<()> {
+/// How often files are polled.
+pub(crate) const POLL: Duration = Duration::from_millis(250);
+
+/// Follows the files of one run attempt: every `every`, expands the `specs` under
+/// `home`, opens a source for each new match (`SourceOrigin::File(path)`, deterministic
+/// id) and polls its tailer. This is how subagent transcripts that appear mid-run are
+/// picked up. Once `stop` is set (the run finished), one last expansion and poll, then
+/// each tailer's held-back tail is stored, and the thread ends.
+pub(crate) fn watch(
+    specs: Vec<WatchSpec>,
+    home: PathBuf,
+    run: RunId,
+    attempt: Attempt,
+    ledger: Sender<Cmd>,
+    stop: Arc<AtomicBool>,
+    every: Duration,
+) -> JoinHandle<()> {
     todo!("not implemented")
 }
 
@@ -221,7 +231,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use argus_core::ids::{Attempt, Id128, RunId};
+    use argus_core::ids::Id128;
     use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 
     fn scratch_file() -> PathBuf {
@@ -354,6 +364,84 @@ mod tests {
         assert_eq!(
             &frames[1..],
             &[bytes(0, "z\n"), bytes(2, "b\n"), bytes(4, "new\n")]
+        );
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    use argus_core::ids::Id128;
+    use argus_core::source::{SourceKind, SourceOrigin};
+
+    use crate::ledger_thread::testing::{bytes, fake_ledger};
+
+    #[test]
+    fn a_run_s_transcripts_are_followed_including_ones_that_appear_later() {
+        let home = std::env::temp_dir().join(format!("argus-watch-{}", std::process::id()));
+        let main = home.join(".claude/projects/-w/r.jsonl");
+        let sub = home.join(".claude/projects/-w/r/subagents/agent-a.jsonl");
+        std::fs::create_dir_all(main.parent().unwrap()).unwrap();
+        std::fs::write(&main, "a\n").unwrap();
+
+        let specs = vec![
+            WatchSpec {
+                pattern: ".claude/projects/*/r.jsonl".into(),
+                kind: SourceKind::ClaudeTranscript,
+            },
+            WatchSpec {
+                pattern: ".claude/projects/*/r/subagents/*.jsonl".into(),
+                kind: SourceKind::ClaudeTranscript,
+            },
+        ];
+        let (ledger, received) = fake_ledger();
+        let stop = Arc::new(AtomicBool::new(false));
+        let run = RunId(Id128(5));
+        let thread = watch(
+            specs,
+            home.clone(),
+            run,
+            Attempt(1),
+            ledger.clone(),
+            stop.clone(),
+            Duration::from_millis(10),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::create_dir_all(sub.parent().unwrap()).unwrap();
+        std::fs::write(&sub, "s\n").unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&main)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"tail").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
+        drop(ledger);
+
+        let got = received.join().unwrap();
+        let mut sources: Vec<_> = got
+            .values()
+            .map(|(meta, frames)| {
+                assert_eq!(
+                    (meta.run, meta.attempt, meta.kind),
+                    (run, Attempt(1), SourceKind::ClaudeTranscript)
+                );
+                (meta.origin.clone(), bytes(frames))
+            })
+            .collect();
+        sources.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+        assert_eq!(
+            sources,
+            vec![
+                (
+                    SourceOrigin::File(main),
+                    vec![b"a\n".to_vec(), b"tail".to_vec()]
+                ),
+                (SourceOrigin::File(sub), vec![b"s\n".to_vec()]),
+            ]
         );
     }
 }
