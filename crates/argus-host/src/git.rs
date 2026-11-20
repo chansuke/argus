@@ -2,12 +2,18 @@
 //! which tree existed when (`Snapshot`), plus readings of those immutable trees.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use argus_core::diff::{DiffRequest, HeadDiff};
-use argus_core::event::{ApprovedHead, Snapshot};
-use argus_core::ids::{CommitOid, JobId, TreeOid};
+use argus_core::diff::{DiffRequest, HeadDiff, parse_unified};
+use argus_core::event::{ApprovedHead, FileDelta, FileState, Snapshot};
+use argus_core::ids::{CommitOid, GitOid, JobId, RepoPath, TreeOid};
+
+use crate::glob;
 
 /// `git worktree add <path> -b argus/<job> <base>`.
 pub(crate) fn create_worktree(
@@ -38,7 +44,193 @@ pub(crate) fn snapshot(
     job: JobId,
     deny: &[String],
 ) -> std::io::Result<Snapshot> {
-    todo!("not implemented")
+    let untracked = git(
+        worktree,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        &[],
+        None,
+    )?;
+    let (withheld, staged): (Vec<String>, Vec<String>) = nul_separated(&untracked)
+        .into_iter()
+        .partition(|path| denied(path, deny));
+
+    static N: AtomicU32 = AtomicU32::new(0);
+    let index = std::env::temp_dir().join(format!(
+        "argus-index-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let index_env = [("GIT_INDEX_FILE", index.as_os_str())];
+    let tree = (|| {
+        git(worktree, &["read-tree", "HEAD"], &index_env, None)?;
+        git(worktree, &["add", "-u"], &index_env, None)?;
+        if !staged.is_empty() {
+            let list = staged.join("\0");
+            let args = ["add", "--pathspec-from-file=-", "--pathspec-file-nul"];
+            git(worktree, &args, &index_env, Some(list.as_bytes()))?;
+        }
+        oid(&git(worktree, &["write-tree"], &index_env, None)?)
+    })();
+    let _ = std::fs::remove_file(&index);
+    let tree = tree?;
+
+    let delta = match previous {
+        None => Vec::new(),
+        Some(previous) => {
+            let diff = diff_text(worktree, previous.as_str(), tree.as_str(), "--unified=0")?;
+            let mut delta: Vec<FileDelta> = Vec::new();
+            for hunk in parse_unified(&diff) {
+                match delta.last_mut() {
+                    Some(d) if d.path == hunk.anchor.path => d.hunks.push(hunk.header),
+                    _ => delta.push(FileDelta {
+                        path: hunk.anchor.path,
+                        renamed_from: None,
+                        hunks: vec![hunk.header],
+                    }),
+                }
+            }
+            delta
+        }
+    };
+
+    let changed = git(
+        worktree,
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base.as_str(),
+            tree.as_str(),
+        ],
+        &[],
+        None,
+    )?;
+    let diff = diff_text(worktree, base.as_str(), tree.as_str(), "--unified=3")?;
+    let hunks = parse_unified(&diff);
+    let mut files = Vec::new();
+    for path in nul_separated(&changed) {
+        let Some(path) = RepoPath::parse(&path) else {
+            continue;
+        };
+        let listed = git(
+            worktree,
+            &["ls-tree", "-z", tree.as_str(), "--", path.as_str()],
+            &[],
+            None,
+        )?;
+        // `<mode> blob <oid>\t<path>`; nothing when the tree no longer has the file.
+        let blob = String::from_utf8_lossy(&listed)
+            .split(['\t', ' '])
+            .nth(2)
+            .and_then(GitOid::parse);
+        let anchors = hunks
+            .iter()
+            .filter(|h| h.anchor.path == path)
+            .map(|h| h.anchor.clone())
+            .collect();
+        files.push(FileState {
+            path,
+            blob,
+            hunks: anchors,
+        });
+    }
+
+    let message = format!("argus snapshot of job {}", job.0);
+    let identity = [
+        ("GIT_AUTHOR_NAME", OsStr::new("argus")),
+        ("GIT_AUTHOR_EMAIL", OsStr::new("argus@localhost")),
+        ("GIT_COMMITTER_NAME", OsStr::new("argus")),
+        ("GIT_COMMITTER_EMAIL", OsStr::new("argus@localhost")),
+    ];
+    let commit = git(
+        worktree,
+        &[
+            "commit-tree",
+            tree.as_str(),
+            "-p",
+            base.as_str(),
+            "-m",
+            &message,
+        ],
+        &identity,
+        None,
+    )?;
+    let commit = String::from_utf8_lossy(&commit).trim().to_owned();
+    let reference = format!("refs/argus/{}/{}", job.0, tree.as_str());
+    git(worktree, &["update-ref", &reference, &commit], &[], None)?;
+
+    Ok(Snapshot {
+        tree,
+        base: base.clone(),
+        previous: previous.cloned(),
+        delta,
+        files,
+        withheld: withheld.iter().filter_map(|p| RepoPath::parse(p)).collect(),
+    })
+}
+
+/// Runs `git` in `dir` and returns its stdout; a failure carries git's stderr.
+fn git(
+    dir: &Path,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    stdin: Option<&[u8]>,
+) -> std::io::Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(dir)
+        .envs(env.iter().copied())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(bytes)?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(std::io::Error::other(format!(
+            "git {}: {}",
+            args.join(" "),
+            stderr.trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+fn diff_text(dir: &Path, from: &str, to: &str, context: &str) -> std::io::Result<String> {
+    let args = ["diff", "--no-color", "--no-renames", context, from, to];
+    Ok(String::from_utf8_lossy(&git(dir, &args, &[], None)?).into_owned())
+}
+
+fn oid(stdout: &[u8]) -> std::io::Result<GitOid> {
+    let text = String::from_utf8_lossy(stdout);
+    GitOid::parse(text.trim())
+        .ok_or_else(|| std::io::Error::other(format!("not an object id: {text}")))
+}
+
+fn nul_separated(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect()
+}
+
+/// A pattern without `/` matches the file name anywhere; one with `/` the whole path.
+fn denied(path: &str, deny: &[String]) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    deny.iter().any(|pattern| match pattern.contains('/') {
+        true => glob::wildcard(pattern, path),
+        false => glob::wildcard(pattern, name),
+    })
 }
 
 /// Head diffs for review packets, memoized by `(base, tree)`: both are immutable, so an
