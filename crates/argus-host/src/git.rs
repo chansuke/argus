@@ -15,13 +15,60 @@ use argus_core::ids::{CommitOid, GitOid, JobId, RepoPath, TreeOid};
 
 use crate::glob;
 
-/// `git worktree add <path> -b argus/<job> <base>`.
+/// `git worktree add <at> -b argus/<job> <base>`: the job's own checkout, on its own branch.
+/// An existing checkout at `at` (a retried start) is kept as it is.
 pub(crate) fn create_worktree(
     repo: &Path,
     base: &CommitOid,
     job: JobId,
+    at: &Path,
 ) -> std::io::Result<PathBuf> {
-    todo!("not implemented")
+    if at.exists() {
+        return Ok(at.to_path_buf());
+    }
+    if let Some(parent) = at.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let branch = format!("argus/{}", job.0);
+    let target = at.to_string_lossy().into_owned();
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            &branch,
+            &target,
+            base.as_str(),
+        ],
+        &[],
+        None,
+    )?;
+    Ok(at.to_path_buf())
+}
+
+/// The commit `rev` names in `repo` (`HEAD`, a branch, a commit id).
+pub(crate) fn resolve(repo: &Path, rev: &str) -> std::io::Result<CommitOid> {
+    let rev = format!("{rev}^{{commit}}");
+    oid(&git(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &rev],
+        &[],
+        None,
+    )?)
+}
+
+/// The branch checked out in `repo`, if it is on one.
+pub(crate) fn current_branch(repo: &Path) -> Option<String> {
+    let out = git(
+        repo,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &[],
+        None,
+    )
+    .ok()?;
+    Some(String::from_utf8_lossy(&out).trim().to_owned())
 }
 
 /// Records the worktree without touching its index or HEAD.
