@@ -1,12 +1,14 @@
 //! Tails files that other programs write (agent transcripts). Polling (250 ms) keeps it
 //! std-only; inotify would need FFI.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use argus_core::ledger::SourceCursor;
 use argus_core::plan::WatchSpec;
-use argus_core::source::{Framer, RawFrame};
+use argus_core::source::{Framer, RawFrame, SourceKind};
 
 use crate::ledger_thread::Cmd;
 
@@ -25,6 +27,7 @@ use crate::ledger_thread::Cmd;
 /// is new and returns the frames to store.
 pub(crate) struct Tailer {
     path: PathBuf,
+    kind: SourceKind,
     framer: Framer,
     /// File offset up to which bytes were handed to the framer.
     read_to: u64,
@@ -36,19 +39,75 @@ pub(crate) struct Tailer {
 
 impl Tailer {
     pub(crate) fn new(path: PathBuf, cursor: &SourceCursor) -> Self {
-        todo!("not implemented")
+        let kind = cursor.meta.kind;
+        Tailer {
+            path,
+            kind,
+            framer: kind.framer(cursor.resume_at),
+            read_to: cursor.resume_at,
+            stored_end: cursor.resume_at,
+            last: cursor.last.clone(),
+        }
     }
 
     /// New complete frames, or, when the file was truncated or rewritten under us, a
     /// `Discontinuity` followed by the whole new content. A file that does not exist yet
     /// yields nothing.
     pub(crate) fn poll(&mut self) -> std::io::Result<Vec<RawFrame>> {
-        todo!("not implemented")
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let len = file.metadata()?.len();
+        let mut out = Vec::new();
+        if self.rewritten(&mut file, len)? {
+            out.push(RawFrame::Discontinuity {
+                stored_end: self.stored_end,
+                file_len: len,
+            });
+            self.framer = self.kind.framer(0);
+            (self.read_to, self.stored_end, self.last) = (0, 0, None);
+        }
+        if len > self.read_to {
+            let mut buf = Vec::new();
+            file.seek(SeekFrom::Start(self.read_to))?;
+            file.take(len - self.read_to).read_to_end(&mut buf)?;
+            self.read_to += buf.len() as u64;
+            let frames = self.framer.push(&buf);
+            out.extend(self.store(frames));
+        }
+        Ok(out)
     }
 
     /// The last poll, then whatever the framer held back (a final line without `\n`).
     pub(crate) fn finish(&mut self) -> std::io::Result<Vec<RawFrame>> {
-        todo!("not implemented")
+        let mut out = self.poll()?;
+        let rest = self.framer.finish().into_iter().collect();
+        out.extend(self.store(rest));
+        Ok(out)
+    }
+
+    /// Shorter than what was read, or different bytes where the last stored frame was.
+    fn rewritten(&self, file: &mut File, len: u64) -> std::io::Result<bool> {
+        if len < self.read_to {
+            return Ok(true);
+        }
+        let Some((offset, bytes)) = &self.last else {
+            return Ok(false);
+        };
+        let mut now = Vec::with_capacity(bytes.len());
+        file.seek(SeekFrom::Start(*offset))?;
+        file.take(bytes.len() as u64).read_to_end(&mut now)?;
+        Ok(&now != bytes)
+    }
+
+    fn store(&mut self, frames: Vec<RawFrame>) -> Vec<RawFrame> {
+        if let Some(RawFrame::Bytes { offset, bytes }) = frames.last() {
+            self.stored_end = offset + bytes.len() as u64;
+            self.last = Some((*offset, bytes.clone()));
+        }
+        frames
     }
 }
 
