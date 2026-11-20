@@ -163,13 +163,17 @@ pub struct FindingId {
 impl FindingId {
     /// `<fact>#<index>`, the form the API uses.
     pub fn parse(s: &str) -> Option<Self> {
-        todo!("not implemented")
+        let (fact, index) = s.rsplit_once('#')?;
+        Some(FindingId {
+            fact: FactId::parse(fact)?,
+            index: index.parse().ok()?,
+        })
     }
 }
 
 impl std::fmt::Display for FindingId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!("not implemented")
+        write!(f, "{}#{}", self.fact, self.index)
     }
 }
 
