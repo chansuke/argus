@@ -1457,4 +1457,74 @@ mod tests {
         ));
         host.shutdown();
     }
+
+    #[test]
+    fn the_review_screen_shows_the_head_hunks_their_threads_and_whether_it_can_merge() {
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-review");
+        let ask = format!(r#"{{"job":"{job}"}}"#);
+        let empty = call(&host, &Caller::Local, "review", &ask).unwrap();
+        assert_eq!(get(&empty, "head"), &Json::Null);
+        assert_eq!(get(&empty, "headline"), &Json::Null);
+        assert_eq!(get(&empty, "agenda"), &Json::Arr(vec![]));
+        assert_eq!(get(&empty, "can_merge"), &Json::Bool(false));
+
+        let tree = head_after_edit(&host, &root, &job);
+        let open = format!(
+            r#"{{"request_id":"r-1","job":"{job}","anchor":{{"kind":"Code","tree":"{tree}","path":"a.txt","start":2,"end":2}},"body":"why two?"}}"#
+        );
+        call(&host, &Caller::Local, "open_thread", &open).unwrap();
+        let screen = call(&host, &Caller::Local, "review", &ask).unwrap();
+        assert_eq!(text(&screen, &["job"]), job);
+        assert_eq!(text(&screen, &["base"]), git(&repo, &["rev-parse", "main"]));
+        assert_eq!(text(&screen, &["head", "tree"]), tree);
+        let num = |n: u64| Json::Num(argus_json::Number::from_u64(n));
+        let headline = get(&screen, "headline");
+        for (key, n) in [
+            ("round", 1),
+            ("files", 1),
+            ("added", 1),
+            ("removed", 0),
+            ("unexplained", 1),
+        ] {
+            assert_eq!(get(headline, key), &num(n), "{key}");
+        }
+        assert_eq!(get(headline, "withheld"), &Json::Arr(vec![]));
+        let Json::Arr(agenda) = get(&screen, "agenda") else {
+            panic!()
+        };
+        assert_eq!(agenda.len(), 1);
+        let item = &agenda[0];
+        assert_eq!(text(item, &["hunk", "path"]), "a.txt");
+        assert!(text(item, &["hunk", "text"]).contains("+two"));
+        assert_eq!(get(get(item, "hunk"), "new_start"), &num(1));
+        assert_eq!(get(get(item, "hunk"), "new_len"), &num(2));
+        assert_eq!(text(item, &["provenance", "kind"]), "Unexplained");
+        assert_eq!(text(item, &["tier"]), "Suspicious");
+        let Json::Arr(threads) = get(item, "threads") else {
+            panic!()
+        };
+        assert_eq!(threads.len(), 1);
+        assert_eq!(text(&threads[0], &["at", "path"]), "a.txt");
+        assert_eq!(get(get(&threads[0], "at"), "start"), &num(2));
+        let Json::Arr(comments) = get(&threads[0], "comments") else {
+            panic!()
+        };
+        assert_eq!(text(&comments[0], &["body"]), "why two?");
+        assert_eq!(get(&comments[0], "draft"), &Json::Bool(true));
+        assert_eq!(get(&screen, "drafts"), &num(1));
+        assert_eq!(get(&screen, "threads"), &Json::Arr(vec![]));
+        assert_eq!(get(&screen, "reviews"), &Json::Arr(vec![]));
+        assert_eq!(get(&screen, "checks"), &Json::Arr(vec![]));
+        assert_eq!(get(&screen, "can_merge"), &Json::Bool(false));
+
+        let approve = format!(
+            r#"{{"request_id":"r-2","job":"{job}","tree":"{tree}","verdict":"Approve","note":""}}"#
+        );
+        call(&host, &Caller::Local, "decide", &approve).unwrap();
+        let approved = call(&host, &Caller::Local, "review", &ask).unwrap();
+        assert_eq!(get(&approved, "can_merge"), &Json::Bool(true));
+        assert_eq!(text(&approved, &["state", "kind"]), "Approved");
+        host.shutdown();
+    }
 }
