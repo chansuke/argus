@@ -512,3 +512,179 @@ fn blobs_are_named_by_their_sha256() {
     let (id, _) = store.put_file(&src).unwrap();
     assert_eq!(fs::read(store.path(&id)).unwrap(), big);
 }
+
+// ---------------------------------------------------------------- found by mutation testing
+
+/// Blob ids are content addresses: the hash must be SHA-256 exactly (FIPS 180-4 vectors).
+#[test]
+fn blob_ids_are_sha256_of_the_content() {
+    let dir = scratch("sha");
+    let blobs = dir.blobs();
+    let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let million_a = vec![b'a'; 1_000_000];
+    let vectors: [(&[u8], &str); 4] = [
+        (
+            b"",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            b"abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+        (
+            &million_a,
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+        ),
+    ];
+    for (input, want) in vectors {
+        let src = dir.root().join("input");
+        fs::write(&src, input).unwrap();
+        let (id, len) = blobs.put_file(&src).unwrap();
+        assert_eq!((hex(&id.0).as_str(), len), (want, input.len() as u64));
+        assert_eq!(fs::read(blobs.path(&id)).unwrap(), input);
+    }
+}
+
+/// A header cut short while the log was created is repaired; a different header is not.
+#[test]
+fn a_torn_header_is_repaired_only_if_it_is_a_prefix_of_ours() {
+    let dir = scratch("torn-header");
+    let a = actor("agent-1");
+    drop(LogWriter::open(&dir, &a, HEADER).unwrap());
+    let path = log_file(&dir, &a);
+    let whole = fs::read(&path).unwrap();
+    let torn = &whole[..whole.len() - 3];
+    fs::write(&path, torn).unwrap();
+    let (_, rec) = LogWriter::open(&dir, &a, HEADER).unwrap();
+    assert_eq!(rec.truncated_bytes, torn.len() as u64);
+
+    let mut other = torn.to_vec();
+    let last = other.len() - 1;
+    other[last] ^= 0xff;
+    fs::write(&path, &other).unwrap();
+    assert!(matches!(
+        LogWriter::open(&dir, &a, HEADER),
+        Err(LogError::HeaderMismatch(_))
+    ));
+}
+
+/// A lock released a moment ago is taken; one held for good is refused after the wait.
+#[test]
+fn a_briefly_held_lock_is_waited_for_and_a_held_one_is_refused() {
+    let dir = scratch("lock-wait");
+    let a = actor("host");
+    let (held, _) = LogWriter::open(&dir, &a, HEADER).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        LogWriter::open(&dir, &a, HEADER),
+        Err(LogError::Locked(_))
+    ));
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(150),
+        "{waited:?}"
+    );
+    assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+    });
+    assert!(LogWriter::open(&dir, &a, HEADER).is_ok());
+    release.join().unwrap();
+}
+
+#[test]
+fn a_second_quarantine_at_the_same_offset_is_numbered() {
+    let dir = scratch("numbered");
+    let a = actor("agent-1");
+    drop(LogWriter::open(&dir, &a, HEADER).unwrap());
+    let path = log_file(&dir, &a);
+    let head = fs::read(&path).unwrap();
+    let mut names = Vec::new();
+    for tail in [&b"one"[..], b"two"] {
+        let mut bytes = head.clone();
+        bytes.extend_from_slice(tail);
+        fs::write(&path, &bytes).unwrap();
+        let (_, rec) = LogWriter::open(&dir, &a, HEADER).unwrap();
+        let kept = rec.quarantined.unwrap();
+        names.push(kept.file_name().unwrap().to_string_lossy().into_owned());
+    }
+    let off = head.len();
+    assert_eq!(
+        names,
+        vec![
+            format!("agent-1.alog.torn-{off}"),
+            format!("agent-1.alog.torn-{off}-1")
+        ]
+    );
+}
+
+#[test]
+fn the_clock_restarts_its_counter_once_the_wall_clock_moves_on() {
+    let mut clock = Clock::starting_after(Some(Stamp {
+        wall_ns: 1,
+        logical: 7,
+    }));
+    let next = clock.tick();
+    assert!(next.wall_ns > 1);
+    assert_eq!(next.logical, 0);
+}
+
+/// A reader checks every frame it hands out, also after the file changed under it.
+#[test]
+fn a_frame_damaged_after_the_reader_indexed_it_is_corrupt() {
+    let dir = scratch("late-damage");
+    let a = actor("agent-1");
+    let (mut w, _) = LogWriter::open(&dir, &a, HEADER).unwrap();
+    let mut clock = Clock::starting_after(None);
+    w.append(clock.tick(), b"first frame").unwrap();
+    w.append(clock.tick(), b"second").unwrap();
+    w.sync().unwrap();
+    let reader = LogReader::open(&dir, &a).unwrap();
+    assert!(!reader.is_empty());
+
+    let path = log_file(&dir, &a);
+    let mut bytes = fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    fs::write(&path, &bytes).unwrap();
+    let second = Seq::FIRST.next();
+    assert!(matches!(reader.get(second), Err(LogError::Corrupt { .. })));
+    let iterated: Vec<_> = reader.iter_from(Seq::FIRST).unwrap().collect();
+    assert!(iterated[0].is_ok());
+    assert!(
+        matches!(iterated[1], Err(LogError::Corrupt { .. })),
+        "{:?}",
+        iterated[1]
+    );
+}
+
+#[test]
+fn small_accessors_say_what_they_hold() {
+    let dir = scratch("accessors");
+    assert_eq!(
+        LogDir::new(dir.root().join("missing")).actors().unwrap(),
+        vec![]
+    );
+    let a = actor("agent-1");
+    let (mut w, _) = LogWriter::open(&dir, &a, HEADER).unwrap();
+    assert!(!w.is_dirty());
+    assert!(LogReader::open(&dir, &a).unwrap().is_empty());
+    w.append(Clock::starting_after(None).tick(), b"x").unwrap();
+    assert!(w.is_dirty());
+    w.sync().unwrap();
+    assert!(!w.is_dirty());
+
+    let mut cursor = Cursor::default();
+    let id = |seq: u64| EventId::parse(&format!("agent-1:{seq}")).unwrap();
+    assert_eq!(cursor.admit(&id(0)), Admit::Fresh);
+    assert_eq!(
+        cursor.iter().collect::<Vec<_>>(),
+        vec![(&a, Seq::FIRST.next())]
+    );
+}
