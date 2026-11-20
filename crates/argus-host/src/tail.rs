@@ -122,7 +122,53 @@ pub(crate) fn tail(
 /// Files under `root` matching `pattern`, a `/`-separated path whose segments may use
 /// `*` (any run of characters within one segment). Sorted, so polls agree.
 pub(crate) fn expand(root: &Path, pattern: &str) -> Vec<PathBuf> {
-    todo!("not implemented")
+    let mut found = vec![root.to_path_buf()];
+    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    for (i, segment) in segments.iter().enumerate() {
+        let last = i + 1 == segments.len();
+        let mut next = Vec::new();
+        for dir in &found {
+            if !segment.contains('*') {
+                let path = dir.join(segment);
+                if path.exists() {
+                    next.push(path);
+                }
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+                if wildcard(segment, name) && (last || is_dir) {
+                    next.push(entry.path());
+                }
+            }
+        }
+        found = next;
+    }
+    found.retain(|p| p.is_file());
+    found.sort();
+    found
+}
+
+/// `*` matches any run of characters; everything else matches itself.
+fn wildcard(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((head, rest)) => {
+            let Some(name) = name.strip_prefix(head) else {
+                return false;
+            };
+            (0..=name.len())
+                .filter(|i| name.is_char_boundary(*i))
+                .any(|i| wildcard(rest, &name[i..]))
+        }
+    }
 }
 
 /// Expands `watch` globs under $HOME on each poll; every new match becomes a source
