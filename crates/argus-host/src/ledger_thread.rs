@@ -3,15 +3,19 @@
 //! run here, but each is a short fold-state lookup: anything slow (git, LLMs, processes)
 //! runs elsewhere and comes back as a command.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-use argus_core::event::{Author, Event};
-use argus_core::ids::{RunId, SourceId};
+use argus_core::event::{Author, Event, JobInfo};
+use argus_core::ids::{RunId, SourceId, UnixMillis};
 use argus_core::ledger::{JobLedger, LedgerError, SourceCursor, Submitted};
+use argus_core::plan::{Invocation, PlanEnv, ToolPaths};
+use argus_core::policy::PolicyConfig;
 use argus_core::source::{RawFrame, SourceMeta};
 
 use crate::pulse::Dep;
+use crate::runner::{Running, Workspace};
 
 pub(crate) enum Cmd {
     Submit {
@@ -35,6 +39,8 @@ pub(crate) enum Cmd {
         run: RunId,
     },
     Flush,
+    /// Ends the loop (host shutdown). Runs still executing keep their own threads.
+    Stop,
     /// Daily: `prune_source` for Terminal-family sources older than `Retention`.
     Retain,
 }
@@ -63,21 +69,68 @@ impl LedgerHandle {
     }
 }
 
-/// TODO:
-/// loop {
-///   drain inbox (batch); apply each Cmd to the ledger;
-///   if anything changed:
-///     for event in policy::decide(ledger.views(), cfg, now): submit(Policy, event)
-///     for due in ledger.views().runs().due(&live): match due {
-///       Start{..} => { submit(Host, RunStarted); live.insert(run); runner::start(...) }
-///       Abandon{..} => submit(Host, RunFinished{ outcome: Abandoned })
-///       Kill{..} => runner::kill(run)
-///       Release{lease} => lease::release_orphan(...)  (on a worker thread)
-///     }
-///     registry.changed(LedgerRef::Job(job), &|mask| ledger.views().stamp(mask))
-/// }
-pub(crate) fn run(ledger: JobLedger, inbox: Receiver<Cmd>, live: BTreeSet<RunId>) {
-    todo!("not implemented")
+/// Starts runs. The host's is `runner::start`; tests stand in for processes.
+pub(crate) trait Launcher {
+    fn start(
+        &mut self,
+        inv: Invocation,
+        env: PlanEnv,
+        ws: Workspace,
+        ledger: Sender<Cmd>,
+    ) -> Running;
+}
+
+/// What a job's loop needs besides its ledger: where its runs execute and how.
+pub(crate) struct LoopConfig {
+    pub info: JobInfo,
+    pub home: PathBuf,
+    pub policy: PolicyConfig,
+    pub tools: ToolPaths,
+    pub socket: PathBuf,
+    pub snapshot_deny: Vec<String>,
+}
+
+/// One job's ledger and the runs the host is executing for it. Only this owns the
+/// ledger, so every write is ordered here, live and on replay alike.
+pub(crate) struct JobLoop<L: Launcher> {
+    ledger: JobLedger,
+    /// This loop's own inbox, handed to each run it starts.
+    inbox: Sender<Cmd>,
+    live: BTreeMap<RunId, Running>,
+    launcher: L,
+    cfg: LoopConfig,
+}
+
+impl<L: Launcher> JobLoop<L> {
+    pub(crate) fn new(ledger: JobLedger, inbox: Sender<Cmd>, launcher: L, cfg: LoopConfig) -> Self {
+        JobLoop {
+            ledger,
+            inbox,
+            live: BTreeMap::new(),
+            launcher,
+            cfg,
+        }
+    }
+
+    /// Applies one command. Returns whether the views may have changed.
+    pub(crate) fn handle(&mut self, cmd: Cmd) -> bool {
+        todo!("not implemented")
+    }
+
+    /// After a batch of commands: submits what the policy decides, then does what the
+    /// runs view says the host owes (`Runs::due`), until neither has anything left.
+    pub(crate) fn after_batch(&mut self, now: UnixMillis) {
+        todo!("not implemented")
+    }
+
+    /// Blocks on the inbox and applies commands in batches until `Cmd::Stop`.
+    pub(crate) fn run(mut self, inbox: Receiver<Cmd>) {
+        todo!("not implemented")
+    }
+
+    pub(crate) fn ledger(&self) -> &JobLedger {
+        &self.ledger
+    }
 }
 
 /// Appends an authored event on the ledger thread.
@@ -190,5 +243,290 @@ pub(crate) mod testing {
                 RawFrame::Discontinuity { .. } => None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use argus_core::event::{AgentLaunch, JobOrigin, ReviewLens, RunOutcome, RunPurpose, Snapshot};
+    use argus_core::ids::{Attempt, GitOid, Id128, JobId, ModelId};
+    use argus_core::models::{AgentCli, ModelChoice, ModelSet};
+    use argus_core::plan::{SNAPSHOT_DENY, Workdir};
+
+    /// One `Launcher::start` call, and the receiver its `Running::cancel` sends to.
+    struct Started {
+        run: RunId,
+        attempt: Attempt,
+        inv: Invocation,
+        ws: Workspace,
+        cancelled: mpsc::Receiver<()>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeLauncher(Arc<Mutex<Vec<Started>>>);
+
+    impl Launcher for FakeLauncher {
+        fn start(
+            &mut self,
+            inv: Invocation,
+            env: PlanEnv,
+            ws: Workspace,
+            _: Sender<Cmd>,
+        ) -> Running {
+            let (cancel, cancelled) = mpsc::channel();
+            self.0.lock().unwrap().push(Started {
+                run: env.run,
+                attempt: env.attempt,
+                inv,
+                ws,
+                cancelled,
+            });
+            Running::new(env.run, cancel)
+        }
+    }
+
+    fn oid(c: char) -> GitOid {
+        GitOid::parse(&c.to_string().repeat(40)).unwrap()
+    }
+
+    fn run(n: u128) -> RunId {
+        RunId(Id128(n))
+    }
+
+    fn scratch() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "argus-loop-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn cfg(policy: PolicyConfig) -> LoopConfig {
+        LoopConfig {
+            info: JobInfo {
+                job: JobId(Id128(1)),
+                title: "fix the gate".into(),
+                repo: PathBuf::from("/w/argus"),
+                base: oid('b'),
+                target: "main".into(),
+                worktree: PathBuf::from("/w/jobs/1"),
+                group: None,
+                origin: JobOrigin::Launched,
+            },
+            home: PathBuf::from("/h"),
+            policy,
+            tools: ToolPaths {
+                claude: "claude".into(),
+                codex: "codex".into(),
+                java: "java".into(),
+                tla2tools_jar: "tla2tools.jar".into(),
+                tlars: "tlars".into(),
+                lake: "lake".into(),
+                eas: "eas".into(),
+                script: "script".into(),
+            },
+            socket: PathBuf::from("/run/argus.sock"),
+            snapshot_deny: SNAPSHOT_DENY.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    const NOW: UnixMillis = UnixMillis(1_792_811_790_000);
+
+    struct Job {
+        dir: PathBuf,
+        launcher: FakeLauncher,
+        job: JobLoop<FakeLauncher>,
+    }
+
+    impl Job {
+        fn open(dir: PathBuf, policy: PolicyConfig) -> Self {
+            let launcher = FakeLauncher::default();
+            let (inbox, _) = mpsc::channel();
+            let ledger = JobLedger::open(&dir).unwrap();
+            let job = JobLoop::new(ledger, inbox, launcher.clone(), cfg(policy));
+            Job { dir, launcher, job }
+        }
+
+        /// Submits through the loop, as a transport or a run would, then lets it act.
+        fn submit(&mut self, author: Author, event: Event) -> Submitted {
+            let (reply, answer) = mpsc::channel();
+            self.job.handle(Cmd::Submit {
+                author,
+                event,
+                reply,
+            });
+            self.job.after_batch(NOW);
+            answer.recv().unwrap().unwrap()
+        }
+
+        fn release(&mut self, n: u128) {
+            self.job.handle(Cmd::Released { run: run(n) });
+            self.job.after_batch(NOW);
+        }
+
+        fn started(&self) -> Vec<(RunId, Attempt)> {
+            self.launcher
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| (s.run, s.attempt))
+                .collect()
+        }
+
+        fn attempts(&self, n: u128) -> Vec<(Attempt, Option<RunOutcome>)> {
+            let runs = self.job.ledger().views().runs();
+            runs.get(&run(n))
+                .map(|r| {
+                    r.attempts
+                        .iter()
+                        .map(|a| (a.attempt, a.finished.clone().map(|f| f.1)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    fn agent(n: u128) -> Event {
+        Event::RunRequested {
+            run: run(n),
+            purpose: RunPurpose::Agent(AgentLaunch {
+                cli: AgentCli::Claude,
+                model: None,
+                prompt: "fix the gate".into(),
+                resume: None,
+            }),
+        }
+    }
+
+    fn finished(n: u128, attempt: u16, outcome: RunOutcome) -> Event {
+        Event::RunFinished {
+            run: run(n),
+            attempt: Attempt(attempt),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn a_requested_run_is_started_once_and_recorded_as_started() {
+        let mut job = Job::open(scratch(), PolicyConfig::default());
+        job.submit(Author::Human, agent(1));
+        assert_eq!(job.started(), vec![(run(1), Attempt(0))]);
+        assert_eq!(job.attempts(1), vec![(Attempt(0), None)]);
+        // Planned from the purpose, in the job's own worktree.
+        let launched = &job.launcher.0.lock().unwrap()[0];
+        let Invocation::Process(spec) = &launched.inv else {
+            panic!("{:?}", launched.inv)
+        };
+        assert_eq!(spec.program, PathBuf::from("claude"));
+        assert!(matches!(spec.workdir, Workdir::JobWorktree));
+        assert_eq!(launched.ws.worktree, PathBuf::from("/w/jobs/1"));
+        assert_eq!(launched.ws.repo, PathBuf::from("/w/argus"));
+
+        // Nothing new happens on later batches while it runs.
+        job.job.after_batch(NOW);
+        assert_eq!(job.started().len(), 1);
+    }
+
+    #[test]
+    fn a_run_finishes_by_its_own_report_and_is_not_restarted() {
+        let mut job = Job::open(scratch(), PolicyConfig::default());
+        job.submit(Author::Human, agent(1));
+        job.submit(Author::Host, finished(1, 0, RunOutcome::Exited { code: 0 }));
+        job.release(1);
+        assert_eq!(job.started().len(), 1);
+        assert_eq!(
+            job.attempts(1),
+            vec![(Attempt(0), Some(RunOutcome::Exited { code: 0 }))]
+        );
+    }
+
+    #[test]
+    fn a_cancel_reaches_the_running_run() {
+        let mut job = Job::open(scratch(), PolicyConfig::default());
+        job.submit(Author::Human, agent(1));
+        job.submit(Author::Human, Event::RunCancelRequested { run: run(1) });
+        let launcher = job.launcher.0.lock().unwrap();
+        assert!(launcher[0].cancelled.try_recv().is_ok());
+    }
+
+    #[test]
+    fn after_a_crash_interrupted_runs_are_abandoned_and_safe_ones_retried() {
+        let dir = scratch();
+        {
+            let mut job = Job::open(dir.clone(), PolicyConfig::default());
+            job.submit(Author::Human, agent(1));
+            job.submit(
+                Author::Policy,
+                Event::RunRequested {
+                    run: run(2),
+                    purpose: RunPurpose::Snapshot { after: None },
+                },
+            );
+            assert_eq!(job.started().len(), 2);
+            // The host dies here: neither run reports back.
+        }
+        let mut job = Job::open(dir, PolicyConfig::default());
+        job.job.after_batch(NOW);
+        assert_eq!(
+            job.attempts(1),
+            vec![(Attempt(0), Some(RunOutcome::Abandoned))]
+        );
+        // The agent waits for a human; the snapshot is retried as a new attempt.
+        assert_eq!(
+            job.attempts(2),
+            vec![
+                (Attempt(0), Some(RunOutcome::Abandoned)),
+                (Attempt(1), None)
+            ]
+        );
+        assert_eq!(job.started(), vec![(run(2), Attempt(1))]);
+    }
+
+    #[test]
+    fn the_policy_s_requests_are_started_in_the_same_batch() {
+        let models = ModelSet::new([ModelChoice {
+            cli: AgentCli::Claude,
+            model: ModelId("opus".into()),
+            effort: None,
+        }])
+        .unwrap();
+        let policy = PolicyConfig {
+            review_on_snapshot: Some((models, ReviewLens::General)),
+            ..PolicyConfig::default()
+        };
+        let mut job = Job::open(scratch(), policy);
+        job.submit(
+            Author::Policy,
+            Event::RunRequested {
+                run: run(2),
+                purpose: RunPurpose::Snapshot { after: None },
+            },
+        );
+        let snapshot = Snapshot {
+            tree: oid('1'),
+            base: oid('b'),
+            previous: None,
+            delta: Vec::new(),
+            files: Vec::new(),
+            withheld: Vec::new(),
+        };
+        job.submit(Author::Host, finished(2, 0, RunOutcome::Snapshot(snapshot)));
+        job.release(2);
+        let launched = job.launcher.0.lock().unwrap();
+        let review = launched.iter().find_map(|s| match &s.inv {
+            Invocation::Process(spec) if matches!(spec.workdir, Workdir::Snapshot { .. }) => {
+                Some((s.run, s.ws.previous.clone()))
+            }
+            _ => None,
+        });
+        // The reviewer was started, and new snapshots will be recorded against the head.
+        let (_, previous) = review.expect("a review run was started");
+        assert_eq!(previous, Some(oid('1')));
     }
 }

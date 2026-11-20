@@ -28,6 +28,10 @@ pub(crate) struct Running {
 }
 
 impl Running {
+    pub(crate) fn new(run: RunId, cancel: Sender<()>) -> Self {
+        Running { run, cancel }
+    }
+
     /// Asks the run to stop (`RunCancelRequested` reached the host). Idempotent.
     pub(crate) fn cancel(&self) {
         let _ = self.cancel.send(());
