@@ -723,6 +723,38 @@ mod tests {
 
     /// A job snapshot of `repo()`'s worktree, and a `release` branch at the base that
     /// nothing has checked out.
+    #[test]
+    fn a_head_diff_is_read_once_and_then_shared() {
+        let (dir, base) = repo();
+        let s = snapshot(&dir, &base, None, JobId(Id128(1)), &deny()).unwrap();
+        let cache = DiffCache::default();
+        let req = DiffRequest {
+            base: base.clone(),
+            tree: s.tree.clone(),
+        };
+        let diff = cache.get(&dir, &req).unwrap();
+        assert_eq!(diff.request, req);
+        let paths: Vec<&str> = diff.hunks.iter().map(|h| h.anchor.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt", "b.txt", "src/c.txt"]);
+        let a = &diff.hunks[0];
+        assert!(a.text.contains("-two\n+TWO\n"), "{}", a.text);
+        assert!(std::sync::Arc::ptr_eq(
+            &diff,
+            &cache.get(&dir, &req).unwrap()
+        ));
+        // The diff is of the stored tree, not of whatever the worktree holds now.
+        std::fs::write(dir.join("a.txt"), "changed again\n").unwrap();
+        let fresh = DiffCache::default().get(&dir, &req).unwrap();
+        assert_eq!(fresh.hunks.len(), diff.hunks.len());
+        assert_eq!(fresh.hunks[0].text, diff.hunks[0].text);
+
+        let missing = DiffRequest {
+            base,
+            tree: TreeOid::parse(&"1".repeat(40)).unwrap(),
+        };
+        assert!(cache.get(&dir, &missing).is_err());
+    }
+
     fn merge_setup() -> (PathBuf, CommitOid, Snapshot) {
         let (dir, base) = repo();
         git(&dir, &["config", "user.name", "Reviewer"]);
