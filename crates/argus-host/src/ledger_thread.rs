@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use argus_core::event::{Author, Event, JobInfo, LedgerKind, RunOutcome};
-use argus_core::ids::{Attempt, RunId, SourceId, UnixMillis};
+use argus_core::ids::{Attempt, LedgerRef, RunId, SourceId, UnixMillis};
 use argus_core::ledger::{JobLedger, LedgerError, SourceCursor, Submitted};
 use argus_core::plan::{Invocation, PlanEnv, ToolPaths, plan};
 use argus_core::policy::{self, PolicyConfig};
@@ -50,9 +50,13 @@ pub(crate) enum Cmd {
 #[derive(Clone)]
 pub(crate) struct LedgerHandle {
     tx: Sender<Cmd>,
+    ledger: LedgerRef,
 }
 
 impl LedgerHandle {
+    pub(crate) fn new(tx: Sender<Cmd>, ledger: LedgerRef) -> Self {
+        LedgerHandle { tx, ledger }
+    }
     pub(crate) fn submit(&self, author: Author, event: Event) -> Result<Submitted, LedgerError> {
         todo!("not implemented")
     }
@@ -764,5 +768,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![run(1)]
         );
+    }
+
+    #[test]
+    fn a_handle_submits_and_reads_on_the_loop_thread_and_reports_what_it_read() {
+        use crate::pulse::Dep;
+        use argus_core::ids::JobId;
+        use argus_core::views::ViewSet;
+        let (inbox, commands) = mpsc::channel();
+        let ledger = JobLedger::open(&scratch()).unwrap();
+        let job = JobLoop::new(
+            ledger,
+            inbox.clone(),
+            FakeLauncher::default(),
+            cfg(PolicyConfig::default()),
+        );
+        let thread = std::thread::spawn(move || job.run(commands));
+        let at = LedgerRef::Job(JobId(Id128(1)));
+        let handle = LedgerHandle::new(inbox.clone(), at);
+
+        assert!(matches!(
+            handle.submit(Author::Human, agent(1)),
+            Ok(Submitted::Appended(_))
+        ));
+        assert!(matches!(
+            handle.submit(Author::Human, agent(1)),
+            Ok(Submitted::Duplicate(_))
+        ));
+        let mut deps = Vec::new();
+        let requested = handle.read(&mut deps, |l| l.views().runs().get(&run(1)).is_some());
+        assert!(requested);
+        let [
+            Dep::Views {
+                ledger,
+                mask,
+                stamp,
+            },
+        ] = deps.as_slice()
+        else {
+            panic!("{deps:?}")
+        };
+        assert_eq!(*ledger, at);
+        // The dependency is exactly what the closure read, at the version it saw.
+        let (same_mask, same_stamp) = handle.read(&mut Vec::new(), |l| {
+            let _ = l.views().runs();
+            let mask = l.views().take_reads();
+            (mask, l.views().stamp(mask))
+        });
+        assert_eq!((*mask, *stamp), (same_mask, same_stamp));
+        inbox.send(Cmd::Stop).unwrap();
+        thread.join().unwrap();
     }
 }
