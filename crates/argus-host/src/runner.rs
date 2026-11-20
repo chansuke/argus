@@ -6,18 +6,21 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use argus_core::ids::{Attempt, CommitOid, JobId, RunId, TreeOid};
+use argus_core::event::{Author, Event, RunOutcome};
+use argus_core::ids::{CommitOid, JobId, RunId, TreeOid};
 use argus_core::ledger::SourceCursor;
-use argus_core::plan::{CommandSpec, Effect, Invocation, PlanEnv};
+use argus_core::plan::{CommandSpec, Effect, Invocation, PlanEnv, Workdir};
 use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 use argus_log::BlobStore;
 
 use crate::ledger_thread::{self, Cmd, observe};
-use crate::pty;
+use crate::{git, pty, tail};
 
 pub(crate) struct Running {
     pub run: RunId,
@@ -58,7 +61,164 @@ pub(crate) const GRACE: Duration = Duration::from_secs(10);
 /// - Leased (device checks), `Merge`, and `WriteSkill` are not written yet: they finish
 ///   as `Failed`, so nothing waits on them forever.
 pub(crate) fn start(inv: Invocation, env: PlanEnv, ws: Workspace, ledger: Sender<Cmd>) -> Running {
-    todo!("not implemented")
+    let (cancel, cancelled) = mpsc::channel();
+    let run = env.run;
+    std::thread::spawn(move || {
+        let control = Control {
+            cancel: cancelled,
+            grace: GRACE,
+        };
+        let outcome = execute(inv, &env, &ws, &ledger, &control);
+        let finished = Event::RunFinished {
+            run: env.run,
+            attempt: env.attempt,
+            outcome,
+        };
+        // Without the ledger the outcome is lost; the restart abandons the attempt instead.
+        let _ = ledger_thread::submit(&ledger, Author::Host, finished);
+        let _ = ledger.send(Cmd::Released { run: env.run });
+    });
+    Running { run, cancel }
+}
+
+fn execute(
+    inv: Invocation,
+    env: &PlanEnv,
+    ws: &Workspace,
+    ledger: &Sender<Cmd>,
+    control: &Control,
+) -> RunOutcome {
+    let failed = |reason: String| RunOutcome::Failed { reason };
+    match inv {
+        Invocation::Process(spec) => run_process(spec, env, ws, ledger, control),
+        Invocation::InProcess(Effect::Snapshot) => {
+            let previous = ws.previous.as_ref();
+            match git::snapshot(&ws.worktree, &ws.base, previous, ws.job, &env.snapshot_deny) {
+                Ok(snapshot) => RunOutcome::Snapshot(snapshot),
+                Err(e) => failed(e.to_string()),
+            }
+        }
+        Invocation::InProcess(Effect::Import { transcript, kind }) => {
+            match import(&transcript, kind, env, ledger) {
+                Ok(()) => RunOutcome::Exited { code: 0 },
+                Err(e) => failed(format!("{}: {e}", transcript.display())),
+            }
+        }
+        Invocation::Leased { .. } => failed("device checks are not supported yet".into()),
+        Invocation::InProcess(Effect::Merge(_)) => failed("merging is not supported yet".into()),
+        Invocation::InProcess(Effect::WriteSkill(_)) => {
+            failed("writing skills is not supported yet".into())
+        }
+    }
+}
+
+fn run_process(
+    mut spec: CommandSpec,
+    env: &PlanEnv,
+    ws: &Workspace,
+    ledger: &Sender<Cmd>,
+    control: &Control,
+) -> RunOutcome {
+    // Held until the process ended: dropping it removes the checkout.
+    let checkout = match &spec.workdir {
+        Workdir::Snapshot { tree, base } => match git::materialize(&ws.repo, tree, base) {
+            Ok(checkout) => Some(checkout),
+            Err(e) => {
+                return RunOutcome::SpawnFailed {
+                    error: e.to_string(),
+                };
+            }
+        },
+        Workdir::JobWorktree | Workdir::Home => None,
+    };
+    let dir = match (&spec.workdir, &checkout) {
+        (_, Some(checkout)) => checkout.path.clone(),
+        (Workdir::Home, None) => ws.home.clone(),
+        _ => ws.worktree.clone(),
+    };
+    let artifacts = match spec.artifacts {
+        true => {
+            let dir = std::env::temp_dir()
+                .join(format!("argus-artifacts-{}-{}", env.run.0, env.attempt.0));
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return RunOutcome::SpawnFailed {
+                    error: e.to_string(),
+                };
+            }
+            let value = dir.to_string_lossy().into_owned();
+            spec.env.push(("ARGUS_ARTIFACT_DIR".into(), value));
+            Some(dir)
+        }
+        false => None,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = (!spec.watch.is_empty()).then(|| {
+        let specs = spec.watch.clone();
+        tail::watch(
+            specs,
+            ws.home.clone(),
+            env.run,
+            env.attempt,
+            ledger.clone(),
+            stop.clone(),
+            tail::POLL,
+        )
+    });
+
+    let ended = spawn_capture(&spec, &dir, env, ledger, control);
+    stop.store(true, Ordering::SeqCst);
+    if let Some(watcher) = watcher {
+        let _ = watcher.join();
+    }
+    if let Some(artifacts) = &artifacts {
+        let _ = collect_artifacts(artifacts, env, &ws.blobs, ledger);
+        let _ = std::fs::remove_dir_all(artifacts);
+    }
+    drop(checkout);
+    match ended {
+        Err(e) => RunOutcome::SpawnFailed {
+            error: e.to_string(),
+        },
+        Ok(ended) => outcome_of(&ended),
+    }
+}
+
+fn outcome_of(ended: &Ended) -> RunOutcome {
+    use std::os::unix::process::ExitStatusExt;
+    match (ended.cancelled, ended.status.code(), ended.status.signal()) {
+        (true, _, signal) => RunOutcome::Killed {
+            signal: signal.unwrap_or(15),
+            cancelled: true,
+        },
+        (false, Some(code), _) => RunOutcome::Exited { code },
+        (false, None, signal) => RunOutcome::Killed {
+            signal: signal.unwrap_or(0),
+            cancelled: false,
+        },
+    }
+}
+
+/// Streams `path` into one source of `kind`, as the tailer would, and finishes it.
+fn import(
+    path: &Path,
+    kind: SourceKind,
+    env: &PlanEnv,
+    ledger: &Sender<Cmd>,
+) -> std::io::Result<()> {
+    let origin = SourceOrigin::File(path.to_path_buf());
+    let meta = SourceMeta {
+        id: SourceMeta::derive_id(env.run, env.attempt, &origin),
+        run: env.run,
+        attempt: env.attempt,
+        kind,
+        origin,
+    };
+    // The tailer treats a missing file as "not written yet"; an import must not.
+    std::fs::metadata(path)?;
+    let cursor = ledger_thread::open_source(ledger, meta)?;
+    let mut tailer = tail::Tailer::new(path.to_path_buf(), &cursor);
+    observe(ledger, cursor.meta.id, tailer.finish()?);
+    Ok(())
 }
 
 /// Files left in `dir` (`$ARGUS_ARTIFACT_DIR`): each is put in the blob store (fsynced)
@@ -69,7 +229,48 @@ pub(crate) fn collect_artifacts(
     blobs: &BlobStore,
     ledger: &Sender<Cmd>,
 ) -> std::io::Result<()> {
-    todo!("not implemented")
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    for path in files {
+        let (blob, len) = blobs
+            .put_file(&path)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let captured = Event::ArtifactCaptured {
+            run: env.run,
+            attempt: env.attempt,
+            blob,
+            media_type: media_type(&name).to_owned(),
+            name,
+            len,
+        };
+        ledger_thread::submit(ledger, Author::Host, captured)?;
+    }
+    Ok(())
+}
+
+/// By extension; the viewer only needs to know images, videos, and text apart.
+fn media_type(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("txt" | "log") => "text/plain",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Runs `spec` in `dir` (the resolved workdir: the job worktree, a snapshot checkout, or
@@ -277,7 +478,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use argus_core::ids::Id128;
+    use argus_core::ids::{Attempt, Id128};
     use argus_core::plan::{SNAPSHOT_DENY, ToolPaths, Workdir};
     use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 
