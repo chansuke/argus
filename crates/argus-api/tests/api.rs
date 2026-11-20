@@ -57,6 +57,8 @@ fn basic_types_name_their_typescript_type() {
     assert_eq!(String::ts_ref(), "string");
     assert_eq!(bool::ts_ref(), "boolean");
     assert_eq!(Json::ts_ref(), "unknown");
+    assert_eq!(f64::ts_ref(), "number");
+    assert_eq!(u32::ts_ref(), "number");
     assert_eq!(Vec::<String>::ts_ref(), "Array<string>");
     assert_eq!(Option::<bool>::ts_ref(), "boolean | null");
     // Containers pass their element's declarations through.
