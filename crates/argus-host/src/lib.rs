@@ -119,6 +119,32 @@ impl HostInner {
         Ok(())
     }
 
+    /// Records a new job (`JobOpened`, by the host) and starts its loop. A job that is
+    /// already open (a retried start) is left as it is.
+    pub(crate) fn create_job(&self, info: argus_core::event::JobInfo) -> std::io::Result<()> {
+        let job = info.job;
+        if self.jobs.lock().unwrap().contains_key(&job) {
+            return Ok(());
+        }
+        let mut ledger = self.store.open_job(job).map_err(io_error)?;
+        ledger
+            .submit(
+                argus_core::event::Author::Host,
+                argus_core::event::Event::JobOpened(info),
+            )
+            .map_err(io_error)?;
+        drop(ledger);
+        self.open_job(job)
+    }
+
+    pub(crate) fn job(&self, job: JobId) -> Option<LedgerHandle> {
+        self.jobs.lock().unwrap().get(&job).map(|(h, _)| h.clone())
+    }
+
+    pub(crate) fn job_ids(&self) -> Vec<JobId> {
+        self.jobs.lock().unwrap().keys().copied().collect()
+    }
+
     fn stop_all(&self) {
         let jobs = std::mem::take(&mut *self.jobs.lock().unwrap());
         for (handle, thread) in jobs.into_values() {
@@ -177,8 +203,12 @@ impl Host {
 
     /// One-shot op (query, command, or the current value of a subscription).
     pub fn call(&self, caller: &Caller, op: &str, input: &Json) -> Result<Json, ApiError> {
-        // TODO: argus_api::dispatch(&mut handler::ApiHandler::new(&self.inner), caller, op, input)
-        todo!("not implemented")
+        argus_api::dispatch(
+            &mut handler::ApiHandler::new(&self.inner),
+            caller,
+            op,
+            input,
+        )
     }
 
     /// Pushes the op's value now and again whenever an input it read changes
