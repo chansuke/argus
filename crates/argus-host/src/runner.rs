@@ -1285,4 +1285,259 @@ mod tests {
             started.elapsed()
         );
     }
+
+    // ------------------------------------------------------------ real Claude Code
+
+    /// What a live run has sent so far, readable while it runs.
+    #[derive(Default)]
+    struct Live {
+        sources: std::collections::BTreeMap<argus_core::ids::SourceId, (SourceMeta, Vec<u8>)>,
+        finished: Option<RunOutcome>,
+    }
+
+    fn live_ledger() -> (Sender<Cmd>, std::sync::Arc<std::sync::Mutex<Live>>) {
+        use argus_core::ledger::{SourceCursor, Submitted};
+        use argus_core::source::RawFrame;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let live = std::sync::Arc::new(std::sync::Mutex::new(Live::default()));
+        let shared = live.clone();
+        std::thread::spawn(move || {
+            for cmd in rx {
+                let mut live = shared.lock().unwrap();
+                match cmd {
+                    Cmd::OpenSource { meta, reply } => {
+                        live.sources
+                            .entry(meta.id)
+                            .or_insert((meta.clone(), Vec::new()));
+                        let _ = reply.send(Ok(SourceCursor {
+                            meta,
+                            resume_at: 0,
+                            last: None,
+                        }));
+                    }
+                    Cmd::Observe { source, frames } => {
+                        for frame in frames {
+                            if let RawFrame::Bytes { bytes, .. } = frame {
+                                live.sources.get_mut(&source).unwrap().1.extend(bytes);
+                            }
+                        }
+                    }
+                    Cmd::Submit { event, reply, .. } => {
+                        if let Event::RunFinished { outcome, .. } = event {
+                            live.finished = Some(outcome);
+                        }
+                        let id = argus_core::ids::EventId::parse("host:0").unwrap();
+                        let _ = reply.send(Ok(Submitted::Appended(id)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (tx, live)
+    }
+
+    /// Terminal output without escape sequences or whitespace.
+    fn visible(screen: &str) -> String {
+        let mut out = String::new();
+        let mut chars = screen.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // CSI: up to a final byte in @..~; OSC: up to BEL or ST; others: one char.
+                match chars.next() {
+                    Some('[') => {
+                        for c in chars.by_ref() {
+                            if ('@'..='~').contains(&c) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        for c in chars.by_ref() {
+                            if c == '\x07' || c == '\x1b' {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if !c.is_whitespace() {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Runs real `claude` (haiku) under a PTY in a fresh repository until its transcript
+    /// shows `done`, answering the folder trust question if it is asked; then cancels it.
+    fn real_claude(
+        ws: &Workspace,
+        run: RunId,
+        prompt: &str,
+        resume: Option<RunId>,
+        done: &str,
+    ) -> (RunOutcome, String, Vec<String>) {
+        use argus_core::event::{AgentLaunch, RunPurpose};
+        use argus_core::models::AgentCli;
+        let mut env = env();
+        env.run = run;
+        let purpose = RunPurpose::Agent(AgentLaunch {
+            cli: AgentCli::Claude,
+            model: Some(argus_core::ids::ModelId("haiku".into())),
+            prompt: prompt.into(),
+            resume,
+        });
+        let inv = argus_core::plan::plan(&purpose, &env);
+        let (ledger, live) = live_ledger();
+        let running = start(inv, env, ws.clone(), ledger);
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let (mut moved, mut trusted) = (false, false);
+        let transcript = loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let live = live.lock().unwrap();
+            if Instant::now() >= deadline {
+                for (meta, bytes) in live.sources.values() {
+                    let text = String::from_utf8_lossy(bytes);
+                    let tail: String = text
+                        .chars()
+                        .rev()
+                        .take(1500)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    eprintln!("--- {:?} ({} bytes)\n{tail}", meta.origin, bytes.len());
+                }
+                panic!("no answer in time");
+            }
+            if live.finished.is_some() {
+                for (meta, bytes) in live.sources.values() {
+                    eprintln!(
+                        "--- {:?}\n{}",
+                        meta.origin,
+                        visible(&String::from_utf8_lossy(bytes))
+                    );
+                }
+                panic!("ended early: {:?}", live.finished);
+            }
+            let screen: String = live
+                .sources
+                .values()
+                .filter(|(m, _)| m.origin == SourceOrigin::Terminal)
+                .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            // The screen draws spaces as cursor moves: compare without escapes or spaces.
+            // Keys sent before the prompt is fully drawn are misread, so wait for it, then
+            // move to "Yes" and confirm only once the marker is on it.
+            let shown = visible(&screen);
+            let marker = shown.rfind('❯').map(|i| &shown[i..]);
+            if !trusted && shown.contains("Entertoconfirm") {
+                if marker.is_some_and(|m| m.starts_with("❯Yes")) {
+                    running.send_input(b"\r".to_vec());
+                    trusted = true;
+                } else if !moved {
+                    std::thread::sleep(Duration::from_secs(1));
+                    running.send_input(b"\x1b[B".to_vec());
+                    moved = true;
+                }
+            }
+            let answered = live.sources.values().find(|(m, b)| {
+                matches!(m.origin, SourceOrigin::File(_))
+                    && String::from_utf8_lossy(b).contains(done)
+                    && String::from_utf8_lossy(b).contains("end_turn")
+            });
+            if let Some((meta, bytes)) = answered {
+                let SourceOrigin::File(path) = &meta.origin else {
+                    unreachable!()
+                };
+                break (
+                    path.display().to_string(),
+                    String::from_utf8_lossy(bytes).into_owned(),
+                );
+            }
+        };
+        running.cancel();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let outcome = loop {
+            if let Some(outcome) = live.lock().unwrap().finished.clone() {
+                break outcome;
+            }
+            assert!(Instant::now() < deadline, "did not exit after the cancel");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let files: Vec<String> = live
+            .lock()
+            .unwrap()
+            .sources
+            .values()
+            .filter_map(|(m, _)| match &m.origin {
+                SourceOrigin::File(p) => Some(p.display().to_string()),
+                _ => None,
+            })
+            .collect();
+        (
+            outcome,
+            transcript.0,
+            vec![transcript.1].into_iter().chain(files).collect(),
+        )
+    }
+
+    /// `cargo test -p argus-host --lib real_claude -- --ignored --nocapture`. Costs two
+    /// small haiku turns and leaves two sessions in ~/.claude/projects.
+    #[test]
+    #[ignore = "runs the real claude CLI, which costs a little and writes ~/.claude"]
+    fn real_claude_answers_under_a_pty_and_feedback_resumes_a_copy_of_its_session() {
+        let mut ws = job_repo("real-claude");
+        ws.home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        // Derived run ids are UUID v8; Claude must accept them as session ids.
+        let first = RunId(Id128::derive("e2e", &std::process::id().to_le_bytes()));
+        let (outcome, path, texts) = real_claude(
+            &ws,
+            first,
+            "Reply with exactly the word pong and nothing else.",
+            None,
+            "pong",
+        );
+        eprintln!("first: {outcome:?} {path}");
+        assert!(path.ends_with(&format!("{}.jsonl", first.0)), "{path}");
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::Killed {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let second = RunId(Id128::derive(
+            "e2e-resume",
+            &std::process::id().to_le_bytes(),
+        ));
+        let (outcome, path, texts2) = real_claude(
+            &ws,
+            second,
+            "Now reply with exactly the word again and nothing else.",
+            Some(first),
+            "again",
+        );
+        eprintln!("second: {outcome:?} {path} files={:?}", &texts2[1..]);
+        // A copy of the earlier session continues under the new run's id.
+        assert!(path.ends_with(&format!("{}.jsonl", second.0)), "{path}");
+        assert!(
+            texts2[0].contains("pong"),
+            "the earlier turn is in the new transcript"
+        );
+        assert!(
+            matches!(
+                outcome,
+                RunOutcome::Killed {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        let _ = texts;
+    }
 }
