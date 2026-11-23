@@ -83,6 +83,15 @@ impl Period {
     }
 }
 
+impl UtcOffset {
+    /// `YYYY-MM-DD` of the local day `t` falls in.
+    pub fn date(self, t: UnixMillis) -> String {
+        let day = (t.0 + i64::from(self.minutes) * MINUTE).div_euclid(DAY);
+        let (y, m, d) = civil_from_days(day);
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+}
+
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
@@ -136,4 +145,17 @@ fn civil_days(y: i64, m: i64, d: i64) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146_097 + doe - 719_468)
+}
+
+/// Inverse of `civil_days` (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
