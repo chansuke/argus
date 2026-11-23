@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use argus_core::diff::HeadDiff;
 use argus_core::event::{
     AgentLaunch, Anchor, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens,
-    RunPurpose, TaskState,
+    RunPurpose, TaskPatch, TaskState, Weight,
 };
 use argus_core::event::{CheckSpec, DevicePlatform, TlaEngine};
 use argus_core::ids::{
@@ -663,6 +663,16 @@ fn task_status(s: &TaskState) -> TaskStatus {
     }
 }
 
+fn task_state(s: TaskStatus) -> TaskState {
+    match s {
+        TaskStatus::Pending {} => TaskState::Pending,
+        TaskStatus::InProgress {} => TaskState::InProgress,
+        TaskStatus::Blocked { reason } => TaskState::Blocked { reason },
+        TaskStatus::Done { result } => TaskState::Done { result },
+        TaskStatus::Dropped {} => TaskState::Dropped,
+    }
+}
+
 fn plan_status(s: PlanStatus) -> TaskStatus {
     match s {
         PlanStatus::Pending => TaskStatus::Pending {},
@@ -1261,10 +1271,73 @@ impl Handler for ApiHandler<'_> {
         let (_, handle) = self.job_handle(&input.job)?;
         self.submit(&handle, author, Event::RunCancelRequested { run })
     }
+    /// A new task (no `task`) needs a title; its key derives from who adds it, the
+    /// parent, and the title, so a retried `argus task add` adds nothing. An agent edits
+    /// only the tasks it wrote last; it may add new ones under any parent.
     fn set_task(&mut self, caller: &Caller, input: SetTask) -> Result<TaskSaved, ApiError> {
-        // TODO: agent callers may only touch tasks they created or create new ones under
-        //       any parent; submit(author, TaskSet{ task, patch }).
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let parent = input
+            .parent
+            .as_deref()
+            .map(|p| id(p, "parent").map(TaskKey))
+            .transpose()?;
+        let weight = input
+            .weight
+            .map(|w| {
+                std::num::NonZeroU32::new(w)
+                    .map(Weight)
+                    .ok_or_else(|| ApiError::BadInput {
+                        path: "weight".into(),
+                        what: "a weight is at least 1".into(),
+                    })
+            })
+            .transpose()?;
+        let task = match &input.task {
+            Some(task) => TaskKey(id(task, "task")?),
+            None => {
+                let Some(title) = &input.title else {
+                    return Err(ApiError::BadInput {
+                        path: "title".into(),
+                        what: "a new task needs a title".into(),
+                    });
+                };
+                let by = match author {
+                    Author::Agent(run) => run.0.to_string(),
+                    _ => "human".into(),
+                };
+                let parent = parent.map_or(String::new(), |p| p.0.to_string());
+                TaskKey(Id128::derive(
+                    "task",
+                    format!("{by}\0{parent}\0{title}").as_bytes(),
+                ))
+            }
+        };
+        if let Author::Agent(run) = author {
+            let by = handle.read(&mut Vec::new(), move |l| {
+                l.views().progress().task(&task).map(|t| t.by)
+            });
+            if by.is_some_and(|by| by != progress::PlanAuthor::Agent(run)) {
+                return Err(ApiError::Forbidden {
+                    op: "set_task".into(),
+                });
+            }
+        }
+        let patch = TaskPatch {
+            // A new task without a parent is a root; an edit without one keeps its place.
+            parent: match (parent, &input.task) {
+                (Some(p), _) => Some(Some(p)),
+                (None, None) => Some(None),
+                (None, Some(_)) => None,
+            },
+            title: input.title,
+            weight,
+            state: input.status.map(task_state),
+        };
+        self.submit(&handle, author, Event::TaskSet { task, patch })?;
+        Ok(TaskSaved {
+            task: task.0.to_string(),
+        })
     }
     fn hook(&mut self, caller: &Caller, input: HookPayload) -> Result<Ack, ApiError> {
         // TODO: agent only; open_source(SourceMeta{ run, kind: ClaudeHook, origin: Hook })
@@ -1663,6 +1736,86 @@ mod tests {
             call(&host, &Caller::Local, "job", missing),
             Err(ApiError::NotFound { .. })
         ));
+        host.shutdown();
+    }
+
+    #[test]
+    fn tasks_are_created_once_per_title_and_agents_edit_only_their_own() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-tasks");
+        let plan = |host: &Host| {
+            let v = call(
+                host,
+                &Caller::Local,
+                "job",
+                &format!(r#"{{"job":"{job}"}}"#),
+            )
+            .unwrap();
+            let Json::Arr(rows) = get(get(&v, "detail"), "plan").clone() else {
+                panic!()
+            };
+            rows
+        };
+        let add = format!(r#"{{"job":"{job}","title":"ship it"}}"#);
+        let saved = call(&host, &Caller::Local, "set_task", &add).unwrap();
+        let task = text(&saved, &["task"]).to_owned();
+        let again = call(&host, &Caller::Local, "set_task", &add).unwrap();
+        assert_eq!(
+            text(&again, &["task"]),
+            task,
+            "a retried add makes no second task"
+        );
+        assert_eq!(plan(&host).len(), 1);
+
+        let done = format!(
+            r#"{{"job":"{job}","task":"{task}","status":{{"kind":"Done","result":"shipped"}}}}"#
+        );
+        call(&host, &Caller::Local, "set_task", &done).unwrap();
+        let rows = plan(&host);
+        assert_eq!(text(&rows[0], &["status", "kind"]), "Done");
+        assert_eq!(text(&rows[0], &["status", "result"]), "shipped");
+        assert_eq!(
+            text(&rows[0], &["title"]),
+            "ship it",
+            "a patch keeps what it omits"
+        );
+
+        let id = argus_core::ids::Id128::parse(&job).unwrap();
+        let run = argus_core::ids::Id128::derive("agent", &id.0.to_le_bytes()).to_string();
+        let agent = Caller::Agent { run: run.clone() };
+        let step = format!(r#"{{"job":"{job}","parent":"{task}","title":"step","weight":2}}"#);
+        let saved = call(&host, &agent, "set_task", &step).unwrap();
+        let sub = text(&saved, &["task"]).to_owned();
+        assert_ne!(sub, task);
+        let rows = plan(&host);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(text(&rows[1], &["key"]), sub);
+        assert_eq!(text(&rows[1], &["source"]), run);
+        assert_eq!(
+            rows[1].get("depth"),
+            Some(&Json::Num(argus_json::Number::from_u64(1)))
+        );
+
+        let mine = format!(r#"{{"job":"{job}","task":"{sub}","status":{{"kind":"InProgress"}}}}"#);
+        call(&host, &agent, "set_task", &mine).unwrap();
+        assert!(matches!(
+            call(&host, &agent, "set_task", &done),
+            Err(ApiError::Forbidden { .. })
+        ));
+
+        for bad in [
+            format!(r#"{{"job":"{job}"}}"#),
+            format!(r#"{{"job":"{job}","title":"x","weight":0}}"#),
+            format!(r#"{{"job":"{job}","task":"nope","title":"x"}}"#),
+        ] {
+            assert!(
+                matches!(
+                    call(&host, &Caller::Local, "set_task", &bad),
+                    Err(ApiError::BadInput { .. })
+                ),
+                "{bad}"
+            );
+        }
         host.shutdown();
     }
 
