@@ -11,7 +11,7 @@ use argus_core::diff::HeadDiff;
 use argus_core::event::{self, CheckSpec, DevicePlatform, TlaEngine};
 use argus_core::event::{
     AgentLaunch, Anchor, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens,
-    RunPurpose, TaskPatch, TaskState, Weight,
+    ReviewSpec, RunPurpose, TaskPatch, TaskState, Weight,
 };
 use argus_core::ids::{
     BookmarkId, CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange,
@@ -20,7 +20,7 @@ use argus_core::ids::{
 use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
-use argus_core::models::{self, ModelChoice};
+use argus_core::models::{self, ModelChoice, ModelSet, PresetName, ReviewerChoice, UnknownPreset};
 use argus_core::source::{PlanStatus, SourceKind, SourceMeta, SourceOrigin};
 use argus_core::views::packet::{self, PacketConfig};
 use argus_core::views::timeline::{BucketWidth, Window};
@@ -849,6 +849,27 @@ fn agent_cli(a: Agent) -> AgentCli {
         Agent::Codex => AgentCli::Codex,
     }
 }
+/// A model named on the wire. The name becomes a command-line argument, so it may not
+/// be empty, hold whitespace, or start like an option.
+fn model_choice(pick: ModelPick) -> Result<ModelChoice, ApiError> {
+    let name = pick.model;
+    if name.is_empty() || name.starts_with('-') || name.chars().any(char::is_whitespace) {
+        return Err(ApiError::BadInput {
+            path: "model".into(),
+            what: format!("not a model name: {name:?}"),
+        });
+    }
+    Ok(ModelChoice {
+        cli: agent_cli(pick.agent),
+        model: ModelId(name),
+        effort: pick.effort.map(|e| match e {
+            Effort::Low => models::Effort::Low,
+            Effort::Medium => models::Effort::Medium,
+            Effort::High => models::Effort::High,
+            Effort::Max => models::Effort::Max,
+        }),
+    })
+}
 fn agent_wire(a: AgentCli) -> Agent {
     match a {
         AgentCli::Claude => Agent::Claude,
@@ -1062,18 +1083,83 @@ impl Handler for ApiHandler<'_> {
         Err(internal("the head kept moving while the review was read"))
     }
     fn presets(&mut self, caller: &Caller, input: Empty) -> Result<Presets, ApiError> {
-        todo!("not implemented")
+        let presets = &self.host.config.presets;
+        Ok(Presets {
+            default: presets.default_name().as_str().to_owned(),
+            presets: presets
+                .iter()
+                .map(|(name, models)| Preset {
+                    name: name.as_str().to_owned(),
+                    models: models.iter().map(model_pick).collect(),
+                })
+                .collect(),
+        })
     }
+    /// One review run per resolved model, all of the head snapshot. The models are
+    /// resolved now and stored in the requests, so later preset edits change nothing here.
     fn request_review(
         &mut self,
         caller: &Caller,
         input: RequestReview,
     ) -> Result<RunRefs, ApiError> {
-        // TODO: models = presets.resolve(reviewers)?; head = read(review().head());
-        //       for (run, purpose) in ReviewSpec::panel(uuid(request_id), head, base,
-        //       lens(input.lens), focus, &models): submit(author(caller)?, RunRequested).
-        //       Duplicates are success (same runs returned).
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (job, handle) = self.job_handle(&input.job)?;
+        let choice = match input.reviewers {
+            Reviewers::Default {} => ReviewerChoice::Default,
+            Reviewers::Preset { name } => {
+                ReviewerChoice::Preset(PresetName::parse(&name).ok_or_else(|| {
+                    ApiError::BadInput {
+                        path: "reviewers.name".into(),
+                        what: format!("not a preset name: {name:?}"),
+                    }
+                })?)
+            }
+            Reviewers::Models { models } => {
+                let models = models
+                    .into_iter()
+                    .map(model_choice)
+                    .collect::<Result<Vec<_>, _>>()?;
+                ReviewerChoice::Models(ModelSet::new(models).ok_or_else(|| ApiError::BadInput {
+                    path: "reviewers.models".into(),
+                    what: "a review needs at least one model".into(),
+                })?)
+            }
+        };
+        let models = self
+            .host
+            .config
+            .presets
+            .resolve(&choice)
+            .map_err(|UnknownPreset(name)| ApiError::BadInput {
+                path: "reviewers.name".into(),
+                what: format!("no preset named {:?}", name.as_str()),
+            })?;
+        let head = handle.read(&mut Vec::new(), |l| {
+            l.views()
+                .review()
+                .head()
+                .map(|h| (h.snapshot.tree.clone(), h.snapshot.base.clone()))
+        });
+        let (tree, base) = head.ok_or_else(|| ApiError::NotFound {
+            what: format!("a snapshot of job {} to review", job.0),
+        })?;
+        let panel = ReviewSpec::panel(
+            derived("review", &input.request_id),
+            &tree,
+            &base,
+            lens(input.lens),
+            input.focus.as_deref(),
+            &models,
+        );
+        let mut runs = Vec::new();
+        for (run, purpose) in panel {
+            self.submit(&handle, author.clone(), Event::RunRequested { run, purpose })?;
+            runs.push(RunRef {
+                job: job.0.to_string(),
+                run: run.0.to_string(),
+            });
+        }
+        Ok(RunRefs { runs })
     }
     fn request_check(&mut self, caller: &Caller, input: RequestCheck) -> Result<RunRef, ApiError> {
         todo!("not implemented")
@@ -1952,6 +2038,100 @@ mod tests {
             host.call(&stranger, "hook", &input),
             Err(ApiError::NotFound { .. })
         ));
+        host.shutdown();
+    }
+
+    #[test]
+    fn the_presets_list_their_models_and_the_default() {
+        let (host, _root, _repo) = host();
+        let presets = call(&host, &Caller::Local, "presets", "{}").unwrap();
+        assert_eq!(text(&presets, &["default"]), "default");
+        let Json::Arr(list) = get(&presets, "presets") else {
+            panic!()
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!(text(&list[0], &["name"]), "default");
+        let Json::Arr(models) = get(&list[0], "models") else {
+            panic!()
+        };
+        assert_eq!(text(&models[0], &["agent"]), "Claude");
+        assert_eq!(text(&models[0], &["model"]), "opus");
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_review_request_asks_each_model_once_about_the_head() {
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-review-runs");
+        let ask = |reviewers: &str, request: &str| {
+            format!(
+                r#"{{"request_id":"{request}","job":"{job}","reviewers":{reviewers},"lens":"Security","focus":"the parser"}}"#
+            )
+        };
+        let default = ask(r#"{"kind":"Default"}"#, "rv-1");
+        assert!(
+            matches!(
+                call(&host, &Caller::Local, "request_review", &default),
+                Err(ApiError::NotFound { .. })
+            ),
+            "nothing to review before the first snapshot"
+        );
+
+        let tree = head_after_edit(&host, &root, &job);
+        let runs = |v: &Json| -> Vec<String> {
+            let Json::Arr(runs) = get(v, "runs") else {
+                panic!()
+            };
+            runs.iter().map(|r| text(r, &["run"]).to_owned()).collect()
+        };
+        let first = runs(&call(&host, &Caller::Local, "request_review", &default).unwrap());
+        assert_eq!(first.len(), 1);
+        let again = runs(&call(&host, &Caller::Local, "request_review", &default).unwrap());
+        assert_eq!(again, first, "a retried request asks no one new");
+
+        let two = ask(
+            r#"{"kind":"Models","models":[{"agent":"Codex","model":"gpt-5","effort":"High"},{"agent":"Claude","model":"sonnet","effort":null}]}"#,
+            "rv-2",
+        );
+        let panel = runs(&call(&host, &Caller::Local, "request_review", &two).unwrap());
+        assert_eq!(panel.len(), 2);
+        assert!(panel.iter().all(|r| !first.contains(r)));
+
+        let screen = call(
+            &host,
+            &Caller::Local,
+            "review",
+            &format!(r#"{{"job":"{job}"}}"#),
+        )
+        .unwrap();
+        let Json::Arr(cards) = get(&screen, "reviews") else {
+            panic!()
+        };
+        let mut shown: Vec<&str> = cards.iter().map(|c| text(c, &["run"])).collect();
+        shown.sort();
+        let mut asked: Vec<&str> = first.iter().chain(&panel).map(String::as_str).collect();
+        asked.sort();
+        assert_eq!(shown, asked);
+        assert!(cards.iter().all(|c| text(c, &["tree"]) == tree));
+        assert!(cards.iter().all(|c| text(c, &["lens"]) == "Security"));
+
+        for bad in [
+            ask(r#"{"kind":"Preset","name":"nope"}"#, "rv-3"),
+            ask(r#"{"kind":"Preset","name":"Not Kebab"}"#, "rv-4"),
+            ask(r#"{"kind":"Models","models":[]}"#, "rv-5"),
+            ask(
+                r#"{"kind":"Models","models":[{"agent":"Claude","model":"--help","effort":null}]}"#,
+                "rv-6",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    call(&host, &Caller::Local, "request_review", &bad),
+                    Err(ApiError::BadInput { .. })
+                ),
+                "{bad}"
+            );
+        }
         host.shutdown();
     }
 
