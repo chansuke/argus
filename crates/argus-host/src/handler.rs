@@ -1961,7 +1961,17 @@ mod tests {
         let job = start(&host, &repo, "req-timeline");
         let ask =
             format!(r#"{{"job":"{job}","from_ms":0,"to_ms":9007199254740991,"bucket":"M15"}}"#);
-        let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
+        // The job loop starts the run after the batch that requested it, so a read in that
+        // batch sees only the request: wait for the start.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let page = loop {
+            let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
+            let started = argus_json::write(&page).contains("attempt 0 started");
+            if started || std::time::Instant::now() >= deadline {
+                break page;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
         let Json::Arr(items) = get(&page, "items") else {
             panic!()
         };
