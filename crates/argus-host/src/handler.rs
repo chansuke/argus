@@ -8,14 +8,14 @@ use argus_api::{ApiError, Caller, Handler};
 use std::path::PathBuf;
 
 use argus_core::diff::HeadDiff;
+use argus_core::event::{self, CheckSpec, DevicePlatform, TlaEngine};
 use argus_core::event::{
     AgentLaunch, Anchor, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens,
     RunPurpose, TaskPatch, TaskState, Weight,
 };
-use argus_core::event::{CheckSpec, DevicePlatform, TlaEngine};
 use argus_core::ids::{
-    CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange, ModelId,
-    RepoPath, RunId, SourceId, TaskKey, ThreadId, TreeOid, UnixMillis,
+    BookmarkId, CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange,
+    ModelId, RepoPath, RunId, SourceId, TaskKey, ThreadId, TreeOid, UnixMillis,
 };
 use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
@@ -1345,7 +1345,25 @@ impl Handler for ApiHandler<'_> {
         todo!("not implemented")
     }
     fn bookmark(&mut self, caller: &Caller, input: Bookmark) -> Result<Ack, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let at = FactId::parse(&input.fact).ok_or_else(|| ApiError::BadInput {
+            path: "fact".into(),
+            what: format!("not a fact id: {:?}", input.fact),
+        })?;
+        let kind = match input.kind {
+            BookmarkKind::Idea => event::BookmarkKind::Idea,
+            BookmarkKind::Improvement => event::BookmarkKind::Improvement,
+            BookmarkKind::Pitfall => event::BookmarkKind::Pitfall,
+            BookmarkKind::Exemplar => event::BookmarkKind::Exemplar,
+        };
+        let event = Event::Bookmarked {
+            bookmark: BookmarkId(derived("bookmark", &input.request_id)),
+            at,
+            kind,
+            note: input.note,
+        };
+        self.submit(&handle, author, event)
     }
     fn stats(&mut self, caller: &Caller, input: StatsQuery) -> Result<StatsTable, ApiError> {
         // TODO: Period::parse(input.period, now, tz); store.analytics()?.slice(..)
@@ -1816,6 +1834,49 @@ mod tests {
                 "{bad}"
             );
         }
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_bookmark_marks_a_fact_once_and_shows_on_the_timeline() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-bookmark");
+        let ask =
+            format!(r#"{{"job":"{job}","from_ms":0,"to_ms":9007199254740991,"bucket":"H1"}}"#);
+        let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
+        let Json::Arr(items) = get(&page, "items") else {
+            panic!()
+        };
+        let fact = text(&items[0], &["fact"]).to_owned();
+        let mark = format!(
+            r#"{{"request_id":"bm-1","job":"{job}","fact":"{fact}","kind":"Pitfall","note":"slow start\nmore"}}"#
+        );
+        let ack = call(&host, &Caller::Local, "bookmark", &mark).unwrap();
+        assert_eq!(get(&ack, "duplicate"), &Json::Bool(false));
+        let ack = call(&host, &Caller::Local, "bookmark", &mark).unwrap();
+        assert_eq!(get(&ack, "duplicate"), &Json::Bool(true));
+
+        let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
+        let Json::Arr(items) = get(&page, "items") else {
+            panic!()
+        };
+        let titles: Vec<&str> = items.iter().map(|i| text(i, &["title"])).collect();
+        assert_eq!(
+            titles
+                .iter()
+                .filter(|t| **t == "Pitfall: slow start")
+                .count(),
+            1,
+            "{titles:?}"
+        );
+
+        let bad = format!(
+            r#"{{"request_id":"bm-2","job":"{job}","fact":"nope","kind":"Idea","note":""}}"#
+        );
+        assert!(matches!(
+            call(&host, &Caller::Local, "bookmark", &bad),
+            Err(ApiError::BadInput { .. })
+        ));
         host.shutdown();
     }
 
