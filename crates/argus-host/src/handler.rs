@@ -8,14 +8,14 @@ use argus_api::{ApiError, Caller, Handler};
 use std::path::PathBuf;
 
 use argus_core::diff::HeadDiff;
-use argus_core::event::{self, CheckSpec, DevicePlatform, TlaEngine};
+use argus_core::event::{self, CheckRequest, CheckSpec, DevicePlatform, LeanMode, TlaEngine};
 use argus_core::event::{
     AgentLaunch, Anchor, Author, Decision, Event, JobInfo, JobOrigin, Rejected, ReviewLens,
     ReviewSpec, RunPurpose, TaskPatch, TaskState, Weight,
 };
 use argus_core::ids::{
-    BookmarkId, CommentId, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId, LineRange,
-    ModelId, RepoPath, RunId, SourceId, TaskKey, ThreadId, TreeOid, UnixMillis,
+    BookmarkId, CommentId, CommitOid, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId,
+    LineRange, ModelId, RepoPath, RunId, SourceId, TaskKey, ThreadId, TreeOid, UnixMillis,
 };
 use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
@@ -571,6 +571,19 @@ impl ApiHandler<'_> {
             Submitted::Duplicate(_) => Ok(Ack { duplicate: true }),
         }
     }
+}
+
+/// The head snapshot's tree and base, for a run that looks at the head.
+fn head(handle: &LedgerHandle, job: JobId, to: &str) -> Result<(TreeOid, CommitOid), ApiError> {
+    let head = handle.read(&mut Vec::new(), |l| {
+        l.views()
+            .review()
+            .head()
+            .map(|h| (h.snapshot.tree.clone(), h.snapshot.base.clone()))
+    });
+    head.ok_or_else(|| ApiError::NotFound {
+        what: format!("a snapshot of job {} to {to}", job.0),
+    })
 }
 
 // Core -> wire for what the overview shows.
@@ -1134,15 +1147,7 @@ impl Handler for ApiHandler<'_> {
                 path: "reviewers.name".into(),
                 what: format!("no preset named {:?}", name.as_str()),
             })?;
-        let head = handle.read(&mut Vec::new(), |l| {
-            l.views()
-                .review()
-                .head()
-                .map(|h| (h.snapshot.tree.clone(), h.snapshot.base.clone()))
-        });
-        let (tree, base) = head.ok_or_else(|| ApiError::NotFound {
-            what: format!("a snapshot of job {} to review", job.0),
-        })?;
+        let (tree, base) = head(&handle, job, "review")?;
         let panel = ReviewSpec::panel(
             derived("review", &input.request_id),
             &tree,
@@ -1153,7 +1158,11 @@ impl Handler for ApiHandler<'_> {
         );
         let mut runs = Vec::new();
         for (run, purpose) in panel {
-            self.submit(&handle, author.clone(), Event::RunRequested { run, purpose })?;
+            self.submit(
+                &handle,
+                author.clone(),
+                Event::RunRequested { run, purpose },
+            )?;
             runs.push(RunRef {
                 job: job.0.to_string(),
                 run: run.0.to_string(),
@@ -1161,8 +1170,59 @@ impl Handler for ApiHandler<'_> {
         }
         Ok(RunRefs { runs })
     }
+    /// One check of the head snapshot; its run id derives from `request_id`. Device checks
+    /// are refused until their idle cap and agent-driver prompt are designed.
     fn request_check(&mut self, caller: &Caller, input: RequestCheck) -> Result<RunRef, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (job, handle) = self.job_handle(&input.job)?;
+        let path = |p: &str, at: &str| {
+            RepoPath::parse(p).ok_or_else(|| ApiError::BadInput {
+                path: format!("check.{at}"),
+                what: format!("not a path in the repository: {p:?}"),
+            })
+        };
+        let spec = match input.check {
+            CheckChoice::Tla {
+                spec,
+                config,
+                engine,
+                workers,
+            } => CheckSpec::Tla {
+                spec: path(&spec, "spec")?,
+                config: config.as_deref().map(|c| path(c, "config")).transpose()?,
+                engine: match engine {
+                    Engine::JavaTlc => TlaEngine::JavaTlc,
+                    Engine::Tlars => TlaEngine::Tlars,
+                },
+                workers,
+            },
+            CheckChoice::Lean { root, files } => CheckSpec::Lean {
+                root: path(&root, "root")?,
+                mode: if files.is_empty() {
+                    LeanMode::LakeBuild
+                } else {
+                    LeanMode::Files(
+                        files
+                            .iter()
+                            .map(|f| path(f, "files"))
+                            .collect::<Result<_, _>>()?,
+                    )
+                },
+            },
+            CheckChoice::Device { .. } => {
+                return Err(ApiError::Rejected {
+                    what: "device checks cannot be requested yet".into(),
+                });
+            }
+        };
+        let (tree, base) = head(&handle, job, "check")?;
+        let run = RunId(derived("check", &input.request_id));
+        let purpose = RunPurpose::Check(CheckRequest { tree, base, spec });
+        self.submit(&handle, author, Event::RunRequested { run, purpose })?;
+        Ok(RunRef {
+            job: job.0.to_string(),
+            run: run.0.to_string(),
+        })
     }
     /// A draft thread; its id and its first comment's derive from `request_id`.
     fn open_thread(&mut self, caller: &Caller, input: OpenThread) -> Result<Ack, ApiError> {
@@ -2132,6 +2192,78 @@ mod tests {
                 "{bad}"
             );
         }
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_check_request_runs_once_on_the_head_and_shows_on_the_review_screen() {
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-check");
+        let ask = |check: &str, request: &str| {
+            format!(r#"{{"request_id":"{request}","job":"{job}","check":{check}}}"#)
+        };
+        let tla = ask(
+            r#"{"kind":"Tla","spec":"specs/Job.tla","config":"specs/Job.cfg","engine":"Tlars","workers":4}"#,
+            "ck-1",
+        );
+        assert!(matches!(
+            call(&host, &Caller::Local, "request_check", &tla),
+            Err(ApiError::NotFound { .. })
+        ));
+
+        let tree = head_after_edit(&host, &root, &job);
+        let first = call(&host, &Caller::Local, "request_check", &tla).unwrap();
+        assert_eq!(text(&first, &["job"]), job);
+        let again = call(&host, &Caller::Local, "request_check", &tla).unwrap();
+        assert_eq!(text(&again, &["run"]), text(&first, &["run"]));
+        let lean = ask(r#"{"kind":"Lean","root":"proofs","files":[]}"#, "ck-2");
+        let second = call(&host, &Caller::Local, "request_check", &lean).unwrap();
+
+        let screen = call(
+            &host,
+            &Caller::Local,
+            "review",
+            &format!(r#"{{"job":"{job}"}}"#),
+        )
+        .unwrap();
+        let Json::Arr(cards) = get(&screen, "checks") else {
+            panic!()
+        };
+        let mut shown: Vec<(&str, &str)> = cards
+            .iter()
+            .map(|c| (text(c, &["run"]), text(c, &["target", "kind"])))
+            .collect();
+        shown.sort();
+        let mut asked = vec![
+            (text(&first, &["run"]), "Tla"),
+            (text(&second, &["run"]), "Lean"),
+        ];
+        asked.sort();
+        assert_eq!(shown, asked);
+        assert!(cards.iter().all(|c| text(c, &["tree"]) == tree));
+        let tla_card = cards
+            .iter()
+            .find(|c| text(c, &["target", "kind"]) == "Tla")
+            .unwrap();
+        assert_eq!(text(tla_card, &["target", "config"]), "specs/Job.cfg");
+        assert_eq!(text(tla_card, &["engine"]), "Tlars");
+
+        let device = ask(
+            r#"{"kind":"Device","project":"app","platform":"Ios","app":{"kind":"ExpoGo","sdk":null},"driver":{"kind":"Script","path":"e2e.sh"},"max_minutes":10}"#,
+            "ck-3",
+        );
+        assert!(matches!(
+            call(&host, &Caller::Local, "request_check", &device),
+            Err(ApiError::Rejected { .. })
+        ));
+        let outside = ask(
+            r#"{"kind":"Tla","spec":"../Job.tla","config":null,"engine":"JavaTlc","workers":null}"#,
+            "ck-4",
+        );
+        assert!(matches!(
+            call(&host, &Caller::Local, "request_check", &outside),
+            Err(ApiError::BadInput { .. })
+        ));
         host.shutdown();
     }
 
