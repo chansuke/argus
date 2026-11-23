@@ -292,16 +292,16 @@ mod tests {
             socket: data_root.join("argus.sock"),
             data_root,
             phone: None,
-            // No test may start a real agent CLI (it costs money and writes ~/.claude):
-            // a run that reaches one fails to spawn instead.
+            // No test may start a real tool: agent CLIs and EAS cost money and write
+            // outside the test, checkers are slow. A run that reaches one fails to spawn.
             tools: ToolPaths {
                 claude: "/nonexistent/argus-test/claude".into(),
                 codex: "/nonexistent/argus-test/codex".into(),
-                java: "java".into(),
-                tla2tools_jar: "tla2tools.jar".into(),
-                tlars: "tlars".into(),
-                lake: "lake".into(),
-                eas: "eas".into(),
+                java: "/nonexistent/argus-test/java".into(),
+                tla2tools_jar: "/nonexistent/argus-test/tla2tools.jar".into(),
+                tlars: "/nonexistent/argus-test/tlars".into(),
+                lake: "/nonexistent/argus-test/lake".into(),
+                eas: "/nonexistent/argus-test/eas".into(),
                 script: "script".into(),
             },
             policy: PolicyConfig::default(),
