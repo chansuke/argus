@@ -859,6 +859,7 @@ mod tests {
         use crate::pulse::Dep;
         use argus_core::ids::JobId;
         use argus_core::views::ViewSet;
+        use std::time::{Duration, Instant};
         let (inbox, commands) = mpsc::channel();
         let ledger = JobLedger::open(&scratch()).unwrap();
         let job = JobLoop::new(
@@ -879,6 +880,18 @@ mod tests {
             handle.submit(Author::Human, agent(1)),
             Ok(Submitted::Duplicate(_))
         ));
+        // The loop starts the run after the batch that requested it; compare versions
+        // only once it has, or the two reads below may straddle that change.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.read(&mut Vec::new(), |l| {
+            l.views()
+                .runs()
+                .get(&run(1))
+                .is_some_and(|r| !r.attempts.is_empty())
+        }) {
+            assert!(Instant::now() < deadline, "the run never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut deps = Vec::new();
         let requested = handle.read(&mut deps, |l| l.views().runs().get(&run(1)).is_some());
         assert!(requested);
