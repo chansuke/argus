@@ -34,6 +34,13 @@ pub(crate) enum Cmd {
         source: SourceId,
         frames: Vec<RawFrame>,
     },
+    /// Opens `meta`'s source if needed and appends `bytes` as one record at its end, in one
+    /// step: two records arriving together (hook payloads) never claim the same offset.
+    Record {
+        meta: SourceMeta,
+        bytes: Vec<u8>,
+        reply: Sender<Result<(), LedgerError>>,
+    },
     /// Read-only access for API handlers; runs on this thread, so it sees a consistent
     /// state. The thread wraps `f` in `take_reads()` calls and replies with the `Dep`.
     Read(Box<dyn FnOnce(&JobLedger) + Send>),
@@ -184,6 +191,18 @@ impl<L: Launcher> JobLoop<L> {
             }
             // A source that is not open (or a corrupt frame) has nowhere to go.
             Cmd::Observe { source, frames } => self.ledger.observe(source, frames).is_ok(),
+            Cmd::Record { meta, bytes, reply } => {
+                let result = self.ledger.open_source(meta).and_then(|cursor| {
+                    let frame = RawFrame::Bytes {
+                        offset: cursor.resume_at,
+                        bytes,
+                    };
+                    self.ledger.observe(cursor.meta.id, vec![frame]).map(|_| ())
+                });
+                let changed = result.is_ok();
+                let _ = reply.send(result);
+                changed
+            }
             Cmd::Read(read) => {
                 read(&self.ledger);
                 false
@@ -366,6 +385,23 @@ pub(crate) fn open_source(ledger: &Sender<Cmd>, meta: SourceMeta) -> std::io::Re
     let gone = || std::io::Error::other("the ledger thread stopped");
     ledger
         .send(Cmd::OpenSource { meta, reply })
+        .map_err(|_| gone())?;
+    answer
+        .recv()
+        .map_err(|_| gone())?
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))
+}
+
+/// See `Cmd::Record`.
+pub(crate) fn record(
+    ledger: &Sender<Cmd>,
+    meta: SourceMeta,
+    bytes: Vec<u8>,
+) -> std::io::Result<()> {
+    let (reply, answer) = std::sync::mpsc::channel();
+    let gone = || std::io::Error::other("the ledger thread stopped");
+    ledger
+        .send(Cmd::Record { meta, bytes, reply })
         .map_err(|_| gone())?;
     answer
         .recv()
