@@ -21,7 +21,7 @@ use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
 use argus_core::models::{self, ModelChoice};
-use argus_core::source::{PlanStatus, SourceKind};
+use argus_core::source::{PlanStatus, SourceKind, SourceMeta, SourceOrigin};
 use argus_core::views::packet::{self, PacketConfig};
 use argus_core::views::timeline::{BucketWidth, Window};
 use argus_core::views::{GateState, checks, glance, progress, review, timeline};
@@ -1339,10 +1339,46 @@ impl Handler for ApiHandler<'_> {
             task: task.0.to_string(),
         })
     }
+    /// A Claude Code hook payload from inside a run, appended verbatim as one record of
+    /// that run's hook log. Only the agent itself may send one.
     fn hook(&mut self, caller: &Caller, input: HookPayload) -> Result<Ack, ApiError> {
-        // TODO: agent only; open_source(SourceMeta{ run, kind: ClaudeHook, origin: Hook })
-        //       and observe one RawFrame::Bytes with the payload verbatim.
-        todo!("not implemented")
+        let Author::Agent(run) = author(caller)? else {
+            return Err(ApiError::Forbidden { op: "hook".into() });
+        };
+        let owner = self.host.job_ids().into_iter().find_map(|job| {
+            let handle = self.host.job(job)?;
+            let attempt = handle.read(&mut Vec::new(), move |l| {
+                l.views()
+                    .runs()
+                    .get(&run)
+                    .map(|r| r.attempts.last().map(|a| a.attempt))
+            })?;
+            Some((handle, attempt))
+        });
+        let (handle, attempt) = match owner {
+            Some((handle, Some(attempt))) => (handle, attempt),
+            Some((_, None)) => {
+                return Err(ApiError::NotFound {
+                    what: format!("a started attempt of run {}", run.0),
+                });
+            }
+            None => {
+                return Err(ApiError::NotFound {
+                    what: format!("run {}", run.0),
+                });
+            }
+        };
+        let origin = SourceOrigin::Hook;
+        let meta = SourceMeta {
+            id: SourceMeta::derive_id(run, attempt, &origin),
+            run,
+            attempt,
+            kind: SourceKind::ClaudeHook,
+            origin,
+        };
+        crate::ledger_thread::record(&handle.sender(), meta, input.body.into_bytes())
+            .map_err(internal)?;
+        Ok(Ack { duplicate: false })
     }
     fn bookmark(&mut self, caller: &Caller, input: Bookmark) -> Result<Ack, ApiError> {
         let author = author(caller)?;
@@ -1876,6 +1912,45 @@ mod tests {
         assert!(matches!(
             call(&host, &Caller::Local, "bookmark", &bad),
             Err(ApiError::BadInput { .. })
+        ));
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_hook_payload_is_kept_verbatim_in_its_runs_hook_log() {
+        use argus_core::ids::{Attempt, Id128, RunId};
+        use argus_core::source::{SourceMeta, SourceOrigin};
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-hook");
+        let id = Id128::parse(&job).unwrap();
+        let run = RunId(Id128::derive("agent", &id.0.to_le_bytes()));
+        let agent = Caller::Agent {
+            run: run.0.to_string(),
+        };
+        let bodies = [
+            r#"{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#,
+            r#"{"hook_event_name":"Stop"}"#,
+        ];
+        for body in bodies {
+            let input = Json::Obj(vec![("body".into(), Json::str(body))]);
+            host.call(&agent, "hook", &input).unwrap();
+        }
+        let source = SourceMeta::derive_id(run, Attempt(0), &SourceOrigin::Hook);
+        let ask = format!(r#"{{"job":"{job}","source":"{}","limit":10}}"#, source.0);
+        let page = call(&host, &Caller::Local, "raw", &ask).unwrap();
+        assert_eq!(records(&page), bodies);
+
+        let input = Json::Obj(vec![("body".into(), Json::str(bodies[1]))]);
+        assert!(matches!(
+            host.call(&Caller::Local, "hook", &input),
+            Err(ApiError::Forbidden { .. })
+        ));
+        let stranger = Caller::Agent {
+            run: Id128(7).to_string(),
+        };
+        assert!(matches!(
+            host.call(&stranger, "hook", &input),
+            Err(ApiError::NotFound { .. })
         ));
         host.shutdown();
     }
