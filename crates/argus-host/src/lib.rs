@@ -292,9 +292,11 @@ mod tests {
             socket: data_root.join("argus.sock"),
             data_root,
             phone: None,
+            // No test may start a real agent CLI (it costs money and writes ~/.claude):
+            // a run that reaches one fails to spawn instead.
             tools: ToolPaths {
-                claude: "claude".into(),
-                codex: "codex".into(),
+                claude: "/nonexistent/argus-test/claude".into(),
+                codex: "/nonexistent/argus-test/codex".into(),
                 java: "java".into(),
                 tla2tools_jar: "tla2tools.jar".into(),
                 tlars: "tlars".into(),
