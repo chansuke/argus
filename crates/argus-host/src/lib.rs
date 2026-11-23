@@ -40,6 +40,7 @@ use argus_core::models::ModelPresets;
 use argus_core::period::UtcOffset;
 use argus_core::plan::{Invocation, PlanEnv, SNAPSHOT_DENY, ToolPaths};
 use argus_core::policy::PolicyConfig;
+use argus_core::views::ViewSet;
 use argus_core::views::packet::PacketConfig;
 use argus_json::Json;
 
@@ -86,8 +87,10 @@ pub(crate) struct HostInner {
     /// One loop per open job: the handle to reach it and the thread that runs it.
     pub(crate) jobs: Mutex<BTreeMap<JobId, (LedgerHandle, JoinHandle<()>)>>,
     /// Behind a short mutex: marking dirty never waits on a ledger.
-    pub(crate) registry: Mutex<pulse::Registry>,
+    pub(crate) registry: Arc<Mutex<pulse::Registry>>,
     pub(crate) diffs: git::DiffCache,
+    /// Re-evaluates dirty subscriptions (`pulse::flush`), coalesced to ~100 ms.
+    pulse: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl HostInner {
@@ -112,7 +115,16 @@ impl HostInner {
             snapshot_deny,
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        let job_loop = JobLoop::new(ledger, tx.clone(), ProcessLauncher, cfg);
+        let registry = self.registry.clone();
+        let at = LedgerRef::Job(job);
+        let job_loop =
+            JobLoop::new(ledger, tx.clone(), ProcessLauncher, cfg).on_change(move |ledger| {
+                let views = ledger.views();
+                registry
+                    .lock()
+                    .unwrap()
+                    .changed(at, &|mask| views.stamp(mask));
+            });
         let thread = std::thread::spawn(move || job_loop.run(rx));
         let handle = LedgerHandle::new(tx, LedgerRef::Job(job));
         self.jobs.lock().unwrap().insert(job, (handle, thread));
@@ -134,7 +146,9 @@ impl HostInner {
             )
             .map_err(io_error)?;
         drop(ledger);
-        self.open_job(job)
+        self.open_job(job)?;
+        self.registry.lock().unwrap().job_set_changed();
+        Ok(())
     }
 
     pub(crate) fn job(&self, job: JobId) -> Option<LedgerHandle> {
@@ -176,6 +190,10 @@ impl Launcher for ProcessLauncher {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct SubscriptionId(pub u64);
 
+/// How long the pulse waits after a change before re-evaluating, so a burst of batches
+/// costs one evaluation.
+const COALESCE: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl Host {
     /// Opens the store (taking every lock), starts ledger threads for open jobs, and
     /// reconciles: each ledger's `runs.due(&empty)` abandons interrupted attempts and
@@ -185,12 +203,14 @@ impl Host {
     /// host holds it), the loops started so far are stopped and the error returned.
     pub fn start(config: HostConfig) -> std::io::Result<Host> {
         let store = Store::open(config.data_root.clone()).map_err(io_error)?;
+        let (wake, woken) = std::sync::mpsc::channel();
         let inner = Arc::new(HostInner {
             config,
             store,
             jobs: Mutex::new(BTreeMap::new()),
-            registry: Mutex::default(),
+            registry: Arc::new(Mutex::new(pulse::Registry::new(wake))),
             diffs: git::DiffCache::default(),
+            pulse: Mutex::new(None),
         });
         for job in inner.store.jobs().map_err(io_error)? {
             if let Err(e) = inner.open_job(job) {
@@ -198,6 +218,21 @@ impl Host {
                 return Err(e);
             }
         }
+        let weak = Arc::downgrade(&inner);
+        let pulse = std::thread::spawn(move || {
+            // Ends when the registry closes (shutdown) and drops the sender.
+            while woken.recv().is_ok() {
+                std::thread::sleep(COALESCE);
+                while woken.try_recv().is_ok() {}
+                let Some(inner) = weak.upgrade() else { return };
+                pulse::flush(&inner.registry, &mut |caller, op, input| {
+                    let mut h = handler::ApiHandler::new(&inner);
+                    let value = argus_api::dispatch(&mut h, caller, op, input)?;
+                    Ok((value, h.deps))
+                });
+            }
+        });
+        *inner.pulse.lock().unwrap() = Some(pulse);
         Ok(Host { inner })
     }
 
@@ -222,11 +257,35 @@ impl Host {
         input: Json,
         sink: Box<dyn FnMut(Json) + Send>,
     ) -> Result<SubscriptionId, ApiError> {
-        todo!("not implemented")
+        let info = argus_api::OPS
+            .iter()
+            .find(|o| o.name == op)
+            .ok_or_else(|| ApiError::UnknownOp { op: op.into() })?;
+        if info.kind != argus_api::OpKind::Subscribe {
+            return Err(ApiError::BadInput {
+                path: "op".into(),
+                what: format!("{op} is not a subscription"),
+            });
+        }
+        let mut h = handler::ApiHandler::new(&self.inner);
+        let value = argus_api::dispatch(&mut h, caller, op, &input)?;
+        let sink: pulse::Sink = Arc::new(Mutex::new(sink));
+        (sink.lock().unwrap())(value.clone());
+        let sub = pulse::Subscription {
+            caller: caller.clone(),
+            op: op.into(),
+            input,
+            deps: h.deps,
+            last: Some(value),
+            dirty: true,
+            sink,
+        };
+        Ok(self.inner.registry.lock().unwrap().insert(sub))
     }
 
+    /// No push starts after this returns; one already being delivered may still land.
     pub fn unsubscribe(&self, id: SubscriptionId) {
-        todo!("not implemented")
+        self.inner.registry.lock().unwrap().remove(id);
     }
 
     /// File behind an `Evidence.blob` id (screenshots, recordings) for the transport to
@@ -248,9 +307,15 @@ impl Host {
         )
     }
 
-    /// Stops every job's loop. Runs still executing are stopped with them (a dropped
-    /// `Running` is a cancel), and the next start abandons or retries them.
+    /// Stops the pulse first (its evaluations read the ledgers), then every job's loop.
+    /// Runs still executing are stopped with them (a dropped `Running` is a cancel), and
+    /// the next start abandons or retries them.
     pub fn shutdown(self) {
+        self.inner.registry.lock().unwrap().close();
+        let pulse = self.inner.pulse.lock().unwrap().take();
+        if let Some(pulse) = pulse {
+            let _ = pulse.join();
+        }
         self.inner.stop_all();
     }
 }

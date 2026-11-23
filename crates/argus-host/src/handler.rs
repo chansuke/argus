@@ -2358,6 +2358,87 @@ mod tests {
         host.shutdown();
     }
 
+    type Pushes = std::sync::Arc<std::sync::Mutex<Vec<Json>>>;
+
+    fn sink() -> (Pushes, Box<dyn FnMut(Json) + Send>) {
+        let pushes = Pushes::default();
+        let into = pushes.clone();
+        (pushes, Box::new(move |v| into.lock().unwrap().push(v)))
+    }
+
+    /// Waits up to 5 s for a push that satisfies `pred`.
+    fn pushed(pushes: &Pushes, pred: impl Fn(&Json) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if pushes.lock().unwrap().iter().any(&pred) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_subscription_pushes_its_value_now_and_again_only_when_it_changes() {
+        let (host, _root, repo) = host();
+        let (overview, into) = sink();
+        let input = parse(b"{}").unwrap();
+        host.subscribe(&Caller::Local, "overview", input, into)
+            .unwrap();
+        {
+            let first = overview.lock().unwrap();
+            assert_eq!(
+                first.len(),
+                1,
+                "the current value is pushed before subscribe returns"
+            );
+            assert_eq!(get(&first[0], "jobs"), &Json::Arr(vec![]));
+        }
+        let job = start(&host, &repo, "req-sub");
+        assert!(pushed(
+            &overview,
+            |v| matches!(get(v, "jobs"), Json::Arr(j) if j.len() == 1)
+        ));
+
+        let (detail, into) = sink();
+        let input = parse(format!(r#"{{"job":"{job}"}}"#).as_bytes()).unwrap();
+        let sub = host.subscribe(&Caller::Local, "job", input, into).unwrap();
+        let add = format!(r#"{{"job":"{job}","title":"ship it"}}"#);
+        call(&host, &Caller::Local, "set_task", &add).unwrap();
+        let has_task = |v: &Json| argus_json::write(v).contains("ship it");
+        assert!(pushed(&detail, has_task));
+        // Let the job settle, then check no push repeated the one before it.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        {
+            let all = detail.lock().unwrap();
+            assert!(all.windows(2).all(|w| w[0] != w[1]), "{} pushes", all.len());
+        }
+
+        host.unsubscribe(sub);
+        let seen = detail.lock().unwrap().len();
+        let more = format!(r#"{{"job":"{job}","title":"and test it"}}"#);
+        call(&host, &Caller::Local, "set_task", &more).unwrap();
+        assert!(pushed(&overview, |v| argus_json::write(v).contains(&job)));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(
+            detail.lock().unwrap().len(),
+            seen,
+            "nothing after unsubscribe"
+        );
+
+        let (_, into) = sink();
+        assert!(matches!(
+            host.subscribe(&Caller::Local, "presets", parse(b"{}").unwrap(), into),
+            Err(ApiError::BadInput { .. })
+        ));
+        let (_, into) = sink();
+        assert!(matches!(
+            host.subscribe(&Caller::Local, "nope", parse(b"{}").unwrap(), into),
+            Err(ApiError::UnknownOp { .. })
+        ));
+        host.shutdown();
+    }
+
     #[test]
     fn the_timeline_lists_what_happened_and_its_quarters() {
         let (host, _root, repo) = host();
