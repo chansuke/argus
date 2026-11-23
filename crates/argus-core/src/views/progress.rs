@@ -169,6 +169,10 @@ impl Progress {
         PlanTree { roots: nodes }
     }
 
+    pub fn task(&self, key: &TaskKey) -> Option<&TaskNode> {
+        self.tasks.get(key)
+    }
+
     /// The job's share: the weighted share of the top-level tasks and of every counted
     /// observed plan (weight 1 each). `None` with nothing to count: most agents never
     /// write a plan, and "no plan" must not read as "nothing done".
