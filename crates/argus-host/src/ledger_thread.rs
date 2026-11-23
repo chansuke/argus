@@ -147,7 +147,11 @@ pub(crate) struct JobLoop<L: Launcher> {
     live: BTreeMap<RunId, Running>,
     launcher: L,
     cfg: LoopConfig,
+    /// Told after every batch that may have changed the views (subscriptions).
+    changed: Option<OnChange>,
 }
+
+type OnChange = Box<dyn FnMut(&JobLedger) + Send>;
 
 impl<L: Launcher> JobLoop<L> {
     pub(crate) fn new(ledger: JobLedger, inbox: Sender<Cmd>, launcher: L, cfg: LoopConfig) -> Self {
@@ -157,7 +161,13 @@ impl<L: Launcher> JobLoop<L> {
             live: BTreeMap::new(),
             launcher,
             cfg,
+            changed: None,
         }
+    }
+
+    pub(crate) fn on_change(mut self, f: impl FnMut(&JobLedger) + Send + 'static) -> Self {
+        self.changed = Some(Box::new(f));
+        self
     }
 
     /// Applies one command. Returns whether the views may have changed.
@@ -272,6 +282,9 @@ impl<L: Launcher> JobLoop<L> {
             }
             if changed {
                 self.after_batch(now());
+                if let Some(f) = &mut self.changed {
+                    f(&self.ledger);
+                }
             }
             if stop {
                 return;
