@@ -1155,7 +1155,12 @@ fn stats_count_per_run_and_hour_and_never_double_count_usage() {
         r.models.iter().map(|m| m.0.as_str()).collect::<Vec<_>>(),
         vec!["claude-opus-5-5"]
     );
-    assert_eq!(r.tools[&ToolName("Bash".into())], 2);
+    let bash = ToolName("Bash".into());
+    assert_eq!(r.tools[&HourBucket::of(UnixMillis(T0))][&bash], 1);
+    assert_eq!(
+        r.tools[&HourBucket::of(UnixMillis(T0 + 3_600_000))][&bash],
+        1
+    );
     let first = r.hours[&HourBucket::of(UnixMillis(T0))];
     assert_eq!(
         (
@@ -1173,6 +1178,114 @@ fn stats_count_per_run_and_hour_and_never_double_count_usage() {
     );
     let second = r.hours[&HourBucket::of(UnixMillis(T0 + 3_600_000))];
     assert_eq!((second.tool_calls, second.human_inputs), (1, 2));
+}
+
+/// Two jobs: a Claude run with a model and two tools, and a Codex run that worked past
+/// midnight JST (15:00 UTC).
+fn two_jobs() -> argus_core::views::stats::Analytics {
+    use argus_core::event::AgentLaunch;
+    use argus_core::ids::JobId;
+    use argus_core::views::stats::{Analytics, JobStats};
+    let mut one = JobStats::default();
+    let mut feed = Feed::default();
+    let src = transcript(run(1));
+    feed.authored(&mut one, T0, Author::Human, agent_requested(1));
+    feed.agent(&mut one, &src, T0 + 1, prompt("go"));
+    feed.agent(
+        &mut one,
+        &src,
+        T0 + 2,
+        AgentWhat::Reply {
+            text: "ok".into(),
+            model: Some(argus_core::ids::ModelId("opus".into())),
+        },
+    );
+    feed.agent(&mut one, &src, T0 + 3, call("t1", "Bash"));
+    feed.agent(&mut one, &src, T0 + 3_600_000, call("t2", "Read"));
+
+    let mut two = JobStats::default();
+    let mut feed = Feed::default();
+    let codex = Event::RunRequested {
+        run: run(2),
+        purpose: RunPurpose::Agent(AgentLaunch {
+            cli: AgentCli::Codex,
+            model: None,
+            prompt: "go".into(),
+            resume: None,
+        }),
+    };
+    feed.authored(&mut two, T0, Author::Human, codex);
+    feed.agent(
+        &mut two,
+        &transcript(run(2)),
+        T0 + 12 * 3_600_000,
+        prompt("late"),
+    );
+    Analytics {
+        jobs: [(JobId(Id128(1)), one), (JobId(Id128(2)), two)].into(),
+    }
+}
+
+#[test]
+fn a_slice_groups_the_hours_inside_a_period_by_agent_model_job_day_or_tool() {
+    use argus_core::period::{Period, UtcOffset};
+    use argus_core::views::stats::{GroupBy, Row};
+    let a = two_jobs();
+    let jst = UtcOffset { minutes: 540 };
+    let all = Period {
+        from: UnixMillis(T0 - 3 * 3_600_000),
+        to: UnixMillis(T0 + 24 * 3_600_000),
+    };
+    let keyed = |rows: Vec<Row>| -> Vec<(String, u64, u64, u32)> {
+        rows.into_iter()
+            .map(|r| (r.key, r.counters.prompts, r.counters.tool_calls, r.runs))
+            .collect()
+    };
+    assert_eq!(
+        keyed(a.slice(&all, GroupBy::Agent, jst)),
+        vec![("claude".into(), 1, 2, 1), ("codex".into(), 1, 0, 1)]
+    );
+    assert_eq!(
+        keyed(a.slice(&all, GroupBy::Model, jst)),
+        vec![("opus".into(), 1, 2, 1), ("unknown".into(), 1, 0, 1)]
+    );
+    assert_eq!(
+        keyed(a.slice(&all, GroupBy::Job, jst)),
+        vec![
+            (Id128(1).to_string(), 1, 2, 1),
+            (Id128(2).to_string(), 1, 0, 1)
+        ]
+    );
+    assert_eq!(
+        keyed(a.slice(&all, GroupBy::Day, jst)),
+        vec![
+            ("2026-10-24".into(), 1, 2, 1),
+            ("2026-10-25".into(), 1, 0, 1)
+        ]
+    );
+    let utc = UtcOffset { minutes: 0 };
+    assert_eq!(
+        keyed(a.slice(&all, GroupBy::Day, utc)),
+        vec![("2026-10-24".into(), 2, 2, 2)]
+    );
+    assert_eq!(
+        keyed(a.slice(&all, GroupBy::Tool, jst)),
+        vec![("Bash".into(), 0, 1, 1), ("Read".into(), 0, 1, 1)]
+    );
+
+    let first_hour = Period {
+        from: UnixMillis(T0),
+        to: UnixMillis(T0 + 3_600_000),
+    };
+    assert_eq!(
+        keyed(a.slice(&first_hour, GroupBy::Tool, jst)),
+        vec![("Bash".into(), 0, 1, 1)]
+    );
+    assert_eq!(
+        keyed(a.slice(&first_hour, GroupBy::Agent, jst)),
+        vec![("claude".into(), 1, 1, 1)],
+        "a run with nothing in the period is not counted"
+    );
 }
 
 #[test]

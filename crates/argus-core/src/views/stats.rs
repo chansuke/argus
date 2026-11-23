@@ -8,7 +8,7 @@ use crate::event::{Event, RunPurpose};
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
 use crate::models::AgentCli;
-use crate::period::{HourBucket, Period};
+use crate::period::{HourBucket, Period, UtcOffset};
 use crate::source::{AgentWhat, Observation, SourceFamily, TokenUsage};
 use crate::views::{Checkpoint, Projection};
 
@@ -32,7 +32,8 @@ pub struct RunStats {
     pub cli: Option<AgentCli>,
     pub models: BTreeSet<ModelId>,
     pub hours: BTreeMap<HourBucket, Counters>,
-    pub tools: BTreeMap<ToolName, u64>,
+    /// Calls per tool, per hour, so a period can be cut from them like `hours`.
+    pub tools: BTreeMap<HourBucket, BTreeMap<ToolName, u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +48,18 @@ pub struct JobStats {
 }
 
 impl Counters {
+    fn add(&mut self, o: &Counters) {
+        self.prompts += o.prompts;
+        self.replies += o.replies;
+        self.tool_calls += o.tool_calls;
+        self.tool_errors += o.tool_errors;
+        self.input_tokens += o.input_tokens;
+        self.output_tokens += o.output_tokens;
+        self.cache_read_tokens += o.cache_read_tokens;
+        self.cache_write_tokens += o.cache_write_tokens;
+        self.human_inputs += o.human_inputs;
+        self.review_findings += o.review_findings;
+    }
     fn add_usage(&mut self, u: &TokenUsage) {
         self.input_tokens += u.input;
         self.output_tokens += u.output;
@@ -91,7 +104,7 @@ impl JobStats {
 
 impl Projection for JobStats {
     const NAME: &'static str = "stats";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     /// Hooks carry permission waits, which count as intervention load.
     const READS: &'static [SourceFamily] = &[SourceFamily::AgentSession, SourceFamily::AgentHook];
     /// Repeated records never arrive (`ledger::Applied`); repeated usage inside one message
@@ -142,6 +155,8 @@ impl Projection for JobStats {
                             .entry(run)
                             .or_default()
                             .tools
+                            .entry(hour)
+                            .or_default()
                             .entry(name.clone())
                             .or_default() += 1;
                     }
@@ -192,7 +207,59 @@ pub struct Row {
 }
 
 impl Analytics {
-    pub fn slice(&self, period: &Period, by: GroupBy) -> Vec<Row> {
-        todo!("not implemented")
+    /// Sums over the whole hours inside `period` (`Period::hours`), one row per key, sorted
+    /// by key. `runs` counts the runs with anything in a row's hours. A run's model key is
+    /// its models joined by `+` (counters are per run, not per model), `unknown` if none;
+    /// a day is local to `tz`. Tool rows count only `tool_calls`.
+    pub fn slice(&self, period: &Period, by: GroupBy, tz: UtcOffset) -> Vec<Row> {
+        let (hours, _) = period.hours();
+        let mut rows: BTreeMap<String, (Counters, BTreeSet<RunId>)> = BTreeMap::new();
+        let mut add = |key: String, run: RunId, c: &Counters| {
+            let (sum, runs) = rows.entry(key).or_default();
+            sum.add(c);
+            runs.insert(run);
+        };
+        for (job, stats) in &self.jobs {
+            for (run, r) in &stats.runs {
+                let inside = |h: &&HourBucket| hours.contains(&h.0);
+                if by == GroupBy::Tool {
+                    for (_, tools) in r.tools.iter().filter(|(h, _)| inside(h)) {
+                        for (tool, n) in tools {
+                            let calls = Counters {
+                                tool_calls: *n,
+                                ..Counters::default()
+                            };
+                            add(tool.0.clone(), *run, &calls);
+                        }
+                    }
+                    continue;
+                }
+                for (hour, c) in r.hours.iter().filter(|(h, _)| inside(h)) {
+                    let key = match by {
+                        GroupBy::Agent => match r.cli {
+                            Some(AgentCli::Claude) => "claude".into(),
+                            Some(AgentCli::Codex) => "codex".into(),
+                            None => "unknown".into(),
+                        },
+                        GroupBy::Model if r.models.is_empty() => "unknown".into(),
+                        GroupBy::Model => {
+                            let names: Vec<&str> = r.models.iter().map(|m| m.0.as_str()).collect();
+                            names.join("+")
+                        }
+                        GroupBy::Job => job.0.to_string(),
+                        GroupBy::Day => tz.date(UnixMillis(hour.0 * 3_600_000)),
+                        GroupBy::Tool => unreachable!("handled above"),
+                    };
+                    add(key, *run, c);
+                }
+            }
+        }
+        rows.into_iter()
+            .map(|(key, (counters, runs))| Row {
+                key,
+                counters,
+                runs: u32::try_from(runs.len()).unwrap_or(u32::MAX),
+            })
+            .collect()
     }
 }
