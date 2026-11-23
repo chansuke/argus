@@ -8,7 +8,7 @@ use argus_log::LogError;
 use crate::ids::*;
 use crate::ledger::{JobLedger, LedgerError, MetaLedger};
 use crate::period::Period;
-use crate::views::stats::Analytics;
+use crate::views::stats::{Analytics, JobStats};
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -49,15 +49,20 @@ impl Store {
         &self.root
     }
 
-    /// Store-wide analytics without opening any ledger for writing.
+    /// Store-wide analytics without opening any ledger for writing: each job's `JobStats`
+    /// replayed from its logs (`ledger::replay`, safe while a host writes).
     ///
-    /// TODO: for each job: load `checkpoints/<job>/stats.ckpt` (the projection plus its
-    /// `ledger::Applied`, so record dedup survives the checkpoint) if usable, then
-    /// `ledger::replay::<JobStats>(job_dir, Some(ckpt))` to catch up on the tail; save the
-    /// new checkpoint (temp file + rename; concurrent writers are harmless since both
-    /// write a valid checkpoint). Merge into `Analytics`.
+    /// TODO: start each replay from `checkpoints/<job>/stats.ckpt` (the projection plus its
+    /// `ledger::Applied`, so record dedup survives) when usable, and save the new one
+    /// (temp file + rename). Until then every call replays every job in full.
     pub fn analytics(&self) -> Result<Analytics, LedgerError> {
-        todo!("not implemented")
+        let mut analytics = Analytics::default();
+        for job in self.jobs()? {
+            let dir = self.root.join("jobs").join(job.0.to_string());
+            let (stats, _) = crate::ledger::replay::<JobStats>(&dir, None)?;
+            analytics.jobs.insert(job, stats);
+        }
+        Ok(analytics)
     }
 
     /// The exact prompt for an insight run over `period`: per conversation, the human
