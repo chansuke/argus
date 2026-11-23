@@ -21,10 +21,11 @@ use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
 use argus_core::models::{self, ModelChoice, ModelSet, PresetName, ReviewerChoice, UnknownPreset};
+use argus_core::period::Period;
 use argus_core::source::{PlanStatus, SourceKind, SourceMeta, SourceOrigin};
 use argus_core::views::packet::{self, PacketConfig};
 use argus_core::views::timeline::{BucketWidth, Window};
-use argus_core::views::{GateState, checks, glance, progress, review, timeline};
+use argus_core::views::{GateState, checks, glance, progress, review, stats, timeline};
 use argus_json::Json;
 use argus_log::{EventId, Seq};
 
@@ -1547,9 +1548,46 @@ impl Handler for ApiHandler<'_> {
         };
         self.submit(&handle, author, event)
     }
+    /// Counters over the whole hours inside the period, from every job's logs. Numbers are
+    /// strings (they can pass 2^53); `exact` is false when an end falls inside an hour,
+    /// whose events are then left out.
     fn stats(&mut self, caller: &Caller, input: StatsQuery) -> Result<StatsTable, ApiError> {
-        // TODO: Period::parse(input.period, now, tz); store.analytics()?.slice(..)
-        todo!("not implemented")
+        let tz = self.host.config.tz;
+        let period = Period::parse(&input.period, now(), tz).ok_or_else(|| ApiError::BadInput {
+            path: "period".into(),
+            what: format!("not a period: {:?}", input.period),
+        })?;
+        let by = match input.group_by {
+            GroupBy::Agent => stats::GroupBy::Agent,
+            GroupBy::Model => stats::GroupBy::Model,
+            GroupBy::Job => stats::GroupBy::Job,
+            GroupBy::Day => stats::GroupBy::Day,
+            GroupBy::Tool => stats::GroupBy::Tool,
+        };
+        let analytics = self.host.store.analytics().map_err(ledger_error)?;
+        let rows = analytics
+            .slice(&period, by, tz)
+            .into_iter()
+            .map(|row| {
+                let c = row.counters;
+                StatsRow {
+                    key: row.key,
+                    runs: row.runs,
+                    prompts: c.prompts.to_string(),
+                    tool_calls: c.tool_calls.to_string(),
+                    tool_errors: c.tool_errors.to_string(),
+                    input_tokens: c.input_tokens.to_string(),
+                    output_tokens: c.output_tokens.to_string(),
+                    human_inputs: c.human_inputs.to_string(),
+                }
+            })
+            .collect();
+        Ok(StatsTable {
+            period_from_ms: period.from.0,
+            period_to_ms: period.to.0,
+            exact: period.hours().1,
+            rows,
+        })
     }
     fn candidates(&mut self, caller: &Caller, input: Empty) -> Result<Candidates, ApiError> {
         todo!("not implemented")
@@ -2262,6 +2300,59 @@ mod tests {
         );
         assert!(matches!(
             call(&host, &Caller::Local, "request_check", &outside),
+            Err(ApiError::BadInput { .. })
+        ));
+        host.shutdown();
+    }
+
+    #[test]
+    fn stats_count_what_happened_in_a_period_by_group() {
+        let (host, _root, repo) = host();
+        let job = start(&host, &repo, "req-stats");
+        let id = argus_core::ids::Id128::parse(&job).unwrap();
+        let run = argus_core::ids::Id128::derive("agent", &id.0.to_le_bytes()).to_string();
+        for n in 0..2 {
+            let typed =
+                format!(r#"{{"request_id":"in-{n}","job":"{job}","run":"{run}","text":"y\r"}}"#);
+            call(&host, &Caller::Local, "send_input", &typed).unwrap();
+        }
+        let ask = |period: &str, by: &str| format!(r#"{{"period":"{period}","group_by":"{by}"}}"#);
+        let table = call(&host, &Caller::Local, "stats", &ask("today", "Agent")).unwrap();
+        assert_eq!(
+            get(&table, "exact"),
+            &Json::Bool(true),
+            "whole days are whole hours"
+        );
+        let Json::Arr(rows) = get(&table, "rows") else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(text(&rows[0], &["key"]), "codex");
+        assert_eq!(text(&rows[0], &["human_inputs"]), "2");
+        assert_eq!(text(&rows[0], &["prompts"]), "0");
+        assert_eq!(
+            get(&rows[0], "runs"),
+            &Json::Num(argus_json::Number::from_u64(1))
+        );
+
+        let table = call(&host, &Caller::Local, "stats", &ask("last-24h", "Job")).unwrap();
+        assert_eq!(get(&table, "exact"), &Json::Bool(false));
+        let Json::Arr(rows) = get(&table, "rows") else {
+            panic!()
+        };
+        let from = get(&table, "period_from_ms");
+        let to = get(&table, "period_to_ms");
+        let ms = |v: &Json| match v {
+            Json::Num(n) => n.as_i64().unwrap(),
+            _ => panic!("{v:?}"),
+        };
+        assert_eq!(ms(to) - ms(from), 24 * 3_600_000);
+        assert!(rows.iter().all(|r| text(r, &["key"]) == job), "{rows:?}");
+
+        let table = call(&host, &Caller::Local, "stats", &ask("2001-01", "Agent")).unwrap();
+        assert_eq!(get(&table, "rows"), &Json::Arr(vec![]));
+        assert!(matches!(
+            call(&host, &Caller::Local, "stats", &ask("someday", "Agent")),
             Err(ApiError::BadInput { .. })
         ));
         host.shutdown();
