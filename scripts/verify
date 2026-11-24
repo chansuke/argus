@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# One command to check a change. Runs the steps of tools/gate (the same steps
+# CI runs), prints one line per step, and keeps each step's log and a
+# summary under target/verify/.
+#
+#   scripts/verify [--base REV]        every offline gate step, then the
+#                                      docs/verification.md items the change
+#                                      triggers
+#   scripts/verify full [--base REV]   the above, then the Tauri app build
+#                                      (needs the network)
+#   scripts/verify ui                  the UI steps only (generated client,
+#                                      typecheck, and lint/tests when present)
+#
+# REV defaults to origin/main. Runs inside `nix develop`.
+set -euo pipefail
+
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+if [ -z "${IN_NIX_SHELL:-}" ]; then
+  exec nix develop "$root" --command "$0" "$@"
+fi
+cd "$root"
+
+mode=check
+base=origin/main
+while (($# > 0)); do
+  case $1 in
+  check | full | ui) mode=$1 ;;
+  --base)
+    base=${2:?--base needs a revision}
+    shift
+    ;;
+  *)
+    sed -n '2,/^set /p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
+    exit 2
+    ;;
+  esac
+  shift
+done
+git rev-parse --verify --quiet "$base^{commit}" >/dev/null || base=main
+
+mapfile -t all < <(tools/gate --list)
+steps=()
+for s in "${all[@]}"; do
+  case $mode:$s in
+  check:app) ;;
+  ui:tsgen | ui:ts | ui:ui-*) steps+=("$s") ;;
+  ui:*) ;;
+  *) steps+=("$s") ;;
+  esac
+done
+
+out=$root/target/verify
+rm -rf "$out"
+mkdir -p "$out"
+summary=$out/summary.md
+failed=0
+rows=()
+for s in "${steps[@]}"; do
+  log=$out/$s.log
+  started=$(date +%s)
+  status=0
+  GATE_BASE=$base tools/gate "$s" >"$log" 2>&1 || status=$?
+  took=$(($(date +%s) - started))s
+  rel=${log#"$root"/}
+  if ((status == 0)); then
+    printf 'pass  %-12s %5s  %s\n' "$s" "$took" "$rel"
+    rows+=("| $s | pass | $took | \`$rel\` |")
+  else
+    printf 'FAIL  %-12s %5s  %s\n' "$s" "$took" "$rel"
+    rows+=("| $s | **FAILED**: rerun \`nix develop -c tools/gate $s\` | $took | \`$rel\` |")
+    grep -v '^::' "$log" | tail -n 30 | sed 's/^/      /'
+    failed=1
+  fi
+done
+
+checklist=$(scripts/verification-checklist.sh "$base")
+
+{
+  echo "# Verification"
+  echo
+  echo "Revision $(git rev-parse --short HEAD), compared with $base; mode \`$mode\`."
+  if ! git diff --quiet HEAD --; then
+    echo "The working tree has changes that are not committed."
+  fi
+  echo
+  echo "| Step | Result | Time | Log |"
+  echo "|---|---|---|---|"
+  printf '%s\n' "${rows[@]}"
+  echo
+  echo "## Checklist items this change triggers"
+  echo
+  echo "Each one needs a check of its own; see docs/verification.md."
+  echo
+  echo "$checklist"
+  echo
+  case $mode in
+  check) echo "Not run in this mode: the Tauri app build (\`scripts/verify full\`)." ;;
+  ui) echo "Only the UI steps ran. Run \`scripts/verify\` for the rest." ;;
+  esac
+} >"$summary"
+
+echo "summary: ${summary#"$root"/}"
+exit "$failed"
