@@ -25,5 +25,7 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 # Configured in clippy.toml; each names the wrapper to call instead.
 disallowed_methods = "warn"
+# An allow says why, so a reviewer can tell whether it still holds.
+allow_attributes_without_reason = "warn"
 # Iteration order must never leak into logs, views, or generated TS (same rule as tlars).
 disallowed_types = "warn"

@@ -1,7 +1,10 @@
 //! Fact builders shared by the view tests: fresh ids and increasing stamps, the way the
 //! ledger hands facts to projections.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test binary includes this module and uses only some builders"
+)]
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -91,7 +94,10 @@ impl Feed {
     }
 
     /// An agent event carried by record `key` under `parent`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per field of the agent record a test writes"
+    )]
     pub fn record<P: Projection>(
         &mut self,
         view: &mut P,
