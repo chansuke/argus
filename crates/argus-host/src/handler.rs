@@ -2453,26 +2453,12 @@ mod tests {
 
     /// The job loop starts a run after the batch that requested it: waits for that.
     fn wait_started(host: &Host, job: &str, run: argus_core::ids::RunId) {
-        use argus_core::ids::{Id128, JobId};
-        let handle = host.inner.job(JobId(Id128::parse(job).unwrap())).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let started = handle.read(&mut Vec::new(), move |l| {
-                l.views()
-                    .runs()
-                    .get(&run)
-                    .is_some_and(|r| !r.attempts.is_empty())
-            });
-            if started {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "run {} never started",
-                run.0
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        until(host, job, move |l| {
+            l.views()
+                .runs()
+                .get(&run)
+                .is_some_and(|r| !r.attempts.is_empty())
+        });
     }
 
     #[test]
@@ -2481,7 +2467,6 @@ mod tests {
         use argus_core::source::{SourceMeta, SourceOrigin};
         let (host, _root, repo) = host();
         let job = start(&host, &repo, "req-hook");
-        agent_started(&host, &job);
         let id = Id128::parse(&job).unwrap();
         let run = RunId(Id128::derive("agent", &id.0.to_le_bytes()));
         let agent = Caller::Agent {
