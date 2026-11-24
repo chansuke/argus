@@ -16,6 +16,7 @@
 
 #![allow(dead_code, unused_variables)]
 
+mod config;
 mod git;
 mod glob;
 mod handler;
@@ -49,6 +50,7 @@ use argus_json::Json;
 use argus_core::views::MetaViews;
 use ledger_thread::{Cmd, JobLoop, Launcher, LedgerHandle, LoopConfig, MetaLoop};
 
+pub use config::{Defaults, host_config, read_host_config};
 pub use transport::{
     PairedDevice, PhoneAccess, PhoneListen, Serving, serve_socket, serve_websocket,
 };
