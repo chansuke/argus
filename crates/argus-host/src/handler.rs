@@ -1408,9 +1408,39 @@ impl Handler for ApiHandler<'_> {
         caller: &Caller,
         input: AnswerPermission,
     ) -> Result<Ack, ApiError> {
-        // TODO: cli of the run; submit(Human, RunInput { input: uuid(request_id), run,
-        //       bytes: plan::permission_input(cli, answer) }).
-        todo!("not implemented")
+        let author = author(caller)?;
+        let (_, handle) = self.job_handle(&input.job)?;
+        let run = RunId(id(&input.run, "run")?);
+        let cli = handle
+            .read(&mut Vec::new(), move |l| {
+                l.views().runs().get(&run).map(|r| match &r.purpose {
+                    RunPurpose::Agent(launch) => Some(launch.cli),
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| ApiError::NotFound {
+                what: format!("run {}", run.0),
+            })?
+            .ok_or_else(|| ApiError::Rejected {
+                what: "only an agent run asks for permission".into(),
+            })?;
+        let answer = match input.answer {
+            argus_api::vm::PermissionAnswer::Allow => argus_core::plan::PermissionAnswer::Allow,
+            argus_api::vm::PermissionAnswer::AllowAlways => {
+                argus_core::plan::PermissionAnswer::AllowAlways
+            }
+            argus_api::vm::PermissionAnswer::Deny => argus_core::plan::PermissionAnswer::Deny,
+        };
+        let bytes =
+            argus_core::plan::permission_input(cli, answer).ok_or_else(|| ApiError::Rejected {
+                what: format!("{answer:?} has no key in this agent's permission prompt"),
+            })?;
+        let event = Event::RunInput {
+            input: InputId(derived("input", &input.request_id)),
+            run,
+            bytes,
+        };
+        self.submit(&handle, author, event)
     }
     fn cancel_run(&mut self, caller: &Caller, input: RunRef) -> Result<Ack, ApiError> {
         let author = author(caller)?;
@@ -1756,6 +1786,70 @@ mod tests {
         });
         assert!(cancelled);
         assert_eq!(typed, 1);
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_permission_answer_is_typed_as_the_agents_own_keys_once() {
+        let (host, _root, repo) = host();
+        let input = format!(
+            r#"{{"request_id":"req-p","repo":"{}","base":null,"title":"t","prompt":"go","agents":[{{"agent":"Claude","model":null}},{{"agent":"Codex","model":null}}]}}"#,
+            repo.display()
+        );
+        let started = call(&host, &Caller::Local, "start_jobs", &input).unwrap();
+        let Some(Json::Arr(jobs)) = started.get("jobs") else {
+            panic!("{}", argus_json::write(&started))
+        };
+        let [claude, codex] = [0, 1].map(|i| jobs[i].as_str().unwrap().to_owned());
+        let run_of = |job: &str| {
+            let id = argus_core::ids::Id128::parse(job).unwrap();
+            argus_core::ids::Id128::derive("agent", &id.0.to_le_bytes()).to_string()
+        };
+        let answer = |job: &str, request: &str, answer: &str| {
+            let input = format!(
+                r#"{{"request_id":"{request}","job":"{job}","run":"{}","answer":"{answer}"}}"#,
+                run_of(job)
+            );
+            call(&host, &Caller::Local, "answer_permission", &input)
+        };
+
+        let ack = answer(&claude, "p-1", "Allow").unwrap();
+        assert_eq!(ack.get("duplicate"), Some(&Json::Bool(false)));
+        let again = answer(&claude, "p-1", "Allow").unwrap();
+        assert_eq!(again.get("duplicate"), Some(&Json::Bool(true)));
+        answer(&claude, "p-2", "Deny").unwrap();
+        assert!(matches!(
+            answer(&claude, "p-3", "AllowAlways"),
+            Err(ApiError::Rejected { .. })
+        ));
+        assert!(matches!(
+            answer(&codex, "p-4", "Allow"),
+            Err(ApiError::Rejected { .. })
+        ));
+        let unknown_run = format!(
+            r#"{{"request_id":"p-5","job":"{claude}","run":"0f8fad5d-d9cb-469f-a165-70867728950e","answer":"Allow"}}"#
+        );
+        assert!(matches!(
+            call(&host, &Caller::Local, "answer_permission", &unknown_run),
+            Err(ApiError::NotFound { .. })
+        ));
+
+        let id = argus_core::ids::JobId(argus_core::ids::Id128::parse(&claude).unwrap());
+        let handle = host.inner.jobs.lock().unwrap()[&id].0.clone();
+        let typed: Vec<String> = handle.read(&mut Vec::new(), |l| {
+            l.views()
+                .timeline()
+                .range(
+                    argus_core::ids::UnixMillis(0),
+                    argus_core::ids::UnixMillis(i64::MAX),
+                )
+                .filter(|(_, _, i)| {
+                    matches!(i.kind, argus_core::views::timeline::ItemKind::HumanInput)
+                })
+                .map(|(_, _, i)| i.title.clone())
+                .collect()
+        });
+        assert_eq!(typed, ["1", "\u{1b}"]);
         host.shutdown();
     }
 
