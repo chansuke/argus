@@ -30,7 +30,7 @@ jobs:
           NUMBER: ${{ github.event.pull_request.number }}
         run: |
           changed=$(gh api --paginate "repos/$REPOSITORY/pulls/$NUMBER/files" --jq '.[].filename')
-          pattern='^(\.github/|tools/|flake\.(nix|lock)$|clippy\.toml$|_typos\.toml$|specs/tla/.*\.cfg$|specs/tla/mutants\.txt$|proofs/lakefile\.toml$|\.claude/)'
+          pattern='^(\.github/|tools/|scripts/|flake\.(nix|lock)$|Cargo\.toml$|clippy\.toml$|_typos\.toml$|specs/tla/.*\.cfg$|specs/tla/mutants\.txt$|proofs/lakefile\.toml$|\.claude/|REVIEW\.md$|AGENTS\.md$|CLAUDE\.md$|ui/(.*/)?eslint\.config\.[cm]?[jt]s$|ui/(.*/)?tsconfig[^/]*\.json$)'
           checks=$(grep -E "$pattern" <<<"$changed" || true)
           if [[ -n $checks ]]; then
             echo "This pull request changes files that define its own checks:"
