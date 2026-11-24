@@ -1643,8 +1643,29 @@ mod tests {
         )
     }
 
-    /// `cargo test -p argus-host --lib real_claude -- --ignored --nocapture`. Costs two
-    /// small haiku turns and leaves two sessions in ~/.claude/projects.
+    /// A test that costs money runs only when a human asked for a real run: `--ignored`
+    /// alone (for example `--run-ignored all` in a sweep) is not enough.
+    fn require_billed_opt_in(flag: Option<&std::ffi::OsStr>) {
+        assert!(
+            flag == Some(std::ffi::OsStr::new("1")),
+            "billed test: set ARGUS_ALLOW_BILLED=1 only when a human asked for a real run."
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "set ARGUS_ALLOW_BILLED=1")]
+    fn a_billed_test_stops_before_any_effect_without_the_opt_in() {
+        require_billed_opt_in(None);
+    }
+
+    #[test]
+    #[should_panic(expected = "set ARGUS_ALLOW_BILLED=1")]
+    fn a_billed_test_accepts_only_the_exact_opt_in() {
+        require_billed_opt_in(Some(std::ffi::OsStr::new("yes")));
+    }
+
+    /// `ARGUS_ALLOW_BILLED=1 cargo test -p argus-host --lib real_claude -- --ignored --nocapture`.
+    /// Costs two small haiku turns and leaves two sessions in ~/.claude/projects.
     #[test]
     #[ignore = "runs the real claude CLI, which costs a little and writes ~/.claude"]
     #[expect(
@@ -1652,6 +1673,7 @@ mod tests {
         reason = "the opt-in real run uses the claude login under the user's $HOME"
     )]
     fn real_claude_answers_under_a_pty_and_feedback_resumes_a_copy_of_its_session() {
+        require_billed_opt_in(std::env::var_os("ARGUS_ALLOW_BILLED").as_deref());
         let mut ws = job_repo("real-claude");
         ws.home = PathBuf::from(std::env::var_os("HOME").unwrap());
         // Derived run ids are UUID v8; Claude must accept them as session ids.
