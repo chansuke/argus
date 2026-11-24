@@ -13,6 +13,7 @@ use argus_log::{
     merge_by_stamp,
 };
 
+use crate::adapters;
 use crate::codec;
 use crate::event::{self, Author, DedupKey, Event, Rejected};
 use crate::fact::{Fact, FactBody};
@@ -218,7 +219,7 @@ impl<V: ViewSet> Ledger<V> {
         }
         let writer = self.writers.get_mut(&actor).unwrap();
         let stamp = self.clock.tick();
-        let payload = event::encode(&event);
+        let payload = codec::encode(&event);
         let seq = writer.append(stamp, &payload)?;
         writer.sync()?;
         let id = EventId { actor, seq };
@@ -410,7 +411,7 @@ impl<V: ViewSet> Ledger<V> {
     ) -> Result<RawRecord, LedgerError> {
         let (bytes, reading) = match header {
             ActorHeader::Author(author) => {
-                let event = event::decode(&payload).map_err(|e| corrupt(&id, &e.what))?;
+                let event = codec::decode(&payload).map_err(|e| corrupt(&id, &e.what))?;
                 let reading = Reading::Authored {
                     author: author.clone(),
                     event,
@@ -420,7 +421,7 @@ impl<V: ViewSet> Ledger<V> {
             ActorHeader::Source(meta) => {
                 let (bytes, decoded) = match RawFrame::decode(&payload) {
                     Some(RawFrame::Bytes { bytes, .. }) => {
-                        let decoded = meta.kind.decode(&bytes);
+                        let decoded = adapters::decode(meta.kind, &bytes);
                         (bytes, decoded)
                     }
                     Some(RawFrame::Discontinuity {
@@ -529,7 +530,7 @@ fn apply_frame(
     };
     match header {
         ActorHeader::Author(author) => {
-            let event = event::decode(payload).map_err(|e| corrupt(id, &e.what))?;
+            let event = codec::decode(payload).map_err(|e| corrupt(id, &e.what))?;
             apply(&Fact {
                 id: fact_id(0),
                 stamp,
@@ -542,7 +543,7 @@ fn apply_frame(
         }
         ActorHeader::Source(meta) => match RawFrame::decode(payload) {
             Some(RawFrame::Bytes { bytes, .. }) => {
-                let decoded = meta.kind.decode(&bytes);
+                let decoded = adapters::decode(meta.kind, &bytes);
                 for (part, obs) in decoded.iter().enumerate() {
                     if !applied.admit_record(id, obs) {
                         continue;

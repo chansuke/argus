@@ -43,9 +43,6 @@ const KNOWN: &[(&str, &str)] = &[
     ("adapters/llm.rs", "crate::plan"),
     ("adapters/tlc.rs", "crate::plan"),
     ("codec.rs", "crate::ledger::ActorHeader"),
-    ("event.rs", "crate::adapters::llm::review_prompt"),
-    ("event.rs", "crate::codec"),
-    ("source.rs", "crate::adapters"),
 ];
 
 /// Modules that are pure functions of their inputs: replay must equal live, so they
