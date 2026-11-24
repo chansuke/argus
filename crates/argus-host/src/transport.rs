@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -29,10 +29,16 @@ pub struct Serving {
     wake: Box<dyn Fn() + Send>,
     thread: Option<JoinHandle<()>>,
     cleanup: Option<PathBuf>,
+    addr: Option<SocketAddr>,
 }
 
 impl Serving {
     pub fn stop(self) {}
+
+    /// The address a network listener is bound to (its port, when asked for port 0).
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.addr
+    }
 }
 
 impl Drop for Serving {
@@ -75,45 +81,94 @@ pub fn serve_socket(host: Host, path: &Path) -> std::io::Result<Serving> {
         return Err(e);
     }
 
+    let wake_path = path.to_path_buf();
+    Ok(accept_loop(
+        move || listener.accept().map(|(s, _)| s),
+        move || {
+            let _ = UnixStream::connect(&wake_path);
+        },
+        move |stream| socket_connection(host.clone(), stream),
+        Some(path.to_path_buf()),
+        None,
+    ))
+}
+
+/// A connected stream the accept loop can close from another thread.
+trait Conn: Send + Sized + 'static {
+    fn clone_handle(&self) -> std::io::Result<Self>;
+    fn close(&self);
+}
+
+impl Conn for UnixStream {
+    fn clone_handle(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+    fn close(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Conn for TcpStream {
+    fn clone_handle(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+    fn close(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Accepts on its own thread, one thread per connection, until stopped: then closes
+/// every open connection and waits for their threads. `wake` unblocks the `accept`.
+fn accept_loop<C: Conn>(
+    mut accept: impl FnMut() -> std::io::Result<C> + Send + 'static,
+    wake: impl Fn() + Send + 'static,
+    serve: impl Fn(C) + Send + Sync + 'static,
+    cleanup: Option<PathBuf>,
+    addr: Option<SocketAddr>,
+) -> Serving {
     let stop = Arc::new(AtomicBool::new(false));
-    let conns: Arc<Mutex<BTreeMap<u64, UnixStream>>> = Arc::default();
+    let serve = Arc::new(serve);
     let thread = {
-        let (stop, conns) = (stop.clone(), conns.clone());
+        let stop = stop.clone();
         std::thread::spawn(move || {
+            let conns: Arc<Mutex<BTreeMap<u64, C>>> = Arc::default();
             let mut threads: Vec<JoinHandle<()>> = Vec::new();
-            for (n, stream) in (0u64..).zip(listener.incoming()) {
+            for n in 0u64.. {
+                let stream = accept();
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let Ok(stream) = stream else { continue };
-                let Ok(handle) = stream.try_clone() else {
+                let Ok(stream) = stream else {
+                    // Out of descriptors, say: back off instead of spinning.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                };
+                let Ok(handle) = stream.clone_handle() else {
                     continue;
                 };
                 conns.lock().unwrap().insert(n, handle);
-                let (host, conns) = (host.clone(), conns.clone());
+                let (serve, conns) = (serve.clone(), conns.clone());
                 threads.retain(|t| !t.is_finished());
                 threads.push(std::thread::spawn(move || {
-                    socket_connection(host, stream);
+                    serve(stream);
                     conns.lock().unwrap().remove(&n);
                 }));
             }
             for stream in conns.lock().unwrap().values() {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+                stream.close();
             }
             for thread in threads {
                 let _ = thread.join();
             }
         })
     };
-    let wake_path = path.to_path_buf();
-    Ok(Serving {
+    Serving {
         stop,
-        wake: Box::new(move || {
-            let _ = UnixStream::connect(&wake_path);
-        }),
+        wake: Box::new(wake),
         thread: Some(thread),
-        cleanup: Some(path.to_path_buf()),
-    })
+        cleanup,
+        addr,
+    }
 }
 
 fn socket_connection(host: Host, stream: UnixStream) {
@@ -330,8 +385,155 @@ pub struct PhoneAccess {
 /// paired device (-> `Caller::Phone { device }`), else close. `GET /blob/<job>/<id>`
 /// with the token in a header: evidence files. Plain TCP on loopback or the tailnet
 /// (WireGuard-encrypted); TLS beyond that is an open question.
-pub fn serve_websocket(host: Host, access: &PhoneAccess) -> std::io::Result<()> {
-    todo!("not implemented")
+pub fn serve_websocket(host: Host, access: &PhoneAccess) -> std::io::Result<Serving> {
+    let listener = TcpListener::bind(access.listen.addr())?;
+    let addr = listener.local_addr()?;
+    let devices = access.devices.clone();
+    Ok(accept_loop(
+        move || listener.accept().map(|(s, _)| s),
+        move || {
+            let _ = TcpStream::connect(addr);
+        },
+        move |stream| phone_connection(&host, &devices, stream),
+        None,
+        Some(addr),
+    ))
+}
+
+/// The paired device `token` belongs to. Every device is compared, in constant time.
+fn paired(devices: &[PairedDevice], token: &str) -> Option<String> {
+    let mut found = None;
+    for d in devices {
+        if crate::tokens::same(d.token.as_bytes(), token.as_bytes()) {
+            found = Some(d.device.clone());
+        }
+    }
+    found
+}
+
+/// How long a phone may take to send its request head or `Hello`.
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn phone_connection(host: &Host, devices: &[PairedDevice], stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
+    let mut reader = &stream;
+    let Some(req) = crate::ws::read_request(&mut reader) else {
+        return;
+    };
+    let token = req
+        .header("authorization")
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if let Some(rest) = req.path.strip_prefix("/blob/") {
+        let device = token.and_then(|t| paired(devices, t));
+        serve_blob(host, rest, device.is_some(), &req, &stream);
+        return;
+    }
+    let accept = (req.path == "/ws").then(|| crate::ws::upgrade_accept(&req));
+    let Some(Some(accept)) = accept else {
+        let _ = respond(&stream, "404 Not Found", &[]);
+        return;
+    };
+    let switched = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    if (&stream).write_all(switched.as_bytes()).is_err() {
+        return;
+    }
+    let shared = Arc::new(Mutex::new(stream));
+    let mut frames = Frames(shared.clone(), Vec::new());
+    let Ok(reader) = shared.lock().unwrap().try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(reader);
+    let next =
+        |reader: &mut BufReader<TcpStream>, frames: &mut Frames| match crate::ws::read_message(
+            reader, frames, MAX_FRAME,
+        ) {
+            crate::ws::Message::Text(text) => frame(&text),
+            crate::ws::Message::Close => None,
+        };
+    let caller = match next(&mut reader, &mut frames) {
+        Some(ClientFrame::Hello {
+            token: Some(token),
+            run: None,
+        }) => paired(devices, &token).map(|device| Caller::Phone { device }),
+        _ => None,
+    };
+    let Some(caller) = caller else {
+        let _ = crate::ws::write_close(&mut frames);
+        return;
+    };
+    let _ = reader.get_ref().set_read_timeout(None);
+    let mut writer = Frames(shared.clone(), Vec::new());
+    let (out, writing) =
+        writer_thread(move |text: String| crate::ws::write_text(&mut writer, &text));
+    let mut session = Session::new(host.clone(), caller, out);
+    while let Some(f) = next(&mut reader, &mut frames) {
+        if !session.handle(f) {
+            break;
+        }
+    }
+    drop(session);
+    let _ = writing.join();
+    let _ = crate::ws::write_close(&mut frames);
+}
+
+/// Writes to a stream shared by the reader (pongs) and the writer thread (messages):
+/// a frame is buffered, then written whole under the lock at `flush`, so two frames
+/// never interleave.
+struct Frames(Arc<Mutex<TcpStream>>, Vec<u8>);
+
+impl Write for Frames {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.1.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let bytes = std::mem::take(&mut self.1);
+        let stream = self.0.lock().unwrap();
+        (&*stream).write_all(&bytes)?;
+        (&*stream).flush()
+    }
+}
+
+/// `GET /blob/<job>/<id>`: an evidence file, to a paired device only.
+fn serve_blob(
+    host: &Host,
+    rest: &str,
+    authorized: bool,
+    req: &crate::ws::Request,
+    stream: &TcpStream,
+) {
+    if !authorized {
+        let _ = respond(stream, "401 Unauthorized", &[]);
+        return;
+    }
+    let file = (req.method == "GET")
+        .then(|| rest.split_once('/'))
+        .flatten()
+        .and_then(|(job, blob)| host.blob_path(job, blob))
+        .and_then(|path| std::fs::File::open(path).ok());
+    let Some(mut file) = file else {
+        let _ = respond(stream, "404 Not Found", &[]);
+        return;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nCache-Control: private, max-age=31536000, immutable\r\nConnection: close\r\n\r\n"
+    );
+    let mut w = stream;
+    if w.write_all(head.as_bytes()).is_ok() {
+        let _ = std::io::copy(&mut file, &mut w);
+    }
+}
+
+fn respond(mut stream: &TcpStream, status: &str, body: &[u8]) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)
 }
 
 #[cfg(test)]
@@ -491,6 +693,167 @@ mod tests {
         c.send(r#"{"kind":"Call","id":1,"op":"presets","input":{}}"#);
         assert_eq!(kind(&c.next().unwrap()), "Reply");
         drop(c);
+        serving.stop();
+        host.shutdown();
+    }
+
+    // ------------------------------------------------------------ phone
+
+    use crate::ws::tests::{client_frame, server_frame};
+
+    const PHONE_TOKEN: &str = "c0ffee";
+
+    fn phone() -> (Host, Serving, SocketAddr) {
+        let root = scratch();
+        let host = Host::start(crate::tests::config(root.join("data"))).unwrap();
+        let access = PhoneAccess {
+            listen: PhoneListen::new("127.0.0.1:0".parse().unwrap()).unwrap(),
+            devices: vec![PairedDevice {
+                device: "pixel".into(),
+                token: PHONE_TOKEN.into(),
+            }],
+        };
+        let serving = serve_websocket(host.clone(), &access).unwrap();
+        let addr = serving.local_addr().unwrap();
+        (host, serving, addr)
+    }
+
+    /// Sends `request` and returns the response head and what followed it so far.
+    fn http(addr: SocketAddr, request: &str) -> (TcpStream, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(
+                stream.read(&mut byte).unwrap(),
+                1,
+                "{:?}",
+                String::from_utf8_lossy(&head)
+            );
+            head.push(byte[0]);
+        }
+        (stream, String::from_utf8(head).unwrap())
+    }
+
+    fn open_ws(addr: SocketAddr) -> TcpStream {
+        let (stream, head) = http(
+            addr,
+            "GET /ws HTTP/1.1\r\nHost: argus\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+        assert!(head.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
+        stream
+    }
+
+    fn send_text(stream: &mut TcpStream, text: &str) {
+        stream
+            .write_all(&client_frame(true, 0x1, text.as_bytes()))
+            .unwrap();
+    }
+
+    /// The next text message as JSON; `None` for a close frame or the end.
+    fn next_text(stream: &mut TcpStream) -> Option<Json> {
+        loop {
+            match server_frame(stream)? {
+                (0x1, payload) => return Some(argus_json::parse(&payload).unwrap()),
+                (0x8, _) => return None,
+                (0xA, _) => continue,
+                (op, _) => panic!("unexpected opcode {op}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_paired_phone_is_the_human_over_a_websocket() {
+        let (host, serving, addr) = phone();
+        let mut ws = open_ws(addr);
+        send_text(
+            &mut ws,
+            &format!(r#"{{"kind":"Hello","token":"{PHONE_TOKEN}","run":null}}"#),
+        );
+        send_text(
+            &mut ws,
+            r#"{"kind":"Call","id":1,"op":"presets","input":{}}"#,
+        );
+        let reply = next_text(&mut ws).unwrap();
+        assert!(
+            reply.get("ok").is_some_and(|ok| *ok != Json::Null),
+            "{}",
+            argus_json::write(&reply)
+        );
+
+        ws.write_all(&client_frame(true, 0x9, b"hi")).unwrap();
+        assert_eq!(server_frame(&mut ws), Some((0xA, b"hi".to_vec())));
+
+        send_text(
+            &mut ws,
+            r#"{"kind":"Subscribe","id":2,"op":"overview","input":{}}"#,
+        );
+        let push = next_text(&mut ws).unwrap();
+        assert_eq!(kind(&push), "Push", "{}", argus_json::write(&push));
+
+        ws.write_all(&client_frame(true, 0x8, b"")).unwrap();
+        assert_eq!(next_text(&mut ws), None);
+        serving.stop();
+        host.shutdown();
+    }
+
+    #[test]
+    fn a_phone_without_a_paired_token_is_closed() {
+        let (host, serving, addr) = phone();
+        for hello in [
+            r#"{"kind":"Hello","token":"c0ffef","run":null}"#.to_owned(),
+            r#"{"kind":"Hello","token":null,"run":null}"#.to_owned(),
+            format!(r#"{{"kind":"Hello","token":"{PHONE_TOKEN}","run":"1"}}"#),
+            r#"{"kind":"Call","id":1,"op":"presets","input":{}}"#.to_owned(),
+        ] {
+            let mut ws = open_ws(addr);
+            send_text(&mut ws, &hello);
+            assert_eq!(next_text(&mut ws), None, "{hello}");
+        }
+        let (_, head) = http(addr, "GET / HTTP/1.1\r\nHost: argus\r\n\r\n");
+        assert!(head.starts_with("HTTP/1.1 404 "), "{head}");
+        serving.stop();
+        host.shutdown();
+    }
+
+    #[test]
+    fn evidence_files_are_served_to_a_paired_phone_only() {
+        let (host, serving, addr) = phone();
+        let job = Id128(5).to_string();
+        let blob = "ab".repeat(32);
+        let path = host.blob_path(&job, &blob).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"png bytes").unwrap();
+
+        let get = |auth: &str, at: &str| {
+            let (mut stream, head) = http(
+                addr,
+                &format!("GET {at} HTTP/1.1\r\nHost: argus\r\n{auth}\r\n"),
+            );
+            let mut body = Vec::new();
+            stream.read_to_end(&mut body).unwrap();
+            (head, body)
+        };
+        let at = format!("/blob/{job}/{blob}");
+        let bearer = format!("Authorization: Bearer {PHONE_TOKEN}\r\n");
+        let (head, body) = get(&bearer, &at);
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert!(head.contains("Content-Length: 9\r\n"), "{head}");
+        assert_eq!(body, b"png bytes");
+
+        let (head, _) = get("", &at);
+        assert!(head.starts_with("HTTP/1.1 401 "), "{head}");
+        let (head, _) = get("Authorization: Bearer nope\r\n", &at);
+        assert!(head.starts_with("HTTP/1.1 401 "), "{head}");
+        let (head, _) = get(&bearer, &format!("/blob/{job}/{}", "cd".repeat(32)));
+        assert!(head.starts_with("HTTP/1.1 404 "), "{head}");
+        let (head, _) = get(&bearer, &format!("/blob/{job}/../../x"));
+        assert!(head.starts_with("HTTP/1.1 404 "), "{head}");
         serving.stop();
         host.shutdown();
     }
