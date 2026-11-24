@@ -2049,19 +2049,14 @@ mod tests {
             purpose: RunPurpose::Snapshot { after: None },
         };
         handle.submit(Author::Policy, request).unwrap();
-        for _ in 0..200 {
-            let head = handle.read(&mut Vec::new(), |l| {
-                l.views()
-                    .review()
-                    .head()
-                    .map(|h| h.snapshot.tree.as_str().to_owned())
-            });
-            if let Some(tree) = head {
-                return tree;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        panic!("no snapshot");
+        until(host, job, |l| l.views().review().head().is_some());
+        handle.read(&mut Vec::new(), |l| {
+            l.views()
+                .review()
+                .head()
+                .map(|h| h.snapshot.tree.as_str().to_owned())
+                .unwrap()
+        })
     }
 
     #[test]
@@ -2090,12 +2085,12 @@ mod tests {
         call(&host, &Caller::Local, "decide", &approve).unwrap();
         let merged = call(&host, &Caller::Local, "merge", &early).unwrap();
         assert_eq!(text(&merged, &["job"]), job);
-        for _ in 0..200 {
-            if git(&repo, &["rev-parse", "main^{tree}"]) == tree {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        until(&host, &job, |l| {
+            l.views().runs().iter().any(|(_, r)| {
+                matches!(r.purpose, argus_core::event::RunPurpose::Merge(_))
+                    && r.attempts.iter().any(|a| a.finished.is_some())
+            })
+        });
         assert_eq!(git(&repo, &["rev-parse", "main^{tree}"]), tree);
         assert_eq!(
             std::fs::read_to_string(repo.join("a.txt")).unwrap(),
@@ -2486,6 +2481,7 @@ mod tests {
         use argus_core::source::{SourceMeta, SourceOrigin};
         let (host, _root, repo) = host();
         let job = start(&host, &repo, "req-hook");
+        agent_started(&host, &job);
         let id = Id128::parse(&job).unwrap();
         let run = RunId(Id128::derive("agent", &id.0.to_le_bytes()));
         let agent = Caller::Agent {
@@ -2740,24 +2736,68 @@ mod tests {
         host.shutdown();
     }
 
-    type Pushes = std::sync::Arc<std::sync::Mutex<Vec<Json>>>;
+    /// Blocks until `pred` holds for the job's ledger. It is checked now and again after
+    /// each push of the job's `job` subscription, whose cursor moves whenever a view it
+    /// reads changes, so this waits on the job loop's events, not on time. It fails when
+    /// nothing changes for 10 s.
+    fn until<P>(host: &Host, job: &str, pred: P)
+    where
+        P: Fn(&argus_core::JobLedger) -> bool + Clone + Send + 'static,
+    {
+        use argus_core::ids::{Id128, JobId};
+        let handle = host.inner.job(JobId(Id128::parse(job).unwrap())).unwrap();
+        let (tx, changed) = std::sync::mpsc::channel();
+        let into: Box<dyn FnMut(Json) + Send> = Box::new(move |_| tx.send(()).unwrap_or(()));
+        let input = parse(format!(r#"{{"job":"{job}"}}"#).as_bytes()).unwrap();
+        let sub = host.subscribe(&Caller::Local, "job", input, into).unwrap();
+        loop {
+            let pred = pred.clone();
+            if handle.read(&mut Vec::new(), move |l| pred(l)) {
+                break;
+            }
+            changed
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the job stopped changing before the condition held");
+        }
+        host.unsubscribe(sub);
+    }
+
+    /// The job's agent run has an attempt, so hooks and the timeline can name it. The
+    /// loop starts a run in the batch after the one that requested it.
+    fn agent_started(host: &Host, job: &str) {
+        until(host, job, |l| {
+            l.views().runs().iter().any(|(_, r)| !r.attempts.is_empty())
+        });
+    }
+
+    /// What a test subscription received; `arrived` is notified on each push.
+    #[derive(Default)]
+    struct PushLog {
+        values: std::sync::Mutex<Vec<Json>>,
+        arrived: std::sync::Condvar,
+    }
+
+    type Pushes = std::sync::Arc<PushLog>;
 
     fn sink() -> (Pushes, Box<dyn FnMut(Json) + Send>) {
         let pushes = Pushes::default();
         let into = pushes.clone();
-        (pushes, Box::new(move |v| into.lock().unwrap().push(v)))
+        let push = move |v| {
+            into.values.lock().unwrap().push(v);
+            into.arrived.notify_all();
+        };
+        (pushes, Box::new(push))
     }
 
-    /// Waits up to 5 s for a push that satisfies `pred`.
+    /// Waits on each push, up to 5 s, for one that satisfies `pred`.
     fn pushed(pushes: &Pushes, pred: impl Fn(&Json) -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if pushes.lock().unwrap().iter().any(&pred) {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        false
+        let values = pushes.values.lock().unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        let (values, _) = pushes
+            .arrived
+            .wait_timeout_while(values, wait, |v| !v.iter().any(&pred))
+            .unwrap();
+        values.iter().any(&pred)
     }
 
     #[test]
@@ -2768,7 +2808,7 @@ mod tests {
         host.subscribe(&Caller::Local, "overview", input, into)
             .unwrap();
         {
-            let first = overview.lock().unwrap();
+            let first = overview.values.lock().unwrap();
             assert_eq!(
                 first.len(),
                 1,
@@ -2792,18 +2832,18 @@ mod tests {
         // Let the job settle, then check no push repeated the one before it.
         std::thread::sleep(std::time::Duration::from_millis(400));
         {
-            let all = detail.lock().unwrap();
+            let all = detail.values.lock().unwrap();
             assert!(all.windows(2).all(|w| w[0] != w[1]), "{} pushes", all.len());
         }
 
         host.unsubscribe(sub);
-        let seen = detail.lock().unwrap().len();
+        let seen = detail.values.lock().unwrap().len();
         let more = format!(r#"{{"job":"{job}","title":"and test it"}}"#);
         call(&host, &Caller::Local, "set_task", &more).unwrap();
         assert!(pushed(&overview, |v| argus_json::write(v).contains(&job)));
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert_eq!(
-            detail.lock().unwrap().len(),
+            detail.values.lock().unwrap().len(),
             seen,
             "nothing after unsubscribe"
         );
@@ -2827,17 +2867,8 @@ mod tests {
         let job = start(&host, &repo, "req-timeline");
         let ask =
             format!(r#"{{"job":"{job}","from_ms":0,"to_ms":9007199254740991,"bucket":"M15"}}"#);
-        // The job loop starts the run after the batch that requested it, so a read in that
-        // batch sees only the request: wait for the start.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let page = loop {
-            let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
-            let started = argus_json::write(&page).contains("attempt 0 started");
-            if started || std::time::Instant::now() >= deadline {
-                break page;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        };
+        agent_started(&host, &job);
+        let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
         let Json::Arr(items) = get(&page, "items") else {
             panic!()
         };
