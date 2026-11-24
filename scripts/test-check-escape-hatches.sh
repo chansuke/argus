@@ -25,8 +25,9 @@ expect() { # WANT(pass|fail) DESCRIPTION FILE CONTENT
 }
 
 expect pass "plain code" src/a.rs 'fn main() {}'
-expect fail "a sleep in a test" src/a.rs '        std::thread::sleep(Duration::from_millis(50));'
-expect fail "an imported sleep" src/a.rs '    sleep(Duration::from_millis(5));'
+expect fail "a sleep in an integration test" crates/x/tests/a.rs '    std::thread::sleep(Duration::from_millis(50));'
+expect fail "a sleep in a unit test module" src/a.rs $'fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { std::thread::sleep(D); }\n}'
+expect pass "a production poll interval (clippy and review judge it)" src/a.rs $'fn poll() {\n    std::thread::sleep(every);\n}\n#[cfg(test)]\nmod tests {}'
 expect pass "a word that ends in sleep" src/a.rs 'fn may_sleep_now() {}'
 expect fail "an ignored test without a reason" src/a.rs '#[ignore]'
 expect pass "an ignored test with a reason" src/a.rs '#[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]'

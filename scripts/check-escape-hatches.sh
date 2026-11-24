@@ -8,20 +8,32 @@
 #        scripts/check-escape-hatches.sh BASE [HEAD]  (BASE to HEAD, or to the working tree)
 set -euo pipefail
 
+# show FILE prints the new version of FILE, as the diff sees it.
 case "${1:-}" in
---staged) diff=(git diff --cached --no-color --no-ext-diff -U0 --) ;;
+--staged)
+  diff=(git diff --cached --no-color --no-ext-diff -U0 --)
+  show() { git show ":$1"; }
+  ;;
 "")
   echo "usage: $0 --staged | BASE [HEAD]" >&2
   exit 2
   ;;
-*) diff=(git diff --no-color --no-ext-diff -U0 "$@" --) ;;
+*)
+  diff=(git diff --no-color --no-ext-diff -U0 "$@" --)
+  if (($# > 1)); then
+    head_rev=$2
+    show() { git show "$head_rev:$1"; }
+  else
+    show() { cat -- "$1"; }
+  fi
+  ;;
 esac
 
-# Each rule: what to read (code or comment), a file glob (`*` also matches `/`),
+# Each rule: what to read (code, test code, or comment), a file glob (`*` also matches `/`),
 # an extended regular expression that flags the line, one that clears it again
 # (`-` for none), and what to do instead.
 rules=(
-  $'code\t*.rs\t(^|[^A-Za-z_])sleep\\(\t-\tDo not wait for time to pass. Wait on a channel, a condvar, or the event itself (REVIEW.md: no sleeping tests). In production, block on the thing that changes.'
+  $'test\t*.rs\t(^|[^A-Za-z_])sleep\\(\t-\tDo not wait for time to pass in a test. Wait on a channel, a condvar, or the event itself (REVIEW.md: no sleeping tests).'
   $'code\t*.rs\t#\\[ignore\\]\t-\tGive the reason: #[ignore = "why it does not run by default"]. A failing test is fixed or removed, not ignored (REVIEW.md).'
   $'code\t*.rs\t(^|[^A-Za-z_])(todo|unimplemented)!\t-\tImplement it in this change, or leave the feature out. A stub compiles but fails at run time.'
   $'comment\t*\t(^|[^A-Za-z])(TODO|FIXME|HACK|XXX)([^A-Za-z]|$)\t-\tFix it in this change. If it is out of scope, open an issue and describe what the code does now as a fact; better, add a test or a lint that fails until it is fixed.'
@@ -54,13 +66,24 @@ checked() { # FILE
   return 0
 }
 
+# The first line of FILE's `#[cfg(test)]` code (tests sit at the end of a file), or
+# 1 for a file under tests/. Empty when FILE has no test code.
+test_start() { # FILE
+  case $1 in
+  */tests/* | tests/*) echo 1 ;;
+  *.rs) show "$1" 2>/dev/null | grep -n -m1 '^#\[cfg(test)\]' | cut -d: -f1 || true ;;
+  esac
+}
+
 found=0
 file=""
 line=0
+tests_from=""
 while IFS= read -r row; do
   case $row in
   '+++ b/'*)
     file=${row#+++ b/}
+    tests_from=$(test_start "$file")
     continue
     ;;
   '+++ '* | '--- '*) continue ;;
@@ -82,6 +105,9 @@ while IFS= read -r row; do
       [[ $file == $glob ]] || continue
       subject=$text
       [ "$kind" = comment ] && subject=$comment
+      if [ "$kind" = test ] && { [ -z "$tests_from" ] || ((line < tests_from)); }; then
+        continue
+      fi
       if [ -n "$subject" ] && grep -Eq -- "$pattern" <<<"$subject" &&
         { [ "$unless" = - ] || ! grep -Eq -- "$unless" <<<"$subject"; }; then
         printf '%s:%s: %s\n    %s\n' "$file" "$line" "${text#"${text%%[![:space:]]*}"}" "$advice" >&2
