@@ -19,7 +19,7 @@
 #![expect(
     dead_code,
     unused_variables,
-    reason = "todo!() stubs (socket transport, MCP server) take arguments and hold items they do not use yet"
+    reason = "unimplemented stubs (socket transport, MCP server) take arguments and hold items they do not use yet"
 )]
 
 mod mcp;
