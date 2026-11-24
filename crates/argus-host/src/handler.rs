@@ -2194,6 +2194,30 @@ mod tests {
         host.shutdown();
     }
 
+    /// The job loop starts a run after the batch that requested it: waits for that.
+    fn wait_started(host: &Host, job: &str, run: argus_core::ids::RunId) {
+        use argus_core::ids::{Id128, JobId};
+        let handle = host.inner.job(JobId(Id128::parse(job).unwrap())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let started = handle.read(&mut Vec::new(), move |l| {
+                l.views()
+                    .runs()
+                    .get(&run)
+                    .is_some_and(|r| !r.attempts.is_empty())
+            });
+            if started {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {} never started",
+                run.0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn a_hook_payload_is_kept_verbatim_in_its_runs_hook_log() {
         use argus_core::ids::{Attempt, Id128, RunId};
@@ -2205,6 +2229,8 @@ mod tests {
         let agent = Caller::Agent {
             run: run.0.to_string(),
         };
+        // A hook comes from a running agent; the run starts after the batch that asked.
+        wait_started(&host, &job, run);
         let bodies = [
             r#"{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#,
             r#"{"hook_event_name":"Stop"}"#,
