@@ -28,6 +28,32 @@ fn a_model_choice_reads_as_cli_model_and_effort() {
     );
 }
 
+#[test]
+fn a_model_choice_parses_back_from_its_text() {
+    for c in [
+        choice(AgentCli::Claude, "opus", None),
+        choice(AgentCli::Codex, "gpt-5", Some(Effort::High)),
+        choice(AgentCli::Claude, "sonnet", Some(Effort::Low)),
+    ] {
+        assert_eq!(ModelChoice::parse(&c.to_string()), Some(c));
+    }
+    // A model id may itself contain colons; only a known effort is split off the end.
+    assert_eq!(
+        ModelChoice::parse("claude:us.anthropic.claude-v1:0"),
+        Some(choice(AgentCli::Claude, "us.anthropic.claude-v1:0", None))
+    );
+    for bad in [
+        "",
+        "claude",
+        "claude:",
+        "gemini:pro",
+        "Claude:opus",
+        "claude::high",
+    ] {
+        assert_eq!(ModelChoice::parse(bad), None, "{bad:?}");
+    }
+}
+
 fn oid(c: char) -> GitOid {
     GitOid::parse(&c.to_string().repeat(40)).unwrap()
 }

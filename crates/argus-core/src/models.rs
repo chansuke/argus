@@ -66,6 +66,35 @@ impl std::fmt::Display for ModelChoice {
     }
 }
 
+impl ModelChoice {
+    /// The text `Display` writes. The model id may contain colons; a last segment that
+    /// names an effort is the effort.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (cli, rest) = s.split_once(':')?;
+        let cli = match cli {
+            "claude" => AgentCli::Claude,
+            "codex" => AgentCli::Codex,
+            _ => return None,
+        };
+        let effort = |e: &str| match e {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            "max" => Some(Effort::Max),
+            _ => None,
+        };
+        let (model, effort) = match rest.rsplit_once(':') {
+            Some((model, e)) if effort(e).is_some() => (model, effort(e)),
+            _ => (rest, None),
+        };
+        (!model.is_empty()).then(|| ModelChoice {
+            cli,
+            model: ModelId(model.into()),
+            effort,
+        })
+    }
+}
+
 /// Non-empty, sorted, deduplicated. A review asked of zero models is unrepresentable.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ModelSet {
