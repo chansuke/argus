@@ -180,7 +180,7 @@ fn f() { let _ = crate::adapters::llm::review_prompt(); }
 mod tests {
     use crate::views::InTest;
 }
-fn g() -> crate::plan::CommandSpec { todo!() }
+fn g(_: crate::plan::CommandSpec) {}
 ";
     let found = crate_paths(&production(text));
     assert_eq!(
