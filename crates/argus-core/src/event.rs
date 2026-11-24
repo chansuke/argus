@@ -704,6 +704,11 @@ impl Event {
         };
         let ledger_ok = match self {
             Event::RunRequested { purpose, .. } => purpose.ledger_kind() == ledger,
+            // A run's lifecycle goes where it was requested (insights and skill writes
+            // run on the meta ledger); the runs view ignores unknown runs.
+            Event::RunStarted { .. }
+            | Event::RunFinished { .. }
+            | Event::RunCancelRequested { .. } => true,
             Event::CandidateDismissed { .. } => ledger == LedgerKind::Meta,
             _ => ledger == LedgerKind::Job,
         };

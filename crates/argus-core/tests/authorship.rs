@@ -203,3 +203,36 @@ fn each_event_belongs_to_one_kind_of_ledger() {
         Err(Rejected::WrongAuthor)
     );
 }
+
+#[test]
+fn a_runs_lifecycle_is_recorded_on_whichever_ledger_requested_it() {
+    let run = RunId(Id128(1));
+    let lifecycle = [
+        (
+            Author::Host,
+            Event::RunStarted {
+                run,
+                attempt: Attempt(0),
+                pid: None,
+            },
+        ),
+        (
+            Author::Host,
+            Event::RunFinished {
+                run,
+                attempt: Attempt(0),
+                outcome: RunOutcome::Exited { code: 0 },
+            },
+        ),
+        (Author::Human, Event::RunCancelRequested { run }),
+    ];
+    for (author, event) in lifecycle {
+        for ledger in [LedgerKind::Job, LedgerKind::Meta] {
+            assert_eq!(
+                event.check(&author, ledger),
+                Ok(()),
+                "{event:?} on {ledger:?}"
+            );
+        }
+    }
+}
