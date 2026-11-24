@@ -44,7 +44,8 @@ use argus_core::views::ViewSet;
 use argus_core::views::packet::PacketConfig;
 use argus_json::Json;
 
-use ledger_thread::{Cmd, JobLoop, Launcher, LedgerHandle, LoopConfig};
+use argus_core::views::MetaViews;
+use ledger_thread::{Cmd, JobLoop, Launcher, LedgerHandle, LoopConfig, MetaLoop};
 
 pub use transport::{PairedDevice, PhoneAccess, PhoneListen, serve_socket, serve_websocket};
 
@@ -86,6 +87,8 @@ pub(crate) struct HostInner {
     pub(crate) store: Store,
     /// One loop per open job: the handle to reach it and the thread that runs it.
     pub(crate) jobs: Mutex<BTreeMap<JobId, (LedgerHandle, JoinHandle<()>)>>,
+    /// The meta ledger's loop (insights, skill candidates, skill writes).
+    meta: Mutex<Option<(LedgerHandle<MetaViews>, JoinHandle<()>)>>,
     /// Behind a short mutex: marking dirty never waits on a ledger.
     pub(crate) registry: Arc<Mutex<pulse::Registry>>,
     pub(crate) diffs: git::DiffCache,
@@ -106,9 +109,7 @@ impl HostInner {
         snapshot_deny.extend(config.snapshot_deny.iter().cloned());
         let cfg = LoopConfig {
             info: Some(info),
-            home: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default(),
+            home: home(),
             policy: config.policy.clone(),
             tools: config.tools.clone(),
             socket: config.socket.clone(),
@@ -129,6 +130,37 @@ impl HostInner {
         let handle = LedgerHandle::new(tx, LedgerRef::Job(job));
         self.jobs.lock().unwrap().insert(job, (handle, thread));
         Ok(())
+    }
+
+    /// Opens the meta ledger and starts its loop. Nothing there runs unasked; its first
+    /// pass abandons or retries what was running when the last host died.
+    fn open_meta(&self) -> std::io::Result<()> {
+        let ledger = self.store.open_meta().map_err(io_error)?;
+        let cfg = LoopConfig {
+            info: None,
+            home: home(),
+            policy: PolicyConfig::default(),
+            tools: self.config.tools.clone(),
+            socket: self.config.socket.clone(),
+            snapshot_deny: Vec::new(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry = self.registry.clone();
+        let meta_loop =
+            MetaLoop::new(ledger, tx.clone(), ProcessLauncher, cfg).on_change(move |ledger| {
+                let views = ledger.views();
+                registry
+                    .lock()
+                    .unwrap()
+                    .changed(LedgerRef::Meta, &|mask| views.stamp(mask));
+            });
+        let thread = std::thread::spawn(move || meta_loop.run(rx));
+        *self.meta.lock().unwrap() = Some((LedgerHandle::new(tx, LedgerRef::Meta), thread));
+        Ok(())
+    }
+
+    pub(crate) fn meta(&self) -> Option<LedgerHandle<MetaViews>> {
+        self.meta.lock().unwrap().as_ref().map(|(h, _)| h.clone())
     }
 
     /// Records a new job (`JobOpened`, by the host) and starts its loop. A job that is
@@ -165,7 +197,17 @@ impl HostInner {
             let _ = handle.sender().send(Cmd::Stop);
             let _ = thread.join();
         }
+        if let Some((handle, thread)) = self.meta.lock().unwrap().take() {
+            let _ = handle.sender().send(Cmd::Stop);
+            let _ = thread.join();
+        }
     }
+}
+
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 fn io_error(e: argus_core::LedgerError) -> std::io::Error {
@@ -208,10 +250,12 @@ impl Host {
             config,
             store,
             jobs: Mutex::new(BTreeMap::new()),
+            meta: Mutex::new(None),
             registry: Arc::new(Mutex::new(pulse::Registry::new(wake))),
             diffs: git::DiffCache::default(),
             pulse: Mutex::new(None),
         });
+        inner.open_meta()?;
         for job in inner.store.jobs().map_err(io_error)? {
             if let Err(e) = inner.open_job(job) {
                 inner.stop_all();
