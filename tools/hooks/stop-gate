@@ -19,7 +19,7 @@ out=$(nix develop --command tools/gate 2>&1)
 status=$?
 if [[ $status -ne 0 ]]; then
   {
-    echo "The verification gate failed. Fix the cause (see .claude/skills/verify/SKILL.md):"
+    echo "The verification gate failed. Fix the cause; scripts/verify keeps each step's log in target/verify/:"
     grep -E '^gate: ' <<<"$out"
     echo "--- last lines ---"
     tail -n 40 <<<"$out"
