@@ -5,10 +5,13 @@ use std::path::PathBuf;
 
 use argus_log::LogError;
 
+use crate::adapters::llm::{self, InsightSession};
 use crate::ids::*;
 use crate::ledger::{JobLedger, LedgerError, MetaLedger};
 use crate::period::Period;
+use crate::views::runs::Runs;
 use crate::views::stats::{Analytics, JobStats};
+use crate::views::timeline::Timeline;
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -65,15 +68,31 @@ impl Store {
         Ok(analytics)
     }
 
-    /// The exact prompt for an insight run over `period`: per conversation, the human
-    /// prompts, corrections, tool errors, rework loops, and bookmarks, each tagged with a
-    /// `FactRef` the model must cite as evidence. Existing skill names are listed so it
-    /// proposes changes instead of duplicates. Stored verbatim in the `Insight` request.
+    /// The exact prompt for an insight run over `period` (`adapters::llm::insight_prompt`):
+    /// per job, the timeline moments inside it worth learning from, each tagged so the
+    /// model cites them as evidence. Existing skill names are listed so it proposes
+    /// changes instead of duplicates. Stored verbatim in the `Insight` request. Reads like
+    /// `analytics`: every job replayed, safe while a host writes.
     pub fn insight_prompt(
         &self,
         period: &Period,
         existing_skills: &[SkillName],
     ) -> Result<String, LedgerError> {
-        todo!("not implemented")
+        let mut sessions = Vec::new();
+        for job in self.jobs()? {
+            let dir = self.root.join("jobs").join(job.0.to_string());
+            let (timeline, _) = crate::ledger::replay::<Timeline>(&dir, None)?;
+            let items: Vec<_> = timeline
+                .range(period.from, period.to)
+                .map(|(at, fact, item)| (at, fact.clone(), item.clone()))
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            let (runs, _) = crate::ledger::replay::<Runs>(&dir, None)?;
+            let title = runs.job().map(|j| j.title.clone()).unwrap_or_default();
+            sessions.push(InsightSession { job, title, items });
+        }
+        Ok(llm::insight_prompt(period, existing_skills, &sessions))
     }
 }

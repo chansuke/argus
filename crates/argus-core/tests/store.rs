@@ -40,14 +40,15 @@ fn jobs_are_found_again_in_id_order_and_open_once() {
     assert!(store.open_meta().is_ok());
 }
 
-#[test]
-fn analytics_read_every_job_while_its_host_holds_it() {
+/// A job whose Claude transcript holds one prompt and two replies on 2026-10-24.
+fn job_with_a_transcript(
+    store: &Store,
+    root: &std::path::Path,
+) -> (JobId, argus_core::ids::RunId, argus_core::ledger::JobLedger) {
     use argus_core::event::{AgentLaunch, Author, Event, JobInfo, JobOrigin, RunPurpose};
     use argus_core::ids::{Attempt, GitOid, RunId};
     use argus_core::models::AgentCli;
     use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
-    let root = scratch();
-    let store = Store::open(root.clone()).unwrap();
     let job = JobId(Id128(3));
     let run = RunId(Id128(4));
     let mut ledger = store.open_job(job).unwrap();
@@ -91,6 +92,15 @@ fn analytics_read_every_job_while_its_host_holds_it() {
     let frames = SourceKind::ClaudeTranscript.framer(0).push(text.as_bytes());
     ledger.observe(source, frames).unwrap();
     ledger.flush().unwrap();
+    (job, run, ledger)
+}
+
+#[test]
+fn analytics_read_every_job_while_its_host_holds_it() {
+    use argus_core::models::AgentCli;
+    let root = scratch();
+    let store = Store::open(root.clone()).unwrap();
+    let (job, run, ledger) = job_with_a_transcript(&store, &root);
     std::fs::create_dir_all(root.join("jobs").join(Id128(9).to_string())).unwrap();
 
     let analytics = store.analytics().unwrap();
@@ -110,6 +120,38 @@ fn analytics_read_every_job_while_its_host_holds_it() {
         total(|c| c.output_tokens),
         9,
         "a message's usage counts once"
+    );
+    drop(ledger);
+}
+
+#[test]
+fn an_insight_prompt_lists_each_jobs_moments_inside_the_period() {
+    use argus_core::ids::UnixMillis;
+    use argus_core::period::Period;
+    let root = scratch();
+    let store = Store::open(root.clone()).unwrap();
+    let (job, _, ledger) = job_with_a_transcript(&store, &root);
+    let oct_24 = UnixMillis::parse_rfc3339("2026-10-24T00:00:00Z").unwrap();
+    let day = |from: UnixMillis| Period {
+        from,
+        to: UnixMillis(from.0 + 86_400_000),
+    };
+
+    let prompt = store.insight_prompt(&day(oct_24), &[]).unwrap();
+    assert!(prompt.contains(r#""fix the gate":"#), "{prompt}");
+    assert!(
+        prompt.contains("[E1] 03:16 prompt: fix the gate"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("[E2]"), "replies are left out: {prompt}");
+    assert!(prompt.contains(&format!("E1 {} ", job.0)), "{prompt}");
+
+    let before = store
+        .insight_prompt(&day(UnixMillis(oct_24.0 - 86_400_000)), &[])
+        .unwrap();
+    assert!(
+        before.contains("Nothing happened in this period."),
+        "{before}"
     );
     drop(ledger);
 }
