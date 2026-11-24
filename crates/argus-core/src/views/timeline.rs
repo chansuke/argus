@@ -445,3 +445,23 @@ fn outcome_title(outcome: &RunOutcome) -> String {
         RunOutcome::Failed { reason } => format!("failed: {}", first_line(reason)),
     }
 }
+
+impl crate::adapters::llm::InsightMoment for Item {
+    fn lesson(&self) -> Option<String> {
+        Some(match &self.kind {
+            ItemKind::Prompt => "prompt".into(),
+            ItemKind::HumanInput => "human typed".into(),
+            ItemKind::ToolCall {
+                name,
+                ok: Some(false),
+            } => format!("tool {} failed", name.0),
+            ItemKind::Decision => "decision".into(),
+            ItemKind::Comment => "comment".into(),
+            ItemKind::Finding => "finding".into(),
+            _ => return None,
+        })
+    }
+    fn title(&self) -> &str {
+        &self.title
+    }
+}

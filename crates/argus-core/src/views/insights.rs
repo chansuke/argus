@@ -8,18 +8,8 @@ use crate::adapters::llm;
 use crate::event::{Event, RunOutcome, RunPurpose, SkillDraft};
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
-use crate::source::{AgentWhat, Observation, SourceFamily};
+use crate::source::{AgentWhat, Observation, RawCandidate, SourceFamily};
 use crate::views::Projection;
-
-/// What `adapters::llm::parse_candidates` yields.
-#[derive(Clone, Debug)]
-pub struct RawCandidate {
-    pub name: String,
-    pub description: String,
-    pub why: String,
-    pub body: String,
-    pub evidence: Vec<FactRef>,
-}
 
 #[derive(Debug)]
 pub struct Candidate {

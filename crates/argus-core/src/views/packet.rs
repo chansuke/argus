@@ -15,9 +15,9 @@ use crate::diff::{DiffHunk, HeadDiff, HunkAnchor};
 use crate::event::{Anchor, ApprovedHead, Decision};
 use crate::ids::*;
 use crate::models::ModelChoice;
-use crate::views::checks::CheckVerdict;
+use crate::source::{CheckVerdict, Severity};
 use crate::views::review::{
-    Finding, ReviewBoard, ReviewOutput, Severity, SnapshotEntry, Thread, ThreadOrigin,
+    Finding, ReviewBoard, ReviewOutput, SnapshotEntry, Thread, ThreadOrigin,
 };
 use crate::views::transcript::{EditHow, EditTrace};
 use crate::views::{GateState, JobViews};

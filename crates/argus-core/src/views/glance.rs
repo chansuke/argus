@@ -3,7 +3,7 @@
 
 use crate::event::{Decision, RunOutcome, RunPurpose, TaskState};
 use crate::ids::*;
-use crate::views::checks::CheckVerdict;
+use crate::source::CheckVerdict;
 use crate::views::progress::{Activity, PlanNode, Share, WaitReason};
 use crate::views::{GateState, JobViews};
 

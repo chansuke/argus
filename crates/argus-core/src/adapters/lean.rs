@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use crate::adapters::tlc;
 use crate::plan::{CommandSpec, PlanEnv, Workdir};
+use crate::source::CheckVerdict;
 use crate::source::{Decoded, LeanMessage, LeanSeverity, Observation, SourceKind};
-use crate::views::checks::CheckVerdict;
 
 pub(crate) const VERSION: u32 = 1;
 

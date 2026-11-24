@@ -220,12 +220,12 @@ fn model_pick(m: &ModelChoice) -> ModelPick {
     }
 }
 
-fn severity(s: review::Severity) -> Severity {
+fn severity(s: argus_core::source::Severity) -> Severity {
     match s {
-        review::Severity::High => Severity::High,
-        review::Severity::Medium => Severity::Medium,
-        review::Severity::Low => Severity::Low,
-        review::Severity::Nit => Severity::Nit,
+        argus_core::source::Severity::High => Severity::High,
+        argus_core::source::Severity::Medium => Severity::Medium,
+        argus_core::source::Severity::Low => Severity::Low,
+        argus_core::source::Severity::Nit => Severity::Nit,
     }
 }
 
@@ -426,17 +426,19 @@ fn check_card(run: &RunId, c: &checks::CheckRun, head: Option<&TreeOid>) -> Chec
             }
         },
         verdict: c.verdict.as_ref().map(|(_, v)| match v {
-            checks::CheckVerdict::Proved => CheckVerdict::Proved {},
-            checks::CheckVerdict::Holes { sorries } => CheckVerdict::Holes { sorries: *sorries },
-            checks::CheckVerdict::Refuted { summary, trace } => CheckVerdict::Refuted {
+            argus_core::source::CheckVerdict::Proved => CheckVerdict::Proved {},
+            argus_core::source::CheckVerdict::Holes { sorries } => {
+                CheckVerdict::Holes { sorries: *sorries }
+            }
+            argus_core::source::CheckVerdict::Refuted { summary, trace } => CheckVerdict::Refuted {
                 summary: summary.clone(),
                 trace: facts(trace),
             },
-            checks::CheckVerdict::Passed => CheckVerdict::Passed {},
-            checks::CheckVerdict::ToolError { summary } => CheckVerdict::ToolError {
+            argus_core::source::CheckVerdict::Passed => CheckVerdict::Passed {},
+            argus_core::source::CheckVerdict::ToolError { summary } => CheckVerdict::ToolError {
                 summary: summary.clone(),
             },
-            checks::CheckVerdict::Cancelled => CheckVerdict::Cancelled {},
+            argus_core::source::CheckVerdict::Cancelled => CheckVerdict::Cancelled {},
         }),
         evidence: c
             .evidence
@@ -582,7 +584,7 @@ impl ApiHandler<'_> {
         meta: &LedgerHandle<MetaViews>,
         text: &str,
         by: Option<RunId>,
-    ) -> Result<(FindingId, insights::RawCandidate), ApiError> {
+    ) -> Result<(FindingId, argus_core::source::RawCandidate), ApiError> {
         let id = FindingId::parse(text).ok_or_else(|| ApiError::BadInput {
             path: "candidate".into(),
             what: format!("not a candidate id: {text:?}"),

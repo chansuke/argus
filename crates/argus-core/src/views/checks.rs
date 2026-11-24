@@ -10,7 +10,9 @@ use crate::event::{
 };
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
-use crate::source::{DeviceAction, LeanMessage, Observation, SourceFamily, TlcMessage};
+use crate::source::{
+    CheckVerdict, DeviceAction, LeanMessage, Observation, SourceFamily, TlcMessage,
+};
 use crate::views::runs::ArtifactRef;
 use crate::views::{GateState, Projection};
 
@@ -38,25 +40,6 @@ pub enum CheckOutput {
     Tlc(Vec<(FactId, TlcMessage)>),
     Lean(Vec<(FactId, LeanMessage)>),
     Device(Vec<(FactId, DeviceAction)>),
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub enum CheckVerdict {
-    Proved,
-    /// Builds, but proofs use `sorry`: never displayed as proved.
-    Holes {
-        sorries: u32,
-    },
-    Refuted {
-        summary: String,
-        trace: Vec<FactId>,
-    },
-    /// Device driver exited 0 (scripted assertions held / agent reported success).
-    Passed,
-    ToolError {
-        summary: String,
-    },
-    Cancelled,
 }
 
 impl Checks {

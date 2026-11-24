@@ -537,6 +537,55 @@ pub struct DeviceAction {
     pub detail: String,
 }
 
+// What adapters decode from a tool run's output; views fold these.
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum CheckVerdict {
+    Proved,
+    /// Builds, but proofs use `sorry`: never displayed as proved.
+    Holes {
+        sorries: u32,
+    },
+    Refuted {
+        summary: String,
+        trace: Vec<FactId>,
+    },
+    /// Device driver exited 0 (scripted assertions held / agent reported success).
+    Passed,
+    ToolError {
+        summary: String,
+    },
+    Cancelled,
+}
+
+/// What `adapters::llm::parse_findings` yields before ids are assigned.
+#[derive(Clone, Debug)]
+pub struct RawFinding {
+    pub path: Option<RepoPath>,
+    pub lines: Option<LineRange>,
+    pub severity: Severity,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Severity {
+    High,
+    Medium,
+    Low,
+    Nit,
+}
+
+/// What `adapters::llm::parse_candidates` yields.
+#[derive(Clone, Debug)]
+pub struct RawCandidate {
+    pub name: String,
+    pub description: String,
+    pub why: String,
+    pub body: String,
+    pub evidence: Vec<FactRef>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

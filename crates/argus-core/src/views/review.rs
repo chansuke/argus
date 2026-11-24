@@ -20,7 +20,7 @@ use crate::event::{
 };
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
-use crate::source::{AgentWhat, Observation, SourceFamily, SourceMeta};
+use crate::source::{AgentWhat, Observation, RawFinding, Severity, SourceFamily, SourceMeta};
 use crate::views::packet::FeedbackItem;
 use crate::views::{GateState, JobViews, Projection};
 
@@ -66,24 +66,6 @@ pub enum ReviewOutput {
     Failed {
         reason: String,
     },
-}
-
-/// What `adapters::llm::parse_findings` yields before ids are assigned.
-#[derive(Clone, Debug)]
-pub struct RawFinding {
-    pub path: Option<RepoPath>,
-    pub lines: Option<LineRange>,
-    pub severity: Severity,
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Severity {
-    High,
-    Medium,
-    Low,
-    Nit,
 }
 
 #[derive(Debug)]
