@@ -13,8 +13,6 @@
 //! `ops.rs`; every transport and both frontends get it, and the host fails to compile
 //! until it implements the new `Handler` method.
 
-#![allow(dead_code, unused_variables)]
-
 mod ops;
 pub mod vm;
 pub mod wire;

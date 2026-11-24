@@ -15,7 +15,7 @@ use argus_log::{
 
 use crate::adapters;
 use crate::codec::{self, ActorHeader};
-use crate::event::{self, Author, DedupKey, Event, Rejected};
+use crate::event::{Author, DedupKey, Event, Rejected};
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
 use crate::source::{AgentEvent, Decoded, Observation, RawFrame, SourceMeta};

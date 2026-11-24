@@ -5,7 +5,6 @@
 //! (`Id128::derive`), so deciding twice (around a crash, or on every append) yields the
 //! same ids and the ledger drops the repeats as duplicates.
 
-use crate::adapters;
 use crate::event::{
     AgentLaunch, CheckRequest, CheckSpec, Decision, Event, LlmCall, ReviewLens, ReviewSpec,
     RunPurpose,

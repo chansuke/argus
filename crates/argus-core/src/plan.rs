@@ -5,9 +5,7 @@
 use crate::adapters;
 use crate::command::{CommandSpec, Effect, Invocation, PermissionAnswer, PlanEnv, Workdir};
 use crate::event::*;
-use crate::ids::*;
 use crate::models::AgentCli;
-use crate::source::SourceKind;
 
 /// The lease protocol steps of each provider; the adapter owns the commands.
 impl LeaseProvider {

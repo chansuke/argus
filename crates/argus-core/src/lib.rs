@@ -23,7 +23,11 @@
 //! let raw = job.raw(&fact.event)?;                       // verbatim bytes behind any item
 //! ```
 
-#![allow(dead_code, unused_variables, unused_imports)]
+#![expect(
+    dead_code,
+    unused_variables,
+    reason = "todo!() stubs (EAS device checks, insights, checkpoints) take arguments and hold items they do not use yet"
+)]
 
 mod adapters;
 mod codec;
