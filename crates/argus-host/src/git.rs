@@ -74,7 +74,7 @@ pub(crate) fn current_branch(repo: &Path) -> Option<String> {
 /// Records the worktree without touching its index or HEAD.
 ///
 /// 1. untracked = `git ls-files --others --exclude-standard -z` (git's ignore rules);
-///    `withheld` = those matching `deny` (`plan::SNAPSHOT_DENY` + config). Withheld
+///    `withheld` = those matching `deny` (`command::SNAPSHOT_DENY` + config). Withheld
 ///    files are never staged, so a secret never enters a tree, a ref, or a reviewer's
 ///    checkout. Tracked files are always included.
 /// 2. With `GIT_INDEX_FILE=<tmp>`: `git read-tree HEAD`, `git add -u`,
@@ -530,9 +530,9 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use argus_core::command::SNAPSHOT_DENY;
     use argus_core::diff::parse_unified;
     use argus_core::ids::Id128;
-    use argus_core::plan::SNAPSHOT_DENY;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")

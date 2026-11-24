@@ -27,6 +27,7 @@
 
 mod adapters;
 mod codec;
+pub mod command;
 pub mod diff;
 pub mod event;
 pub mod fact;

@@ -1,9 +1,9 @@
 //! TLA+ model checking through java TLC or tlars. Both speak `-tool` mode, so the
 //! command differs and the decoder does not.
 
+use crate::command::{CommandSpec, PlanEnv, Workdir};
 use crate::event::{CheckRequest, CheckSpec, TlaEngine};
 use crate::ids::{FactId, RepoPath};
-use crate::plan::{CommandSpec, PlanEnv, Workdir};
 use crate::source::CheckVerdict;
 use crate::source::{Decoded, Observation, SourceKind, TlcMessage};
 

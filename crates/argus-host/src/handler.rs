@@ -1493,11 +1493,11 @@ impl Handler for ApiHandler<'_> {
                 what: "only an agent run asks for permission".into(),
             })?;
         let answer = match input.answer {
-            argus_api::vm::PermissionAnswer::Allow => argus_core::plan::PermissionAnswer::Allow,
+            argus_api::vm::PermissionAnswer::Allow => argus_core::command::PermissionAnswer::Allow,
             argus_api::vm::PermissionAnswer::AllowAlways => {
-                argus_core::plan::PermissionAnswer::AllowAlways
+                argus_core::command::PermissionAnswer::AllowAlways
             }
-            argus_api::vm::PermissionAnswer::Deny => argus_core::plan::PermissionAnswer::Deny,
+            argus_api::vm::PermissionAnswer::Deny => argus_core::command::PermissionAnswer::Deny,
         };
         let bytes =
             argus_core::plan::permission_input(cli, answer).ok_or_else(|| ApiError::Rejected {

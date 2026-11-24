@@ -4,10 +4,10 @@
 
 use argus_json::Json;
 
+use crate::command::{CommandSpec, PermissionAnswer, PlanEnv, WatchSpec, Workdir};
 use crate::diff::line_hash;
 use crate::event::AgentLaunch;
 use crate::ids::{ModelId, RecordKey, ToolCallId, ToolName, UnixMillis};
-use crate::plan::{CommandSpec, PermissionAnswer, PlanEnv, WatchSpec, Workdir};
 use crate::source::{
     AgentEvent, AgentWhat, Decoded, FileTouch, Observation, PlanItem, PlanOp, PlanStatus,
     SourceKind, TokenUsage, TouchHow,

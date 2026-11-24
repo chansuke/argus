@@ -4,9 +4,9 @@
 use crate::event::{LlmCall, ReviewLens, ReviewSpec};
 use argus_json::Json;
 
+use crate::command::{CommandSpec, PlanEnv, Workdir};
 use crate::ids::{CommitOid, LineRange, RepoPath, SkillName, UnixMillis};
 use crate::models::{AgentCli, Effort};
-use crate::plan::{CommandSpec, PlanEnv, Workdir};
 use crate::source::SourceKind;
 
 #[derive(Clone, Copy, Debug)]

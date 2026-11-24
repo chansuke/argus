@@ -8,10 +8,11 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
+use argus_core::command::{Invocation, PlanEnv, ToolPaths};
 use argus_core::event::{Author, Event, JobInfo, RunOutcome};
 use argus_core::ids::{Attempt, LedgerRef, RunId, SourceId, UnixMillis};
 use argus_core::ledger::{JobLedger, Ledger, LedgerError, MetaLedger, SourceCursor, Submitted};
-use argus_core::plan::{Invocation, PlanEnv, ToolPaths, plan};
+use argus_core::plan::plan;
 use argus_core::policy::{self, PolicyConfig};
 use argus_core::source::{RawFrame, SourceMeta};
 use argus_core::views::runs::{Due, Runs};
@@ -598,10 +599,10 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
 
+    use argus_core::command::{SNAPSHOT_DENY, Workdir};
     use argus_core::event::{AgentLaunch, JobOrigin, ReviewLens, RunOutcome, RunPurpose, Snapshot};
     use argus_core::ids::{Attempt, GitOid, Id128, JobId, ModelId};
     use argus_core::models::{AgentCli, ModelChoice, ModelSet};
-    use argus_core::plan::{SNAPSHOT_DENY, Workdir};
 
     /// One `Launcher::start` call, and the receiver its `Running::cancel` sends to.
     struct Started {
@@ -820,7 +821,7 @@ mod tests {
         assert_eq!(spec.stdin.as_deref(), Some(&b"what went wrong?"[..]));
         assert!(matches!(
             launched[1].inv,
-            Invocation::InProcess(argus_core::plan::Effect::WriteSkill(_))
+            Invocation::InProcess(argus_core::command::Effect::WriteSkill(_))
         ));
         let runs = meta.ledger().views().runs();
         assert_eq!(runs.get(&run(1)).unwrap().attempts.len(), 1);
