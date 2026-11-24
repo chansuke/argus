@@ -17,7 +17,7 @@
 #![expect(
     dead_code,
     unused_variables,
-    reason = "todo!() stubs (leases, transports, retention) take arguments and hold items they do not use yet"
+    reason = "unimplemented stubs (leases, transports, retention) take arguments and hold items they do not use yet"
 )]
 
 mod clock;

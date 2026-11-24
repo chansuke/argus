@@ -26,7 +26,7 @@
 #![expect(
     dead_code,
     unused_variables,
-    reason = "todo!() stubs (EAS device checks, insights, checkpoints) take arguments and hold items they do not use yet"
+    reason = "unimplemented stubs (EAS device checks, insights, checkpoints) take arguments and hold items they do not use yet"
 )]
 
 mod adapters;
