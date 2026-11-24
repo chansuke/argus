@@ -52,7 +52,6 @@ const KNOWN: &[(&str, &str)] = &[
     ("diff.rs", "crate::event::Hunk"),
     ("event.rs", "crate::adapters::llm::review_prompt"),
     ("event.rs", "crate::codec"),
-    ("event.rs", "crate::views::timeline::Window"),
     ("source.rs", "crate::adapters"),
 ];
 

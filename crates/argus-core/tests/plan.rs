@@ -10,9 +10,9 @@ use argus_core::event::{
 };
 use argus_core::ids::{Attempt, GitOid, Id128, JobId, ModelId, RepoPath, RunId};
 use argus_core::models::{AgentCli, Effort, ModelChoice};
+use argus_core::period::{BucketWidth, Window};
 use argus_core::plan::{CommandSpec, Invocation, PlanEnv, SNAPSHOT_DENY, ToolPaths, Workdir, plan};
 use argus_core::source::SourceKind;
-use argus_core::views::timeline::{BucketWidth, Window};
 
 const RUN: &str = "0f8fad5d-d9cb-469f-a165-70867728950e";
 

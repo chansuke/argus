@@ -12,10 +12,10 @@ use crate::event::{
 };
 use crate::ids::*;
 use crate::models::{ModelChoice, ModelSet};
+use crate::period::BucketWidth;
 use crate::views::JobViews;
 use crate::views::packet::render_feedback;
 use crate::views::progress::{Activity, WaitReason};
-use crate::views::timeline::BucketWidth;
 
 #[derive(Clone, Debug, Default)]
 pub struct PolicyConfig {
