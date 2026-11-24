@@ -15,11 +15,17 @@ use argus_json::{Json, JsonError, Number};
 use crate::diff::{Hunk, HunkAnchor};
 use crate::event::*;
 use crate::ids::*;
-use crate::ledger::ActorHeader;
 use crate::models::{AgentCli, Effort, ModelChoice};
 use crate::period::Period;
 use crate::period::{BucketWidth, Window};
 use crate::source::{SourceKind, SourceMeta, SourceOrigin};
+
+/// Header of every log; decides how its frames are read.
+#[derive(Clone, Debug)]
+pub(crate) enum ActorHeader {
+    Author(Author),
+    Source(SourceMeta),
+}
 
 pub(crate) fn encode_header(header: &ActorHeader) -> Vec<u8> {
     argus_json::write(&header.to_json()).into_bytes()

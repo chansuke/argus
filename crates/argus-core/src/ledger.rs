@@ -14,7 +14,7 @@ use argus_log::{
 };
 
 use crate::adapters;
-use crate::codec;
+use crate::codec::{self, ActorHeader};
 use crate::event::{self, Author, DedupKey, Event, Rejected};
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
@@ -588,13 +588,6 @@ fn apply_frame(
 
 fn corrupt(id: &EventId, what: &str) -> LedgerError {
     LedgerError::Corrupt(format!("{id}: {what}"))
-}
-
-/// Header of every log; decides how its frames are read.
-#[derive(Clone, Debug)]
-pub(crate) enum ActorHeader {
-    Author(Author),
-    Source(SourceMeta),
 }
 
 /// A log's header, checked against the file it came from.
