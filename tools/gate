@@ -55,12 +55,25 @@ step_lean() {
   tools/lean-check
 }
 
+# Lines added since the base branch may not sleep, ignore a test without a reason,
+# add a todo!() stub, or suppress a TS/ESLint check without a reason. Old lines are
+# not read. The base is origin/main unless GATE_BASE names another ref.
+step_hatches() {
+  scripts/test-check-escape-hatches.sh
+  local base
+  if ! base=$(git merge-base HEAD "${GATE_BASE:-origin/main}" 2>/dev/null); then
+    echo "gate: hatches needs the base branch: run 'git fetch origin main', or set GATE_BASE" >&2
+    return 1
+  fi
+  scripts/check-escape-hatches.sh "$base"
+}
+
 # Tauri resolves crates from the network, so this step is not in the default set.
 step_app() {
   cargo check --locked --manifest-path crates/argus-app/Cargo.toml
 }
 
-default_steps=(fmt clippy test tsgen ts typos actionlint tla lean)
+default_steps=(fmt clippy test tsgen ts typos actionlint hatches tla lean)
 all_steps=("${default_steps[@]}" app)
 
 if [[ ${1:-} == --list ]]; then
