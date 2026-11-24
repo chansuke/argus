@@ -16,12 +16,14 @@
 
 #![allow(dead_code, unused_variables)]
 
+mod clock;
 mod config;
 mod git;
 mod glob;
 mod handler;
 mod lease;
 mod ledger_thread;
+mod proc;
 mod pty;
 mod pulse;
 mod runner;

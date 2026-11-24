@@ -34,7 +34,7 @@ use argus_log::{EventId, Seq};
 
 use crate::ledger_thread::{LedgerHandle, LoopViews};
 use crate::pulse::Dep;
-use crate::{HostInner, git};
+use crate::{HostInner, clock, git};
 
 pub(crate) struct ApiHandler<'h> {
     host: &'h HostInner,
@@ -557,11 +557,6 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     }
 }
 
-fn now() -> UnixMillis {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    UnixMillis(since.map_or(0, |d| d.as_millis() as i64))
-}
-
 impl ApiHandler<'_> {
     fn job_handle(&self, job: &str) -> Result<(JobId, LedgerHandle), ApiError> {
         let job = JobId(id(job, "job")?);
@@ -977,7 +972,7 @@ fn lens(l: Lens) -> ReviewLens {
 impl Handler for ApiHandler<'_> {
     fn overview(&mut self, caller: &Caller, input: Empty) -> Result<Overview, ApiError> {
         self.deps.push(Dep::JobSet);
-        let now = now();
+        let now = clock::now();
         let mut summaries = Vec::new();
         for job in self.host.job_ids() {
             let Some(handle) = self.host.job(job) else {
@@ -1006,7 +1001,7 @@ impl Handler for ApiHandler<'_> {
     /// exactly when something shown here changed.
     fn job(&mut self, caller: &Caller, input: JobRef) -> Result<JobPulse, ApiError> {
         let (_, handle) = self.job_handle(&input.job)?;
-        let now = now();
+        let now = clock::now();
         let mut deps = Vec::new();
         let detail = handle.read(&mut deps, move |l| {
             let summary = summarize(l, now)?;
@@ -1138,7 +1133,7 @@ impl Handler for ApiHandler<'_> {
     /// (`HeadMoved`) starts over.
     fn review(&mut self, caller: &Caller, input: JobRef) -> Result<ReviewScreen, ApiError> {
         let (_, handle) = self.job_handle(&input.job)?;
-        let now = now();
+        let now = clock::now();
         for _ in 0..REVIEW_TRIES {
             let (req, repo) = handle.read(&mut Vec::new(), |l| {
                 let views = l.views();
@@ -1651,10 +1646,11 @@ impl Handler for ApiHandler<'_> {
     /// whose events are then left out.
     fn stats(&mut self, caller: &Caller, input: StatsQuery) -> Result<StatsTable, ApiError> {
         let tz = self.host.config.tz;
-        let period = Period::parse(&input.period, now(), tz).ok_or_else(|| ApiError::BadInput {
-            path: "period".into(),
-            what: format!("not a period: {:?}", input.period),
-        })?;
+        let period =
+            Period::parse(&input.period, clock::now(), tz).ok_or_else(|| ApiError::BadInput {
+                path: "period".into(),
+                what: format!("not a period: {:?}", input.period),
+            })?;
         let by = match input.group_by {
             GroupBy::Agent => stats::GroupBy::Agent,
             GroupBy::Model => stats::GroupBy::Model,
@@ -1723,12 +1719,13 @@ impl Handler for ApiHandler<'_> {
     ) -> Result<RunRef, ApiError> {
         let author = author(caller)?;
         let meta = self.meta_handle()?;
-        let period = Period::parse(&input.period, now(), self.host.config.tz).ok_or_else(|| {
-            ApiError::BadInput {
-                path: "period".into(),
-                what: format!("not a period: {:?}", input.period),
-            }
-        })?;
+        let period =
+            Period::parse(&input.period, clock::now(), self.host.config.tz).ok_or_else(|| {
+                ApiError::BadInput {
+                    path: "period".into(),
+                    what: format!("not a period: {:?}", input.period),
+                }
+            })?;
         let model = model_choice(input.model)?;
         let skills = existing_skills(&self.host.config.skill_dirs);
         let prompt = self
@@ -1802,7 +1799,6 @@ impl Handler for ApiHandler<'_> {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use argus_api::{ApiError, Caller};
@@ -1820,7 +1816,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::proc::command("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
@@ -2347,9 +2343,9 @@ mod tests {
 
     /// Polls `done` every 20 ms for up to 10 s.
     fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = crate::clock::monotonic() + std::time::Duration::from_secs(10);
         while !done() {
-            assert!(std::time::Instant::now() < deadline, "{what}");
+            assert!(crate::clock::monotonic() < deadline, "{what}");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }

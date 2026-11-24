@@ -27,7 +27,7 @@ fn shell_quote(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     /// util-linux `script` from the dev shell (or the system).
     fn script() -> PathBuf {
@@ -37,7 +37,7 @@ mod tests {
     fn run(program: &str, args: &[&str]) -> (Vec<u8>, Option<i32>) {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let (program, args) = wrap(&script(), Path::new(program), &args);
-        let out = Command::new(program)
+        let out = crate::proc::command(program)
             .args(args)
             .stdin(Stdio::null())
             .output()

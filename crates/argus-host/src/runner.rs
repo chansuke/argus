@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -21,7 +21,7 @@ use argus_log::BlobStore;
 
 use crate::ledger_thread::{self, Cmd, observe};
 use crate::tokens::RunTokens;
-use crate::{git, pty, tail};
+use crate::{clock, git, proc, pty, tail};
 
 pub(crate) struct Running {
     pub run: RunId,
@@ -392,7 +392,7 @@ pub(crate) fn spawn_capture(
         Some(cwd) => dir.join(cwd.as_str()),
         None => dir.to_path_buf(),
     };
-    let mut command = Command::new(program);
+    let mut command = proc::command(program);
     command
         .args(args)
         .current_dir(workdir)
@@ -458,7 +458,7 @@ pub(crate) fn spawn_capture(
     ];
 
     // Stopping: SIGTERM to the process group, then SIGKILL once the grace has passed.
-    let started = Instant::now();
+    let started = clock::monotonic();
     let mut stopping: Option<Instant> = None;
     let mut cancelled = false;
     let pgid = child.id();
@@ -482,7 +482,7 @@ pub(crate) fn spawn_capture(
                             .for_each(|c| signal_group(c, "TERM")),
                         false => signal_group(pgid, "TERM"),
                     }
-                    stopping = Some(Instant::now());
+                    stopping = Some(clock::monotonic());
                 }
             }
             Some(since) if since.elapsed() >= control.grace => {
@@ -542,7 +542,7 @@ fn signal_group(pgid: u32, signal: &str) {
     if !may_signal(pgid, own_group()) {
         return;
     }
-    let _ = Command::new("kill")
+    let _ = proc::command("kill")
         .arg(format!("-{signal}"))
         .arg("--")
         .arg(format!("-{pgid}"))
@@ -598,7 +598,7 @@ mod tests {
     use super::*;
     use crate::ledger_thread::testing::{Received, bytes, fake_ledger};
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use argus_core::command::{SNAPSHOT_DENY, ToolPaths, Workdir};
     use argus_core::ids::{Attempt, Id128};
@@ -709,7 +709,7 @@ mod tests {
     fn a_run_whose_handle_is_dropped_is_stopped() {
         let dir = scratch_dir("dropped");
         let (ledger, thread) = fake_ledger();
-        let started = Instant::now();
+        let started = clock::monotonic();
         let running = start(
             Invocation::Process(sh(BUSY)),
             env(),
@@ -791,10 +791,10 @@ mod tests {
         let (ledger, thread) = fake_ledger();
         let running = start(Invocation::Process(spec), env(), ws, ledger.clone());
         drop(ledger);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = clock::monotonic() + Duration::from_secs(10);
         while !dir.join("tok").exists() {
             assert!(
-                Instant::now() < deadline,
+                clock::monotonic() < deadline,
                 "the process never wrote its token"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -972,7 +972,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::proc::command("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
@@ -1226,7 +1226,7 @@ mod tests {
         control.input = Some(input);
         // Enter on a terminal is a carriage return.
         typed.send(b"hello\r".to_vec()).unwrap();
-        let started = Instant::now();
+        let started = clock::monotonic();
         let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1249,7 +1249,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             cancel.send(()).unwrap();
         });
-        let started = Instant::now();
+        let started = clock::monotonic();
         let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -1274,7 +1274,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             cancel.send(()).unwrap();
         });
-        let started = Instant::now();
+        let started = clock::monotonic();
         let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -1324,7 +1324,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             cancel.send(()).unwrap();
         });
-        let started = Instant::now();
+        let started = clock::monotonic();
         let (ended, _) = capture_with(&spec, Path::new("/"), &mut control);
         assert!(
             started.elapsed() < Duration::from_secs(3),
@@ -1435,7 +1435,7 @@ mod tests {
     fn a_process_past_its_timeout_is_killed() {
         let mut spec = sh("sleep 30");
         spec.timeout = Some(Duration::from_millis(200));
-        let started = Instant::now();
+        let started = clock::monotonic();
         let (status, _) = capture(&spec, Path::new("/"));
         assert!(!status.success());
         assert!(
@@ -1548,12 +1548,12 @@ mod tests {
         let inv = argus_core::plan::plan(&purpose, &env);
         let (ledger, live) = live_ledger();
         let running = start(inv, env, ws.clone(), ledger);
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let deadline = clock::monotonic() + Duration::from_secs(180);
         let (mut moved, mut trusted) = (false, false);
         let transcript = loop {
             std::thread::sleep(Duration::from_millis(500));
             let live = live.lock().unwrap();
-            if Instant::now() >= deadline {
+            if clock::monotonic() >= deadline {
                 for (meta, bytes) in live.sources.values() {
                     let text = String::from_utf8_lossy(bytes);
                     let tail: String = text
@@ -1615,12 +1615,15 @@ mod tests {
             }
         };
         running.cancel();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = clock::monotonic() + Duration::from_secs(30);
         let outcome = loop {
             if let Some(outcome) = live.lock().unwrap().finished.clone() {
                 break outcome;
             }
-            assert!(Instant::now() < deadline, "did not exit after the cancel");
+            assert!(
+                clock::monotonic() < deadline,
+                "did not exit after the cancel"
+            );
             std::thread::sleep(Duration::from_millis(200));
         };
         let files: Vec<String> = live
