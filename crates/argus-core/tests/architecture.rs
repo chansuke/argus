@@ -2,7 +2,7 @@
 //! which modules must stay pure. A module may use only modules in earlier layers, so
 //! the graph has no cycles and a change low in the stack never needs one high up.
 //! Test code (`#[cfg(test)]` items) is not checked: it may reach anything to set up a
-//! case.
+//! case. It also checks the crate graph of the workspace in Cargo.lock.
 //!
 //! See docs/design/RATIONALE.md ("Shape") for what each module is for.
 
@@ -30,6 +30,22 @@ const LAYERS: &[&[&str]] = &[
     &["codec"],
     &["ledger"],
     &["store"],
+];
+
+/// Which workspace crates each crate may depend on (normal, dev, or build). The
+/// workspace is std-only; argus-app, which needs Tauri, is outside it.
+const CRATE_DEPS: &[(&str, &[&str])] = &[
+    ("argus-log", &[]),
+    ("argus-json", &[]),
+    ("argus-core", &["argus-log", "argus-json"]),
+    // View models are presentation shapes, not domain types.
+    ("argus-api", &["argus-json"]),
+    (
+        "argus-host",
+        &["argus-log", "argus-json", "argus-core", "argus-api"],
+    ),
+    // The CLI is a client of the API like the app and the phone; it never opens a ledger.
+    ("argus-cli", &["argus-json", "argus-api"]),
 ];
 
 /// Modules that are pure functions of their inputs: replay must equal live, so they
@@ -131,6 +147,45 @@ fn pure_modules_do_no_io_and_read_no_clock() {
 }
 
 #[test]
+fn workspace_crates_depend_only_on_allowed_crates() {
+    let lock_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let problems = check_lock(&lock, CRATE_DEPS);
+    assert!(
+        problems.is_empty(),
+        "Cargo.lock breaks the crate graph (CRATE_DEPS in crates/argus-core/tests/architecture.rs):\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+#[test]
+fn the_lock_check_names_third_party_crates_and_unlisted_edges() {
+    let lock = r#"
+[[package]]
+name = "argus-cli"
+version = "0.0.0"
+dependencies = [
+ "argus-core",
+ "serde",
+]
+
+[[package]]
+name = "argus-core"
+version = "0.0.0"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+    let problems = check_lock(lock, &[("argus-cli", &[]), ("argus-core", &[])]);
+    assert_eq!(problems.len(), 3, "{problems:#?}");
+    assert!(problems[0].starts_with("argus-cli depends on argus-core"));
+    assert!(problems[1].starts_with("argus-cli depends on third-party crate serde"));
+    assert!(problems[2].starts_with("third-party crate serde is in Cargo.lock"));
+}
+
+#[test]
 fn the_scanner_skips_tests_and_comments_and_reads_full_paths() {
     let text = "\
 use crate::ids::JobId;
@@ -155,6 +210,73 @@ fn g(_: crate::plan::CommandSpec) {}
     assert!(contains_word("let t = Instant::now();", "Instant"));
     assert!(!contains_word("struct InstantReply;", "Instant"));
     assert!(contains_word("use std::fs::File;", "std::fs"));
+}
+
+/// Each broken rule in a Cargo.lock, with the fix.
+fn check_lock(lock: &str, allowed: &[(&str, &[&str])]) -> Vec<String> {
+    let mut packages: Vec<(String, bool, Vec<String>)> = Vec::new();
+    let mut in_deps = false;
+    for line in lock.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            packages.push((String::new(), false, Vec::new()));
+            in_deps = false;
+        } else if let Some(package) = packages.last_mut() {
+            if let Some(name) = line.strip_prefix("name = ") {
+                package.0 = name.trim_matches('"').to_string();
+            } else if line.starts_with("source = ") {
+                package.1 = true;
+            } else if line == "dependencies = [" {
+                in_deps = true;
+            } else if in_deps && line == "]" {
+                in_deps = false;
+            } else if in_deps {
+                let dep = line.trim_end_matches(',').trim_matches('"');
+                let dep = dep.split(' ').next().unwrap_or(dep);
+                package.2.push(dep.to_string());
+            }
+        }
+    }
+    let third_party: Vec<&str> = packages
+        .iter()
+        .filter(|p| p.1)
+        .map(|p| p.0.as_str())
+        .collect();
+    let mut problems = Vec::new();
+    for (name, _, deps) in &packages {
+        let Some((_, ok)) = allowed.iter().find(|(crate_name, _)| crate_name == name) else {
+            continue;
+        };
+        for dep in deps {
+            if third_party.contains(&dep.as_str()) {
+                problems.push(format!(
+                    "{name} depends on third-party crate {dep}. The workspace is std-only: \
+                     write the part you need, or put code that needs {dep} in argus-app."
+                ));
+            } else if !ok.contains(&dep.as_str()) {
+                problems.push(format!(
+                    "{name} depends on {dep}, which CRATE_DEPS does not allow. \
+                     Reach it through a crate {name} may use (argus-cli and the apps call argus-api), \
+                     or move the shared part down into argus-json or argus-log."
+                ));
+            }
+        }
+    }
+    for dep in third_party {
+        problems.push(format!(
+            "third-party crate {dep} is in Cargo.lock. Remove it from the workspace members; \
+             only argus-app (outside the workspace) may use crates.io."
+        ));
+    }
+    for (name, _, _) in &packages {
+        let listed = allowed.iter().any(|(crate_name, _)| crate_name == name);
+        if !listed && name.starts_with("argus-") {
+            problems.push(format!(
+                "{name} is not in CRATE_DEPS. Add it with the crates it may depend on."
+            ));
+        }
+    }
+    problems
 }
 
 fn src_dir() -> PathBuf {
