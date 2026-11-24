@@ -79,8 +79,10 @@ pub(crate) const GRACE: Duration = Duration::from_secs(10);
 ///   its `watch` files followed and its artifact directory collected afterwards.
 /// - `Snapshot`: `git::snapshot` of the worktree.
 /// - `Import`: the file streamed through its kind's framer, as one source.
-/// - Leased (device checks), `Merge`, and `WriteSkill` are not written yet: they finish
-///   as `Failed`, so nothing waits on them forever.
+/// - `Merge`: `git::merge` of the approved snapshot into the target branch.
+/// - `WriteSkill`: the skill's `SKILL.md` under its target directory.
+/// - Leased (device checks) are not written yet: they finish as `Failed`, so nothing
+///   waits on them forever.
 pub(crate) fn start(inv: Invocation, env: PlanEnv, ws: Workspace, ledger: Sender<Cmd>) -> Running {
     let (cancel, cancelled) = mpsc::channel();
     let (input, typed) = mpsc::channel();
@@ -138,10 +140,31 @@ fn execute(
                 Err(reason) => failed(reason),
             }
         }
-        Invocation::InProcess(Effect::WriteSkill(_)) => {
-            failed("writing skills is not supported yet".into())
-        }
+        Invocation::InProcess(Effect::WriteSkill(draft)) => match write_skill(&draft) {
+            Ok(path) => RunOutcome::SkillWritten { path },
+            Err(reason) => failed(reason),
+        },
     }
+}
+
+/// `<target>/<name>/SKILL.md`: frontmatter (the description as a JSON string, which is
+/// also a YAML double-quoted scalar) and the body. Written beside and renamed over, so a
+/// reader never sees half a skill; the same draft again writes the same bytes.
+fn write_skill(draft: &argus_core::event::SkillDraft) -> Result<PathBuf, String> {
+    let dir = draft.target.join(draft.name.as_str());
+    let path = dir.join("SKILL.md");
+    let text = format!(
+        "---\nname: {}\ndescription: {}\n---\n\n{}",
+        draft.name.as_str(),
+        argus_json::write(&argus_json::Json::str(&draft.description)),
+        draft.body
+    );
+    let fail = |e: std::io::Error| format!("{}: {e}", dir.display());
+    std::fs::create_dir_all(&dir).map_err(fail)?;
+    let temp = dir.join(".SKILL.md.argus-tmp");
+    std::fs::write(&temp, text).map_err(fail)?;
+    std::fs::rename(&temp, &path).map_err(fail)?;
+    Ok(path)
 }
 
 fn run_process(
@@ -1032,6 +1055,64 @@ mod tests {
                 reason: "no branch release".into()
             }
         );
+    }
+
+    #[test]
+    fn a_skill_write_puts_the_skill_file_in_its_target_and_can_be_repeated() {
+        use argus_core::event::SkillDraft;
+        use argus_core::ids::SkillName;
+        let dir = scratch_dir("skill");
+        let target = dir.join("skills");
+        let draft = SkillDraft {
+            from: None,
+            name: SkillName::parse("run-fmt-first").unwrap(),
+            description: "Use before tests: fmt fails \"often\".".into(),
+            body: "Run `cargo fmt` before `cargo test`.\n".into(),
+            target: target.clone(),
+        };
+        let path = target.join("run-fmt-first").join("SKILL.md");
+        let want = "---\nname: run-fmt-first\ndescription: \"Use before tests: fmt fails \\\"often\\\".\"\n---\n\nRun `cargo fmt` before `cargo test`.\n";
+        for _ in 0..2 {
+            let got = run_to_end(
+                Invocation::InProcess(Effect::WriteSkill(draft.clone())),
+                workspace(&dir),
+            );
+            assert_eq!(
+                finished(&got),
+                RunOutcome::SkillWritten { path: path.clone() }
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, ["SKILL.md"]);
+    }
+
+    #[test]
+    fn a_skill_write_that_cannot_happen_fails_with_its_reason() {
+        use argus_core::event::SkillDraft;
+        use argus_core::ids::SkillName;
+        let dir = scratch_dir("skill-blocked");
+        // A file where the target directory should be.
+        std::fs::write(dir.join("skills"), "").unwrap();
+        let draft = SkillDraft {
+            from: None,
+            name: SkillName::parse("x").unwrap(),
+            description: String::new(),
+            body: "b".into(),
+            target: dir.join("skills"),
+        };
+        let got = run_to_end(
+            Invocation::InProcess(Effect::WriteSkill(draft)),
+            workspace(&dir),
+        );
+        let RunOutcome::Failed { reason } = finished(&got) else {
+            panic!("{:?}", finished(&got))
+        };
+        let target = dir.join("skills").display().to_string();
+        assert!(reason.contains(&target), "{reason}");
     }
 
     #[test]
