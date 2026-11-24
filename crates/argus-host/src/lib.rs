@@ -354,7 +354,7 @@ impl Host {
         )
     }
 
-    /// Stops the pulse first (its evaluations read the ledgers), then every job's loop.
+    /// Stops the pulse first (its evaluations read the ledgers), then every ledger's loop.
     /// Runs still executing are stopped with them (a dropped `Running` is a cancel), and
     /// the next start abandons or retries them.
     pub fn shutdown(self) {
