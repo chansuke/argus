@@ -693,6 +693,29 @@ mod tests {
         dir
     }
 
+    /// A FIFO that a test script writes to once it is ready (its traps installed).
+    /// `wait` blocks until then, so a cancel or a drop never races the script's start.
+    struct Ready(PathBuf);
+
+    impl Ready {
+        fn new(name: &str) -> Self {
+            let path = scratch_dir(name).join("ready");
+            std::fs::remove_file(&path).ok();
+            let made = Command::new("mkfifo").arg(&path).status().unwrap();
+            assert!(made.success(), "mkfifo {}", path.display());
+            Ready(path)
+        }
+
+        /// The shell command that says the script is ready.
+        fn signal(&self) -> String {
+            format!("echo > '{}'", self.0.display())
+        }
+
+        fn wait(&self) {
+            std::fs::read(&self.0).unwrap();
+        }
+    }
+
     /// Runs `inv` to its end and returns what the ledger received.
     fn run_to_end(inv: Invocation, ws: Workspace) -> Received {
         let (ledger, thread) = fake_ledger();
@@ -708,16 +731,17 @@ mod tests {
     #[test]
     fn a_run_whose_handle_is_dropped_is_stopped() {
         let dir = scratch_dir("dropped");
+        let ready = Ready::new("dropped-ready");
         let (ledger, thread) = fake_ledger();
         let started = clock::monotonic();
         let running = start(
-            Invocation::Process(sh(BUSY)),
+            Invocation::Process(sh(&format!("{}; {BUSY}", ready.signal()))),
             env(),
             workspace(&dir),
             ledger.clone(),
         );
         drop(ledger);
-        std::thread::sleep(Duration::from_millis(200));
+        ready.wait();
         drop(running);
         let got = thread.join().unwrap();
         assert!(
@@ -870,14 +894,15 @@ mod tests {
     #[test]
     fn a_cancelled_run_finishes_as_killed_by_request() {
         let dir = scratch_dir("cancel");
+        let ready = Ready::new("cancel-ready");
         let (ledger, thread) = fake_ledger();
         let running = start(
-            Invocation::Process(sh(BUSY)),
+            Invocation::Process(sh(&format!("{}; {BUSY}", ready.signal()))),
             env(),
             workspace(&dir),
             ledger.clone(),
         );
-        std::thread::sleep(Duration::from_millis(200));
+        ready.wait();
         running.cancel();
         drop(ledger);
         let got = thread.join().unwrap();
@@ -1243,10 +1268,14 @@ mod tests {
 
     #[test]
     fn a_cancel_asks_the_process_to_exit_first() {
-        let spec = sh(&format!("trap 'echo bye; exit 0' TERM; {BUSY}"));
+        let ready = Ready::new("exit-first");
+        let spec = sh(&format!(
+            "trap 'echo bye; exit 0' TERM; {}; {BUSY}",
+            ready.signal()
+        ));
         let (cancel, mut control) = control(Duration::from_secs(5));
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            ready.wait();
             cancel.send(()).unwrap();
         });
         let started = clock::monotonic();
@@ -1267,11 +1296,15 @@ mod tests {
 
     #[test]
     fn a_cancel_reaches_a_program_on_a_terminal() {
-        let mut spec = sh(&format!("trap 'echo bye; exit 0' TERM; {BUSY}"));
+        let ready = Ready::new("pty-cancel");
+        let mut spec = sh(&format!(
+            "trap 'echo bye; exit 0' TERM; {}; {BUSY}",
+            ready.signal()
+        ));
         spec.terminal = true;
         let (cancel, mut control) = control(Duration::from_secs(5));
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            ready.wait();
             cancel.send(()).unwrap();
         });
         let started = clock::monotonic();
@@ -1292,10 +1325,14 @@ mod tests {
     /// The grace is for cleaning up: a process that takes a while to exit gets it.
     #[test]
     fn a_process_that_takes_a_moment_to_exit_is_given_the_grace() {
-        let spec = sh(&format!("trap 'sleep 0.3; echo bye; exit 0' TERM; {BUSY}"));
+        let ready = Ready::new("grace");
+        let spec = sh(&format!(
+            "trap 'sleep 0.3; echo bye; exit 0' TERM; {}; {BUSY}",
+            ready.signal()
+        ));
         let (cancel, mut control) = control(Duration::from_secs(5));
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            ready.wait();
             cancel.send(()).unwrap();
         });
         let (ended, got) = capture_with(&spec, Path::new("/"), &mut control);
@@ -1317,11 +1354,12 @@ mod tests {
 
     #[test]
     fn a_process_that_ignores_the_request_is_killed_after_the_grace() {
-        let spec = sh(&format!("trap '' TERM; {BUSY}"));
+        let ready = Ready::new("ignores");
+        let spec = sh(&format!("trap '' TERM; {}; {BUSY}", ready.signal()));
         let (cancel, mut control) = control(Duration::from_millis(300));
         // After the shell installed its trap: a signal before that would end it at once.
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            ready.wait();
             cancel.send(()).unwrap();
         });
         let started = clock::monotonic();
