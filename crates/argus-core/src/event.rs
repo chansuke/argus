@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::diff::HunkAnchor;
+use crate::diff::{Hunk, HunkAnchor};
 use crate::ids::*;
 use crate::models::{AgentCli, ModelChoice, ModelSet};
 use crate::period::Period;
@@ -566,14 +566,6 @@ pub struct FileState {
     /// `None`: deleted in this tree.
     pub blob: Option<GitOid>,
     pub hunks: Vec<HunkAnchor>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Hunk {
-    pub old_start: u32,
-    pub old_len: u32,
-    pub new_start: u32,
-    pub new_len: u32,
 }
 
 /// What a review thread is about.

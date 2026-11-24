@@ -530,7 +530,7 @@ impl ReviewBoard {
 
 /// Carries an inclusive line range of the old file through one file's hunks (old-side
 /// numbers, ascending). `None` when a hunk overlaps the range, or inserts inside it.
-fn shift((start, end): (i64, i64), hunks: &[crate::event::Hunk]) -> Option<(i64, i64)> {
+fn shift((start, end): (i64, i64), hunks: &[crate::diff::Hunk]) -> Option<(i64, i64)> {
     let mut offset = 0i64;
     for h in hunks {
         let (old_start, old_len) = (i64::from(h.old_start), i64::from(h.old_len));
@@ -596,7 +596,7 @@ impl Projection for ReviewBoard {
 #[cfg(test)]
 mod tests {
     use super::shift;
-    use crate::event::Hunk;
+    use crate::diff::Hunk;
 
     fn hunk(old_start: u32, old_len: u32, new_len: u32) -> Hunk {
         Hunk {

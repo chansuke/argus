@@ -690,7 +690,7 @@ mod tests {
             .iter()
             .map(|d| (d.path.as_str(), d.hunks.clone()))
             .collect();
-        let inserted_on_top = argus_core::event::Hunk {
+        let inserted_on_top = argus_core::diff::Hunk {
             old_start: 0,
             old_len: 0,
             new_start: 1,

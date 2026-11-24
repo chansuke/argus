@@ -1,9 +1,10 @@
 //! The review board: which snapshot is the head, what an approval covers, what AI review
 //! found, and what a `RequestChanges` decision sends the agent.
 
+use argus_core::diff::Hunk;
 use argus_core::event::{
-    Anchor, Author, Decision, Event, FileDelta, Hunk, ReviewLens, ReviewSpec, RunOutcome,
-    RunPurpose, Snapshot,
+    Anchor, Author, Decision, Event, FileDelta, ReviewLens, ReviewSpec, RunOutcome, RunPurpose,
+    Snapshot,
 };
 use argus_core::ids::{
     Attempt, CommentId, DecisionId, FindingId, GitOid, Id128, LineRange, RepoPath, Stamp, ThreadId,

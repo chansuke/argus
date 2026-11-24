@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use argus_json::{Json, JsonError, Number};
 
-use crate::diff::HunkAnchor;
+use crate::diff::{Hunk, HunkAnchor};
 use crate::event::*;
 use crate::ids::*;
 use crate::ledger::ActorHeader;
@@ -710,7 +710,7 @@ mod tests {
                 delta: vec![FileDelta {
                     path: path("a.rs"),
                     renamed_from: Some(path("b.rs")),
-                    hunks: vec![Hunk {
+                    hunks: vec![crate::diff::Hunk {
                         old_start: 1,
                         old_len: 0,
                         new_start: 1,
