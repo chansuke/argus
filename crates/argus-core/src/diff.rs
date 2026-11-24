@@ -8,8 +8,16 @@
 //!   their numbers. A hunk that survives untouched into a later snapshot keeps its anchor
 //!   when lines above it shift, which is how "already seen in a decided snapshot" works.
 
-use crate::event::Hunk;
 use crate::ids::{CommitOid, LineRange, RepoPath, TreeOid};
+
+/// One hunk header of a unified diff: where the change sits in the old and new file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Hunk {
+    pub old_start: u32,
+    pub old_len: u32,
+    pub new_start: u32,
+    pub new_len: u32,
+}
 
 /// FNV-1a/64 of `line.trim()`.
 pub fn line_hash(line: &str) -> u64 {

@@ -1,8 +1,8 @@
 //! The unified-diff parser and the hunk anchor, on real `git diff` output (a modified
 //! file, a new file, a deleted file, a binary file, and a file without a final newline).
 
+use argus_core::diff::Hunk;
 use argus_core::diff::{DiffHunk, line_hash, parse_unified};
-use argus_core::event::Hunk;
 use argus_core::ids::LineRange;
 
 fn head_diff() -> Vec<DiffHunk> {

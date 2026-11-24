@@ -49,7 +49,6 @@ const KNOWN: &[(&str, &str)] = &[
     ("adapters/tlc.rs", "crate::plan"),
     ("adapters/tlc.rs", "crate::views::checks::CheckVerdict"),
     ("codec.rs", "crate::ledger::ActorHeader"),
-    ("diff.rs", "crate::event::Hunk"),
     ("event.rs", "crate::adapters::llm::review_prompt"),
     ("event.rs", "crate::codec"),
     ("source.rs", "crate::adapters"),
