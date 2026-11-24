@@ -18,8 +18,8 @@ use crate::ids::*;
 use crate::ledger::ActorHeader;
 use crate::models::{AgentCli, Effort, ModelChoice};
 use crate::period::Period;
+use crate::period::{BucketWidth, Window};
 use crate::source::{SourceKind, SourceMeta, SourceOrigin};
-use crate::views::timeline::{BucketWidth, Window};
 
 pub(crate) fn encode_header(header: &ActorHeader) -> Vec<u8> {
     argus_json::write(&header.to_json()).into_bytes()
@@ -553,7 +553,7 @@ mod tests {
     use crate::ids::*;
     use crate::models::{AgentCli, Effort, ModelChoice};
     use crate::period::Period;
-    use crate::views::timeline::{BucketWidth, Window};
+    use crate::period::{BucketWidth, Window};
 
     fn id(n: u128) -> Id128 {
         Id128(n)

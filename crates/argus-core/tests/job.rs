@@ -869,8 +869,8 @@ fn a_finding_on_a_changed_file_is_not_carried_forward() {
 
 use argus_core::event::{CheckRequest, CheckSpec, LeanMode, TlaEngine};
 use argus_core::models::ModelSet;
+use argus_core::period::BucketWidth;
 use argus_core::policy::{PolicyConfig, decide};
-use argus_core::views::timeline::BucketWidth;
 
 impl Job {
     /// Decides, submits what was decided, and returns it.

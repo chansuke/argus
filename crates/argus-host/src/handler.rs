@@ -23,9 +23,9 @@ use argus_core::ledger::{JobLedger, LedgerError, Submitted};
 use argus_core::models::AgentCli;
 use argus_core::models::{self, ModelChoice, ModelSet, PresetName, ReviewerChoice, UnknownPreset};
 use argus_core::period::Period;
+use argus_core::period::{BucketWidth, Window};
 use argus_core::source::{PlanStatus, SourceKind, SourceMeta, SourceOrigin};
 use argus_core::views::packet::{self, PacketConfig};
-use argus_core::views::timeline::{BucketWidth, Window};
 use argus_core::views::{
     GateState, MetaViews, checks, glance, insights, progress, review, stats, timeline,
 };

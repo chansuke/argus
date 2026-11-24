@@ -6,9 +6,10 @@ use argus_json::Json;
 
 use crate::ids::{CommitOid, LineRange, RepoPath, SkillName, UnixMillis};
 use crate::models::{AgentCli, Effort};
+use crate::period::Window;
 use crate::plan::{CommandSpec, PlanEnv, Workdir};
 use crate::source::SourceKind;
-use crate::views::timeline::{Item, ItemKind, Lane, Window};
+use crate::views::timeline::{Item, ItemKind, Lane};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolAccess {
@@ -576,7 +577,8 @@ mod tests {
     #[test]
     fn a_summary_prompt_says_which_tool_calls_failed() {
         use crate::ids::{RunId, ToolName};
-        use crate::views::timeline::{BucketWidth, Item, ItemKind, Lane, Window};
+        use crate::period::{BucketWidth, Window};
+        use crate::views::timeline::{Item, ItemKind, Lane};
         let call = |ok| Item {
             lane: Lane::Agent(RunId(crate::ids::Id128(1))),
             kind: ItemKind::ToolCall {
