@@ -4,7 +4,7 @@ Reviewers (human or AI) read this file from the base branch.
 
 Tag each finding Important, Nit, or Pre-existing. Do not hold pre-existing issues against the change.
 
-Check these when the diff touches the trigger:
+Check these when the diff touches the trigger. Rules a check already enforces (no `HashMap`/`HashSet`, no sleep in added lines, no `#[ignore]` without a reason) are not repeated here; see clippy.toml and scripts/check-escape-hatches.sh. `scripts/verify` lists the matching items of docs/verification.md.
 
 | Trigger in the diff | Check |
 | --- | --- |
@@ -14,5 +14,4 @@ Check these when the diff touches the trigger:
 | Cursor, dedup, or replay code in argus-log / argus-core | Replaying applied frames is a no-op (`proofs/ArgusProofs/Replay.lean`). Property tests cover crash-at-any-byte. |
 | A decoder or adapter for agent output | Raw bytes stay stored verbatim. Unknown input decodes to `Unrecognized`, never to nothing. |
 | The op list or a view model | Generated TS is regenerated. No domain type leaks onto the wire. |
-| `HashMap` / `HashSet` | Not allowed (iteration order leaks into views); use `BTreeMap` / `BTreeSet`. |
-| A test that sleeps, retries, or is skipped | Not allowed. Find the cause. |
+| A test that retries until it passes, or is skipped | Not allowed. Find the cause. |
