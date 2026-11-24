@@ -701,7 +701,7 @@ mod tests {
         fn new(name: &str) -> Self {
             let path = scratch_dir(name).join("ready");
             std::fs::remove_file(&path).ok();
-            let made = Command::new("mkfifo").arg(&path).status().unwrap();
+            let made = crate::proc::command("mkfifo").arg(&path).status().unwrap();
             assert!(made.success(), "mkfifo {}", path.display());
             Ready(path)
         }
