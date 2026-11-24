@@ -168,47 +168,83 @@ pub(crate) fn watch(
     every: Duration,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut tailers: BTreeMap<PathBuf, (SourceId, Tailer)> = BTreeMap::new();
+        let mut watcher = Watcher::new(specs, home, run, attempt, ledger);
         loop {
-            // Read before the poll, so a stop set during it still gets one more pass.
+            // Read before the pass, so a stop set during it still gets one more pass.
             let stopping = stop.load(Ordering::SeqCst);
-            for spec in &specs {
-                for path in expand(&home, &spec.pattern) {
-                    if tailers.contains_key(&path) {
-                        continue;
-                    }
-                    let origin = SourceOrigin::File(path.clone());
-                    let meta = SourceMeta {
-                        id: SourceMeta::derive_id(run, attempt, &origin),
-                        run,
-                        attempt,
-                        kind: spec.kind,
-                        origin,
-                    };
-                    // Without the ledger there is nowhere to store frames: try again later.
-                    let Ok(cursor) = ledger_thread::open_source(&ledger, meta) else {
-                        continue;
-                    };
-                    let tailer = Tailer::new(path.clone(), &cursor);
-                    tailers.insert(path, (cursor.meta.id, tailer));
-                }
-            }
-            for (id, tailer) in tailers.values_mut() {
-                let frames = match stopping {
-                    true => tailer.finish(),
-                    false => tailer.poll(),
-                };
-                // An unreadable file is retried on the next poll.
-                if let Ok(frames) = frames {
-                    ledger_thread::observe(&ledger, *id, frames);
-                }
-            }
+            watcher.pass(stopping);
             if stopping {
                 return;
             }
             std::thread::sleep(every);
         }
     })
+}
+
+/// The state of `watch` between passes: the files found so far and their tailers.
+struct Watcher {
+    specs: Vec<WatchSpec>,
+    home: PathBuf,
+    run: RunId,
+    attempt: Attempt,
+    ledger: Sender<Cmd>,
+    tailers: BTreeMap<PathBuf, (SourceId, Tailer)>,
+}
+
+impl Watcher {
+    fn new(
+        specs: Vec<WatchSpec>,
+        home: PathBuf,
+        run: RunId,
+        attempt: Attempt,
+        ledger: Sender<Cmd>,
+    ) -> Self {
+        Watcher {
+            specs,
+            home,
+            run,
+            attempt,
+            ledger,
+            tailers: BTreeMap::new(),
+        }
+    }
+
+    /// Opens sources for new matches and stores what each file gained. The last pass
+    /// (`stopping`) also stores each held-back tail.
+    fn pass(&mut self, stopping: bool) {
+        let (run, attempt) = (self.run, self.attempt);
+        for spec in &self.specs {
+            for path in expand(&self.home, &spec.pattern) {
+                if self.tailers.contains_key(&path) {
+                    continue;
+                }
+                let origin = SourceOrigin::File(path.clone());
+                let meta = SourceMeta {
+                    id: SourceMeta::derive_id(run, attempt, &origin),
+                    run,
+                    attempt,
+                    kind: spec.kind,
+                    origin,
+                };
+                // Without the ledger there is nowhere to store frames: try again later.
+                let Ok(cursor) = ledger_thread::open_source(&self.ledger, meta) else {
+                    continue;
+                };
+                let tailer = Tailer::new(path.clone(), &cursor);
+                self.tailers.insert(path, (cursor.meta.id, tailer));
+            }
+        }
+        for (id, tailer) in self.tailers.values_mut() {
+            let frames = match stopping {
+                true => tailer.finish(),
+                false => tailer.poll(),
+            };
+            // An unreadable file is retried on the next poll.
+            if let Ok(frames) = frames {
+                ledger_thread::observe(&self.ledger, *id, frames);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -415,7 +451,6 @@ mod tests {
 #[cfg(test)]
 mod watch_tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     use argus_core::ids::Id128;
     use argus_core::source::{SourceKind, SourceOrigin};
@@ -441,18 +476,9 @@ mod watch_tests {
             },
         ];
         let (ledger, received) = fake_ledger();
-        let stop = Arc::new(AtomicBool::new(false));
         let run = RunId(Id128(5));
-        let thread = watch(
-            specs,
-            home.clone(),
-            run,
-            Attempt(1),
-            ledger.clone(),
-            stop.clone(),
-            Duration::from_millis(10),
-        );
-        std::thread::sleep(Duration::from_millis(50));
+        let mut watcher = Watcher::new(specs, home.clone(), run, Attempt(1), ledger.clone());
+        watcher.pass(false);
         std::fs::create_dir_all(sub.parent().unwrap()).unwrap();
         std::fs::write(&sub, "s\n").unwrap();
         let mut f = std::fs::OpenOptions::new()
@@ -460,9 +486,9 @@ mod watch_tests {
             .open(&main)
             .unwrap();
         std::io::Write::write_all(&mut f, b"tail").unwrap();
-        std::thread::sleep(Duration::from_millis(50));
-        stop.store(true, Ordering::SeqCst);
-        thread.join().unwrap();
+        watcher.pass(false);
+        watcher.pass(true);
+        drop(watcher);
         drop(ledger);
 
         let got = received.join().unwrap();

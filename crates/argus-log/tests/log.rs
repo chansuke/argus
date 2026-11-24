@@ -572,13 +572,13 @@ fn a_torn_header_is_repaired_only_if_it_is_a_prefix_of_ours() {
     ));
 }
 
-/// A lock released a moment ago is taken; one held for good is refused after the wait.
+/// A lock held for good is refused after the wait, and taken once it is released.
 #[test]
 #[expect(
     clippy::disallowed_methods,
     reason = "measures how long open waits for a held lock"
 )]
-fn a_briefly_held_lock_is_waited_for_and_a_held_one_is_refused() {
+fn a_held_lock_is_refused_after_the_wait_and_taken_once_released() {
     let dir = scratch("lock-wait");
     let a = actor("host");
     let (held, _) = LogWriter::open(&dir, &a, HEADER).unwrap();
@@ -594,12 +594,10 @@ fn a_briefly_held_lock_is_waited_for_and_a_held_one_is_refused() {
     );
     assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
 
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        drop(held);
-    });
+    // A lock released during the wait is taken: `a_lock_released_while_waiting_is_taken`
+    // in writer.rs drives that without timing. Once released, it opens at once.
+    drop(held);
     assert!(LogWriter::open(&dir, &a, HEADER).is_ok());
-    release.join().unwrap();
 }
 
 #[test]

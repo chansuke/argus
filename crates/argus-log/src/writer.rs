@@ -154,12 +154,21 @@ const LOCK_WAIT: Duration = Duration::from_millis(200);
 )]
 fn lock(file: &File, path: &Path) -> Result<(), LogError> {
     let deadline = Instant::now() + LOCK_WAIT;
+    lock_retrying(file, path, || {
+        let wait = Instant::now() < deadline;
+        if wait {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        wait
+    })
+}
+
+/// Tries the lock; while it is held, asks `wait` whether to try again.
+fn lock_retrying(file: &File, path: &Path, mut wait: impl FnMut() -> bool) -> Result<(), LogError> {
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(()),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            Err(TryLockError::WouldBlock) if wait() => {}
             Err(TryLockError::WouldBlock) => return Err(LogError::Locked(path.to_path_buf())),
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
@@ -200,4 +209,48 @@ fn create(file: &mut File, head: &[u8], root: &Path) -> Result<u64, LogError> {
     file.sync_all()?;
     File::open(root)?.sync_all()?;
     Ok(head.len() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_file(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("argus-log-lock-{}-{name}", std::process::id()));
+        File::create(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_lock_released_while_waiting_is_taken() {
+        let path = scratch_file("released");
+        let holder = File::open(&path).unwrap();
+        holder.try_lock().unwrap();
+        let mut holder = Some(holder);
+        let mut waits = 0;
+        let taken = lock_retrying(&File::open(&path).unwrap(), &path, || {
+            waits += 1;
+            // The holder closes its log while the opener waits.
+            drop(holder.take());
+            true
+        });
+        assert!(taken.is_ok(), "{taken:?}");
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    fn a_lock_still_held_when_waiting_ends_is_refused() {
+        let path = scratch_file("held");
+        let holder = File::open(&path).unwrap();
+        holder.try_lock().unwrap();
+        let mut waits = 0;
+        let taken = lock_retrying(&File::open(&path).unwrap(), &path, || {
+            waits += 1;
+            waits < 3
+        });
+        assert!(matches!(taken, Err(LogError::Locked(_))), "{taken:?}");
+        assert_eq!(waits, 3);
+        drop(holder);
+    }
 }
