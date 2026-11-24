@@ -10,46 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::event::{Author, Event, RunOutcome, RunPurpose};
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
+use crate::period::{BucketWidth, Window};
 use crate::source::{AgentWhat, LeanSeverity, Observation, SourceFamily, SourceMeta};
 use crate::views::Projection;
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum BucketWidth {
-    M15,
-    H1,
-    H4,
-}
-
-impl BucketWidth {
-    pub fn millis(self) -> i64 {
-        match self {
-            BucketWidth::M15 => 15 * 60 * 1000,
-            BucketWidth::H1 => 60 * 60 * 1000,
-            BucketWidth::H4 => 4 * 60 * 60 * 1000,
-        }
-    }
-}
-
-/// A time window, aligned to its width in UTC.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Window {
-    pub width: BucketWidth,
-    pub start: UnixMillis,
-}
-
-impl Window {
-    /// The window of `width` that holds `at`.
-    pub fn containing(width: BucketWidth, at: UnixMillis) -> Self {
-        let w = width.millis();
-        Window {
-            width,
-            start: UnixMillis(at.0.div_euclid(w) * w),
-        }
-    }
-    pub fn end(&self) -> UnixMillis {
-        UnixMillis(self.start.0 + self.width.millis())
-    }
-}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Lane {

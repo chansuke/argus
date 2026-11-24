@@ -11,7 +11,7 @@ use crate::diff::HunkAnchor;
 use crate::ids::*;
 use crate::models::{AgentCli, ModelChoice, ModelSet};
 use crate::period::Period;
-use crate::views::timeline::Window;
+use crate::period::Window;
 
 /// Who wrote an event. Maps 1:1 to an actor log (`ledger::actor_key`), so each author
 /// has its own single-writer file.

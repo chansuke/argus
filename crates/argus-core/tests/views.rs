@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use argus_core::event::{Author, Event, RunOutcome, RunPurpose, TaskPatch, TaskState};
 use argus_core::ids::{Attempt, Id128, RunId, TaskKey, ToolName, UnixMillis};
 use argus_core::models::AgentCli;
+use argus_core::period::{BucketWidth, Window};
 use argus_core::source::{AgentWhat, Observation, PlanOp, PlanStatus, TokenUsage};
 use argus_core::views::progress::{Activity, PlanNode, Progress, WaitReason};
 use argus_core::views::runs::{Due, MAX_ATTEMPTS, Runs};
-use argus_core::views::timeline::{BucketWidth, ItemKind, Lane, Timeline, Window};
+use argus_core::views::timeline::{ItemKind, Lane, Timeline};
 
 mod common;
 use common::*;

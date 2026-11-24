@@ -434,8 +434,9 @@ fn real_transcripts_replay_equal_to_live() {
 #[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]
 fn real_transcripts_fill_every_job_view() {
     use argus_core::ids::UnixMillis;
+    use argus_core::period::BucketWidth;
     use argus_core::views::progress::PlanNode;
-    use argus_core::views::timeline::{BucketWidth, ItemKind};
+    use argus_core::views::timeline::ItemKind;
 
     let root = std::env::var_os("ARGUS_TRANSCRIPTS").expect("set ARGUS_TRANSCRIPTS");
     let dir = scratch("real-screens");
