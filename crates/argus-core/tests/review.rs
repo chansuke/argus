@@ -11,8 +11,9 @@ use argus_core::ids::{
     TreeOid, UnixMillis,
 };
 use argus_core::source::AgentWhat;
+use argus_core::source::Severity;
 use argus_core::views::GateState;
-use argus_core::views::review::{ReviewBoard, ReviewOutput, Severity, ThreadOrigin};
+use argus_core::views::review::{ReviewBoard, ReviewOutput, ThreadOrigin};
 
 mod common;
 use common::*;

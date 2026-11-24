@@ -12,8 +12,9 @@ use argus_core::event::{
 };
 use argus_core::fact::Fact;
 use argus_core::ids::{Attempt, BlobId, GitOid, Id128, LineRange, RepoPath, RunId, TreeOid};
+use argus_core::source::CheckVerdict;
 use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
-use argus_core::views::checks::{CheckOutput, CheckVerdict, Checks};
+use argus_core::views::checks::{CheckOutput, Checks};
 use argus_core::views::{GateState, Projection, ViewMask, ViewSet, ViewStamp};
 use argus_core::{Ledger, Submitted};
 

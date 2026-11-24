@@ -4,8 +4,8 @@
 use crate::event::{CheckRequest, CheckSpec, TlaEngine};
 use crate::ids::{FactId, RepoPath};
 use crate::plan::{CommandSpec, PlanEnv, Workdir};
+use crate::source::CheckVerdict;
 use crate::source::{Decoded, Observation, SourceKind, TlcMessage};
-use crate::views::checks::CheckVerdict;
 
 pub(crate) const VERSION: u32 = 1;
 

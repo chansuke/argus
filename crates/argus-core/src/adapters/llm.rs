@@ -6,10 +6,8 @@ use argus_json::Json;
 
 use crate::ids::{CommitOid, LineRange, RepoPath, SkillName, UnixMillis};
 use crate::models::{AgentCli, Effort};
-use crate::period::Window;
 use crate::plan::{CommandSpec, PlanEnv, Workdir};
 use crate::source::SourceKind;
-use crate::views::timeline::{Item, ItemKind, Lane};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ToolAccess {
@@ -144,8 +142,8 @@ pub(crate) fn review_prompt(base: &CommitOid, lens: ReviewLens, focus: Option<&s
 /// Findings from the final `Result` text. `None` when the block is missing or malformed:
 /// the review view then keeps the whole answer as `ReviewOutput::Unstructured`, never
 /// dropped. Findings whose location is outside the diff are kept, unlocated.
-pub(crate) fn parse_findings(result_text: &str) -> Option<Vec<crate::views::review::RawFinding>> {
-    use crate::views::review::{RawFinding, Severity};
+pub(crate) fn parse_findings(result_text: &str) -> Option<Vec<crate::source::RawFinding>> {
+    use crate::source::{RawFinding, Severity};
     let block = last_json_block(result_text)?;
     let Json::Arr(items) = argus_json::parse(block.as_bytes()).ok()? else {
         return None;
@@ -187,51 +185,25 @@ fn last_json_block(text: &str) -> Option<&str> {
     Some(&body[..close])
 }
 
-/// The prompt of a `Summarize` run: the window's items, one line each, oldest first.
-pub(crate) fn summary_prompt<'a>(
-    window: &Window,
-    items: impl Iterator<Item = (UnixMillis, &'a Item)>,
-) -> String {
-    let clock = |t: UnixMillis| {
-        let s = t.0.div_euclid(1000).rem_euclid(86_400);
-        format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
-    };
-    let mut out = format!(
-        "Summarize this part of a coding session, {} to {} UTC, in three to five short \
-         sentences for someone who was away: what was done, what failed, and what is \
-         waiting. Use only the events below.\n\nEvents:\n",
-        clock(window.start),
-        clock(window.end()),
-    );
-    for (at, item) in items {
-        let lane = match &item.lane {
-            Lane::Agent(run) => format!("agent {}", short(&run.0)),
-            Lane::Run(run) => format!("run {}", short(&run.0)),
-            Lane::Human => "human".into(),
-            Lane::Host => "host".into(),
-        };
-        let kind = match &item.kind {
-            ItemKind::ToolCall { name, ok } => match ok {
-                Some(false) => format!("tool {} failed", name.0),
-                _ => format!("tool {}", name.0),
-            },
-            other => format!("{other:?}").to_lowercase(),
-        };
-        out.push_str(&format!("{} [{lane}] {kind}: {}\n", clock(at), item.title));
-    }
-    out
-}
-
 /// The first 8 hex digits of an id: enough to tell lanes apart in a prompt.
 fn short(id: &crate::ids::Id128) -> String {
     id.to_string()[..8].to_owned()
 }
 
 /// One job's timeline inside an insight period, oldest first.
-pub(crate) struct InsightSession {
+pub(crate) struct InsightSession<M> {
     pub job: crate::ids::JobId,
     pub title: String,
-    pub items: Vec<(UnixMillis, crate::ids::FactId, Item)>,
+    pub items: Vec<(UnixMillis, crate::ids::FactId, M)>,
+}
+
+/// A moment of a session as an insight prompt shows it. The timeline implements it, so
+/// this adapter only formats lines and never reads a view.
+pub(crate) trait InsightMoment {
+    /// What kind of moment it is (`human typed`, `tool Bash failed`), or `None` when it
+    /// is not worth learning from (replies, thinking, calls that worked).
+    fn lesson(&self) -> Option<String>;
+    fn title(&self) -> &str;
 }
 
 /// Tagged lines in one insight prompt; past this the rest is left out, and the prompt
@@ -247,10 +219,10 @@ const EVIDENCE_INDEX: &str = "argus evidence index (read by argus, not by you):"
 ///
 /// Kept: prompts, what the human typed, failed tool calls, decisions, comments and
 /// bookmarks, findings. Replies, thinking, and calls that worked are left out.
-pub(crate) fn insight_prompt(
+pub(crate) fn insight_prompt<M: InsightMoment>(
     period: &crate::period::Period,
     existing_skills: &[SkillName],
-    sessions: &[InsightSession],
+    sessions: &[InsightSession<M>],
 ) -> String {
     let utc = crate::period::UtcOffset { minutes: 0 };
     let minute = |t: UnixMillis| {
@@ -289,7 +261,7 @@ pub(crate) fn insight_prompt(
         let mut lines = String::new();
         let mut day = String::new();
         for (at, fact, item) in &session.items {
-            let Some(label) = insight_label(&item.kind) else {
+            let Some(label) = item.lesson() else {
                 continue;
             };
             if index.len() == INSIGHT_LINES {
@@ -305,7 +277,7 @@ pub(crate) fn insight_prompt(
                 "[E{}] {} {label}: {}\n",
                 index.len(),
                 minute(*at),
-                printable(&item.title)
+                printable(item.title())
             ));
         }
         if !lines.is_empty() {
@@ -342,21 +314,6 @@ pub(crate) fn insight_prompt(
     out
 }
 
-fn insight_label(kind: &ItemKind) -> Option<String> {
-    Some(match kind {
-        ItemKind::Prompt => "prompt".into(),
-        ItemKind::HumanInput => "human typed".into(),
-        ItemKind::ToolCall {
-            name,
-            ok: Some(false),
-        } => format!("tool {} failed", name.0),
-        ItemKind::Decision => "decision".into(),
-        ItemKind::Comment => "comment".into(),
-        ItemKind::Finding => "finding".into(),
-        _ => return None,
-    })
-}
-
 /// Control characters (a typed Escape, say) shown as escapes, so a line stays one line.
 fn printable(text: &str) -> String {
     text.chars()
@@ -376,9 +333,9 @@ fn printable(text: &str) -> String {
 pub(crate) fn parse_candidates(
     prompt: &str,
     result_text: &str,
-) -> Option<Vec<crate::views::insights::RawCandidate>> {
+) -> Option<Vec<crate::source::RawCandidate>> {
     use crate::ids::{FactId, FactRef, Id128, JobId, LedgerRef};
-    use crate::views::insights::RawCandidate;
+    use crate::source::RawCandidate;
     let index: std::collections::BTreeMap<&str, FactRef> = prompt
         .rfind(EVIDENCE_INDEX)
         .map(|at| &prompt[at + EVIDENCE_INDEX.len()..])
@@ -429,7 +386,7 @@ pub(crate) fn parse_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::review::Severity;
+    use crate::source::Severity;
 
     #[test]
     fn the_example_in_the_review_prompt_is_what_the_parser_reads() {
@@ -443,7 +400,7 @@ mod tests {
         assert_eq!(f.severity, Severity::High);
     }
 
-    fn session() -> InsightSession {
+    fn session() -> InsightSession<crate::views::timeline::Item> {
         use crate::ids::{FactId, Id128, JobId, RunId, ToolName};
         use crate::views::timeline::{Item, ItemKind, Lane};
         let item = |lane, kind, title: &str| Item {
@@ -572,30 +529,5 @@ mod tests {
         ] {
             assert!(parse_candidates(&prompt, bad).is_none(), "{bad}");
         }
-    }
-
-    #[test]
-    fn a_summary_prompt_says_which_tool_calls_failed() {
-        use crate::ids::{RunId, ToolName};
-        use crate::period::{BucketWidth, Window};
-        use crate::views::timeline::{Item, ItemKind, Lane};
-        let call = |ok| Item {
-            lane: Lane::Agent(RunId(crate::ids::Id128(1))),
-            kind: ItemKind::ToolCall {
-                name: ToolName("Bash".into()),
-                ok,
-            },
-            title: "Bash".into(),
-            ended_at: None,
-        };
-        let window = Window {
-            width: BucketWidth::M15,
-            start: UnixMillis(0),
-        };
-        let items = [call(Some(false)), call(Some(true)), call(None)];
-        let prompt = summary_prompt(&window, items.iter().map(|i| (UnixMillis(0), i)));
-        assert_eq!(prompt.matches("tool Bash failed").count(), 1);
-        assert_eq!(prompt.matches("] tool Bash: ").count(), 2);
-        assert!(prompt.contains("00:00:00 to 00:15:00 UTC"), "{prompt}");
     }
 }

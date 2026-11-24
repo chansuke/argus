@@ -736,7 +736,7 @@ fn the_first_round_puts_agreed_findings_first_and_explains_hunks_from_the_transc
     );
     assert_eq!(first.tier, Tier::Blocking);
     assert!(first.signals.contains(&Signal::Finding {
-        severity: argus_core::views::review::Severity::High,
+        severity: argus_core::source::Severity::High,
         agreeing_models: 2
     }));
     assert!(matches!(
@@ -1171,8 +1171,8 @@ fn finding_signals(item: &argus_core::views::packet::AgendaItem<'_>) -> Vec<u16>
 
 #[test]
 fn a_lone_high_finding_is_suspicious_and_two_agreeing_ones_block() {
+    use argus_core::source::Severity;
     use argus_core::views::packet::tier;
-    use argus_core::views::review::Severity;
     let high = |agreeing_models| Signal::Finding {
         severity: Severity::High,
         agreeing_models,
