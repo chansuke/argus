@@ -298,7 +298,7 @@ impl ReviewSpec {
     /// The one way to ask for AI review (human, agent, or policy): one run per model, all
     /// of `tree`. Run ids derive from `request` and the model, so a retried request or a
     /// policy decision made twice yields the same runs. The prompt is built here
-    /// (`adapters::llm::review_prompt`) and stored verbatim; `focus` is free text the
+    /// (`review_prompt`) and stored verbatim; `focus` is free text the
     /// human adds to the lens.
     pub fn panel(
         request: Id128,
@@ -308,7 +308,7 @@ impl ReviewSpec {
         focus: Option<&str>,
         models: &ModelSet,
     ) -> Vec<(RunId, RunPurpose)> {
-        let prompt = crate::adapters::llm::review_prompt(base, lens, focus);
+        let prompt = review_prompt(base, lens, focus);
         models
             .iter()
             .map(|model| {
@@ -739,7 +739,45 @@ impl Event {
     }
 }
 
-/// Stored payload codec (JSON via argus-json; human-inspectable with `argus raw`).
-/// The author is not in the payload: it is the identity of the log the event lives in.
-/// References to frames use `FactId`'s one text form.
-pub(crate) use crate::codec::{decode, encode};
+/// Builds the prompt stored in `ReviewSpec.llm.prompt` (called only by
+/// `ReviewSpec::panel`). The reviewer runs in a checkout of the snapshot and is told the
+/// base commit, so it runs `git diff` itself instead of argus pasting a diff.
+///
+/// Output contract: prose, then one fenced `json` block:
+/// `[{"path","start","end","severity":"high|medium|low|nit","title","body"}]`, read by
+/// `adapters::llm::parse_findings`.
+pub(crate) fn review_prompt(base: &CommitOid, lens: ReviewLens, focus: Option<&str>) -> String {
+    let base = base.as_str();
+    let lens = match lens {
+        ReviewLens::General => "correctness, design, readability, and tests",
+        ReviewLens::Correctness => {
+            "correctness: wrong results, missed edge cases, error handling, and concurrency"
+        }
+        ReviewLens::Security => {
+            "security: injection, leaked secrets, missing authorization, and unchecked input"
+        }
+        ReviewLens::Tests => "tests: missing cases, weak assertions, and tests that cannot fail",
+    };
+    let mut out = format!(
+        "Review the change in this checkout against commit {base}. \
+         Run `git diff {base}` to see it and read any file you need. Do not edit files.\n\n\
+         Look at {lens}.\n"
+    );
+    if let Some(focus) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+        out.push_str(&format!(
+            "The author asks you to look closely at: {focus}\n"
+        ));
+    }
+    out.push_str(
+        "\nWrite your review as prose. End it with exactly one fenced json block that lists \
+         your findings, like this:\n\n\
+         ```json\n\
+         [{\"path\": \"src/lib.rs\", \"start\": 10, \"end\": 12, \"severity\": \"high\", \
+         \"title\": \"one line\", \"body\": \"why it is wrong and what to do\"}]\n\
+         ```\n\n\
+         `severity` is one of high, medium, low, nit. `path` is relative to the repository \
+         root, and lines are in the new version of the file. Use null for path, start, and \
+         end when a finding has no location. Use [] when you find nothing.\n",
+    );
+    out
+}

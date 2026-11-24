@@ -12,7 +12,6 @@
 
 use std::path::PathBuf;
 
-use crate::adapters;
 use crate::ids::*;
 use crate::models::AgentCli;
 
@@ -120,21 +119,6 @@ impl SourceKind {
         }
     }
 
-    /// Bumped whenever the adapter's output changes; part of every checkpoint key, so a
-    /// fixed adapter invalidates exactly the checkpoints built with the old one.
-    pub fn decoder_version(self) -> u32 {
-        match self {
-            SourceKind::ClaudeTranscript
-            | SourceKind::ClaudeStreamJson
-            | SourceKind::ClaudeHook => adapters::claude::VERSION,
-            SourceKind::CodexRollout | SourceKind::CodexExec => adapters::codex::VERSION,
-            SourceKind::TlcTool => adapters::tlc::VERSION,
-            SourceKind::LeanText | SourceKind::LeanJson => adapters::lean::VERSION,
-            SourceKind::EasEvents => adapters::eas::VERSION,
-            SourceKind::Terminal | SourceKind::PlainText => 1,
-        }
-    }
-
     pub fn framer(self, resume_at: u64) -> Framer {
         let framing = match self {
             SourceKind::TlcTool => Framing::TlcMessages,
@@ -148,24 +132,6 @@ impl SourceKind {
             pending: Vec::new(),
             scanned: 0,
             in_block: false,
-        }
-    }
-
-    pub(crate) fn decode(self, bytes: &[u8]) -> Decoded {
-        match self {
-            SourceKind::ClaudeTranscript => adapters::claude::decode_transcript(bytes),
-            SourceKind::ClaudeStreamJson => adapters::claude::decode_stream_json(bytes),
-            SourceKind::ClaudeHook => adapters::claude::decode_hook(bytes),
-            SourceKind::CodexRollout => adapters::codex::decode_rollout(bytes),
-            SourceKind::CodexExec => adapters::codex::decode_exec(bytes),
-            SourceKind::TlcTool => adapters::tlc::decode(bytes),
-            SourceKind::LeanText => adapters::lean::decode_text(bytes),
-            SourceKind::LeanJson => adapters::lean::decode_json(bytes),
-            SourceKind::EasEvents => adapters::eas::decode_events(bytes),
-            SourceKind::Terminal => Decoded::one(Observation::Terminal),
-            SourceKind::PlainText => Decoded::one(Observation::Line(
-                String::from_utf8_lossy(bytes).into_owned(),
-            )),
         }
     }
 }
