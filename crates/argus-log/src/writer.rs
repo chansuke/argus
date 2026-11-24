@@ -148,6 +148,10 @@ const LOCK_WAIT: Duration = Duration::from_millis(200);
 /// Takes the exclusive lock. A process forked by this one holds every descriptor until it
 /// execs, so a lock just released by closing a log can look held for a moment; it is
 /// retried briefly. Another writer holds it for good and still gets `Locked`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the lock retry needs a deadline, and argus-log has no clock to inject"
+)]
 fn lock(file: &File, path: &Path) -> Result<(), LogError> {
     let deadline = Instant::now() + LOCK_WAIT;
     loop {

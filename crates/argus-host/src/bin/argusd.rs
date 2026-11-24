@@ -20,6 +20,10 @@ fn main() -> ExitCode {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the binary reads its environment once, to build the HostConfig"
+)]
 fn run() -> Result<(), String> {
     let defaults = argus_host::Defaults::from_env(|name| {
         std::env::var_os(name).and_then(|v| v.into_string().ok())

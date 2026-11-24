@@ -212,6 +212,10 @@ fn random_value(rng: &mut Rng, depth: u32) -> Json {
 /// `ARGUS_TRANSCRIPTS=~/.claude/projects cargo nextest run -p argus-json --run-ignored all`
 #[test]
 #[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "an opt-in test reads the transcript root from ARGUS_TRANSCRIPTS"
+)]
 fn real_transcript_lines_round_trip_byte_for_byte() {
     let root = std::env::var_os("ARGUS_TRANSCRIPTS").expect("set ARGUS_TRANSCRIPTS");
     let mut files = vec![std::path::PathBuf::from(root)];

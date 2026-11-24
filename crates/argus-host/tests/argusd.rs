@@ -1,4 +1,8 @@
 //! The `argusd` binary: it reads its settings, serves the socket, and refuses bad settings.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an end-to-end test starts the argusd binary and bounds its wait for the socket"
+)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
