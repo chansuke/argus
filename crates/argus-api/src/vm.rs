@@ -15,7 +15,8 @@ vm_struct! { /// No input.
 Empty {} }
 
 vm_struct! { JobRef { job: String } }
-vm_struct! { RunRef { job: String, run: String } }
+vm_struct! { /// `job` is empty for a run on the meta ledger (insights, skill writes).
+RunRef { job: String, run: String } }
 vm_struct! { RunRefs { runs: Vec<RunRef> } }
 vm_struct! { Ack { duplicate: bool } }
 
@@ -171,7 +172,8 @@ vm_struct! { /// `period`: `2026-11`, `2026-11-17`, `last-7d`, ... (parsed by th
 StatsQuery { period: String, group_by: GroupBy } }
 vm_struct! { StatsRow { key: String, runs: u32, prompts: String, tool_calls: String, tool_errors: String, input_tokens: String, output_tokens: String, human_inputs: String } }
 vm_struct! { StatsTable { period_from_ms: i64, period_to_ms: i64, exact: bool, rows: Vec<StatsRow> } }
-vm_struct! { Candidate { id: String, name: String, description: String, why: String, body: String, evidence: Vec<String> } }
+vm_struct! { /// `evidence`: the moments the model cited, each `<job>/<fact>`.
+Candidate { id: String, name: String, description: String, why: String, body: String, evidence: Vec<String> } }
 vm_struct! { Candidates { candidates: Vec<Candidate> } }
 
 // ---- Commands (each carries a client-minted `request_id`: retries are idempotent,
@@ -220,7 +222,8 @@ vm_struct! { /// One tap on an `AwaitingPermission` item (the phone's top queue 
 AnswerPermission { request_id: String, job: String, run: String, answer: PermissionAnswer } }
 vm_struct! { Bookmark { request_id: String, job: String, fact: String, kind: BookmarkKind, note: String } }
 vm_struct! { RequestInsights { request_id: String, period: String, model: ModelPick } }
-vm_struct! { AcceptCandidate { request_id: String, candidate: String, name: String, body: String, target: String } }
+vm_struct! { /// Writes `<target>/<name>/SKILL.md`; `target` is an absolute directory of skills.
+AcceptCandidate { request_id: String, candidate: String, name: String, body: String, target: String } }
 vm_struct! { CandidateRef { candidate: String } }
 vm_struct! { /// A Claude Code hook payload, forwarded verbatim by `argus hook`.
 HookPayload { body: String } }

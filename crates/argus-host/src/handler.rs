@@ -15,7 +15,8 @@ use argus_core::event::{
 };
 use argus_core::ids::{
     BookmarkId, CommentId, CommitOid, DecisionId, FactId, FindingId, GitOid, Id128, InputId, JobId,
-    LineRange, ModelId, RepoPath, RunId, SourceId, TaskKey, ThreadId, TreeOid, UnixMillis,
+    LedgerRef, LineRange, ModelId, RepoPath, RunId, SkillName, SourceId, TaskKey, ThreadId,
+    TreeOid, UnixMillis,
 };
 use argus_core::ledger::Reading;
 use argus_core::ledger::{JobLedger, LedgerError, Submitted};
@@ -25,11 +26,13 @@ use argus_core::period::Period;
 use argus_core::source::{PlanStatus, SourceKind, SourceMeta, SourceOrigin};
 use argus_core::views::packet::{self, PacketConfig};
 use argus_core::views::timeline::{BucketWidth, Window};
-use argus_core::views::{GateState, checks, glance, progress, review, stats, timeline};
+use argus_core::views::{
+    GateState, MetaViews, checks, glance, insights, progress, review, stats, timeline,
+};
 use argus_json::Json;
 use argus_log::{EventId, Seq};
 
-use crate::ledger_thread::LedgerHandle;
+use crate::ledger_thread::{LedgerHandle, LoopViews};
 use crate::pulse::Dep;
 use crate::{HostInner, git};
 
@@ -566,12 +569,75 @@ impl ApiHandler<'_> {
         Ok((job, handle))
     }
 
-    fn submit(&self, handle: &LedgerHandle, author: Author, event: Event) -> Result<Ack, ApiError> {
+    fn meta_handle(&self) -> Result<LedgerHandle<MetaViews>, ApiError> {
+        self.host.meta().ok_or_else(|| ApiError::Internal {
+            what: "the meta ledger is not open".into(),
+        })
+    }
+
+    /// The candidate and whether it can still be accepted by a write with id `by`: it is
+    /// proposed, or `by` already accepted it (a retried request).
+    fn candidate(
+        &mut self,
+        meta: &LedgerHandle<MetaViews>,
+        text: &str,
+        by: Option<RunId>,
+    ) -> Result<(FindingId, insights::RawCandidate), ApiError> {
+        let id = FindingId::parse(text).ok_or_else(|| ApiError::BadInput {
+            path: "candidate".into(),
+            what: format!("not a candidate id: {text:?}"),
+        })?;
+        let key = id.clone();
+        let found = meta.read(&mut self.deps, move |l| {
+            l.views().insights().get(&key).map(|c| {
+                let open = match &c.status {
+                    insights::CandidateStatus::Proposed => true,
+                    insights::CandidateStatus::Accepted { run, .. } => Some(*run) == by,
+                    _ => false,
+                };
+                (c.raw.clone(), open)
+            })
+        });
+        match found {
+            None => Err(ApiError::NotFound {
+                what: format!("candidate {text}"),
+            }),
+            Some((_, false)) => Err(ApiError::Rejected {
+                what: format!("candidate {text} was already dismissed or written"),
+            }),
+            Some((raw, true)) => Ok((id, raw)),
+        }
+    }
+
+    fn submit<V: LoopViews>(
+        &self,
+        handle: &LedgerHandle<V>,
+        author: Author,
+        event: Event,
+    ) -> Result<Ack, ApiError> {
         match handle.submit(author, event).map_err(ledger_error)? {
             Submitted::Appended(_) => Ok(Ack { duplicate: false }),
             Submitted::Duplicate(_) => Ok(Ack { duplicate: true }),
         }
     }
+}
+
+/// Skill names under each directory (`<dir>/<name>/`), sorted and without repeats. A
+/// directory that cannot be read lists nothing.
+fn existing_skills(dirs: &[PathBuf]) -> Vec<SkillName> {
+    let mut names: Vec<SkillName> = dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.path().is_dir().then_some(())?;
+            SkillName::parse(entry.file_name().to_str()?)
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The head snapshot's tree and base, for a run that looks at the head.
@@ -1619,27 +1685,115 @@ impl Handler for ApiHandler<'_> {
             rows,
         })
     }
+    /// Proposed candidates, oldest answer first. Evidence reads `<job>/<fact>`.
     fn candidates(&mut self, caller: &Caller, input: Empty) -> Result<Candidates, ApiError> {
-        todo!("not implemented")
+        let meta = self.meta_handle()?;
+        let candidates = meta.read(&mut self.deps, |l| {
+            l.views()
+                .insights()
+                .open()
+                .map(|c| Candidate {
+                    id: c.id.to_string(),
+                    name: c.raw.name.clone(),
+                    description: c.raw.description.clone(),
+                    why: c.raw.why.clone(),
+                    body: c.raw.body.clone(),
+                    evidence: c
+                        .raw
+                        .evidence
+                        .iter()
+                        .map(|e| match &e.ledger {
+                            LedgerRef::Job(job) => format!("{}/{}", job.0, e.fact),
+                            LedgerRef::Meta => format!("meta/{}", e.fact),
+                        })
+                        .collect(),
+                })
+                .collect()
+        });
+        Ok(Candidates { candidates })
     }
+    /// The prompt is built now, from every job's moments in the period, and stored in the
+    /// request verbatim; a retry with the same request id asks nothing new.
     fn request_insights(
         &mut self,
         caller: &Caller,
         input: RequestInsights,
     ) -> Result<RunRef, ApiError> {
-        // TODO: prompt = store.insight_prompt(period, existing skills) (stored verbatim in
-        //       the request); meta ledger submit RunRequested{ Insight{period, llm} }.
-        todo!("not implemented")
+        let author = author(caller)?;
+        let meta = self.meta_handle()?;
+        let period = Period::parse(&input.period, now(), self.host.config.tz).ok_or_else(|| {
+            ApiError::BadInput {
+                path: "period".into(),
+                what: format!("not a period: {:?}", input.period),
+            }
+        })?;
+        let model = model_choice(input.model)?;
+        let skills = existing_skills(&self.host.config.skill_dirs);
+        let prompt = self
+            .host
+            .store
+            .insight_prompt(&period, &skills)
+            .map_err(ledger_error)?;
+        let run = RunId(derived("insight", &input.request_id));
+        let llm = event::LlmCall { model, prompt };
+        let purpose = RunPurpose::Insight { period, llm };
+        self.submit(&meta, author, Event::RunRequested { run, purpose })?;
+        Ok(RunRef {
+            job: String::new(),
+            run: run.0.to_string(),
+        })
     }
+    /// Writes `<target>/<name>/SKILL.md` with the human's name and body; the candidate's
+    /// description becomes the skill's. `target` must be absolute: the host's working
+    /// directory means nothing to the person who typed it.
     fn accept_candidate(
         &mut self,
         caller: &Caller,
         input: AcceptCandidate,
     ) -> Result<RunRef, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let meta = self.meta_handle()?;
+        let name = SkillName::parse(&input.name).ok_or_else(|| ApiError::BadInput {
+            path: "name".into(),
+            what: format!(
+                "not a skill name (lowercase words and hyphens): {:?}",
+                input.name
+            ),
+        })?;
+        let target = PathBuf::from(&input.target);
+        if !target.is_absolute() {
+            return Err(ApiError::BadInput {
+                path: "target".into(),
+                what: format!("not an absolute directory: {:?}", input.target),
+            });
+        }
+        if input.body.trim().is_empty() {
+            return Err(ApiError::BadInput {
+                path: "body".into(),
+                what: "a skill needs a body".into(),
+            });
+        }
+        let run = RunId(derived("skill", &input.request_id));
+        let (id, raw) = self.candidate(&meta, &input.candidate, Some(run))?;
+        let draft = event::SkillDraft {
+            from: Some(id),
+            name,
+            description: raw.description,
+            body: input.body,
+            target,
+        };
+        let purpose = RunPurpose::WriteSkill(draft);
+        self.submit(&meta, author, Event::RunRequested { run, purpose })?;
+        Ok(RunRef {
+            job: String::new(),
+            run: run.0.to_string(),
+        })
     }
     fn dismiss_candidate(&mut self, caller: &Caller, input: CandidateRef) -> Result<Ack, ApiError> {
-        todo!("not implemented")
+        let author = author(caller)?;
+        let meta = self.meta_handle()?;
+        let (candidate, _) = self.candidate(&meta, &input.candidate, None)?;
+        self.submit(&meta, author, Event::CandidateDismissed { candidate })
     }
 }
 
@@ -2190,6 +2344,114 @@ mod tests {
         assert!(matches!(
             call(&host, &Caller::Local, "bookmark", &bad),
             Err(ApiError::BadInput { .. })
+        ));
+        host.shutdown();
+    }
+
+    /// Polls `done` every 20 ms for up to 10 s.
+    fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn candidates(host: &Host) -> Vec<(String, String)> {
+        let list = call(host, &Caller::Local, "candidates", "{}").unwrap();
+        let Json::Arr(items) = get(&list, "candidates") else {
+            panic!()
+        };
+        items
+            .iter()
+            .map(|c| (text(c, &["id"]).to_owned(), text(c, &["name"]).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn an_insight_run_proposes_skills_that_are_then_written_or_dismissed() {
+        use argus_core::event::RunPurpose;
+        use argus_core::ids::{Attempt, Id128, RunId};
+        use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
+        let (host, root, repo) = host();
+        let job = start(&host, &repo, "req-insight");
+        let job_id = Id128::parse(&job).unwrap();
+        let agent = Id128::derive("agent", &job_id.0.to_le_bytes());
+        let typed = format!(
+            r#"{{"request_id":"in-1","job":"{job}","run":"{agent}","text":"run fmt first"}}"#
+        );
+        call(&host, &Caller::Local, "send_input", &typed).unwrap();
+        let ask = r#"{"request_id":"ins-1","period":"last-24h","model":{"agent":"Claude","model":"haiku","effort":null}}"#;
+        let got = call(&host, &Caller::Local, "request_insights", ask).unwrap();
+        assert_eq!(text(&got, &["job"]), "", "the meta ledger is no job");
+        let again = call(&host, &Caller::Local, "request_insights", ask).unwrap();
+        assert_eq!(text(&again, &["run"]), text(&got, &["run"]));
+        let run = RunId(Id128::parse(text(&got, &["run"])).unwrap());
+        let meta = host.inner.meta().unwrap();
+        let prompt = meta.read(&mut Vec::new(), move |l| {
+            match &l.views().runs().get(&run).unwrap().purpose {
+                RunPurpose::Insight { llm, .. } => llm.prompt.clone(),
+                other => panic!("{other:?}"),
+            }
+        });
+        assert!(prompt.contains(r#""fix the gate":"#), "{prompt}");
+        assert!(prompt.contains("human typed: run fmt first"), "{prompt}");
+
+        // The model's answer, as it arrives on the run's stdout.
+        let answer = "```json\n[{\"name\":\"run-fmt-first\",\"description\":\"Use before tests.\",\"why\":\"w\",\"body\":\"b\",\"evidence\":[]},{\"name\":\"read-errors\",\"description\":\"d\",\"why\":\"w\",\"body\":\"b\",\"evidence\":[]}]\n```";
+        let line = Json::Obj(vec![
+            ("type".into(), Json::str("result")),
+            ("result".into(), Json::str(answer)),
+            ("is_error".into(), Json::Bool(false)),
+        ]);
+        let origin = SourceOrigin::Stdout;
+        let source = SourceMeta {
+            id: SourceMeta::derive_id(run, Attempt(0), &origin),
+            run,
+            attempt: Attempt(0),
+            kind: SourceKind::ClaudeStreamJson,
+            origin,
+        };
+        let bytes = format!("{}\n", argus_json::write(&line)).into_bytes();
+        crate::ledger_thread::record(&meta.sender(), source, bytes).unwrap();
+        let proposed = candidates(&host);
+        let names: Vec<&str> = proposed.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, ["run-fmt-first", "read-errors"]);
+        let (first, second) = (&proposed[0].0, &proposed[1].0);
+
+        let target = root.join("skills");
+        let accept = |request: &str, candidate: &str, name: &str, target: &str| {
+            let input = format!(
+                r#"{{"request_id":"{request}","candidate":"{candidate}","name":"{name}","body":"Run fmt.","target":"{target}"}}"#
+            );
+            call(&host, &Caller::Local, "accept_candidate", &input)
+        };
+        let dir = target.display().to_string();
+        assert!(matches!(
+            accept("acc-0", first, "Not A Name", &dir),
+            Err(ApiError::BadInput { .. })
+        ));
+        assert!(matches!(
+            accept("acc-0", first, "run-fmt-first", "relative/skills"),
+            Err(ApiError::BadInput { .. })
+        ));
+        assert!(matches!(
+            accept("acc-0", "host:1.0#0", "run-fmt-first", &dir),
+            Err(ApiError::NotFound { .. })
+        ));
+        let written = accept("acc-1", first, "run-fmt-first", &dir).unwrap();
+        assert_eq!(text(&written, &["job"]), "");
+        let skill = target.join("run-fmt-first").join("SKILL.md");
+        eventually("the skill is written", || skill.exists());
+        let text_of = std::fs::read_to_string(&skill).unwrap();
+        assert!(text_of.ends_with("\n---\n\nRun fmt."), "{text_of}");
+
+        let dismiss = format!(r#"{{"candidate":"{second}"}}"#);
+        call(&host, &Caller::Local, "dismiss_candidate", &dismiss).unwrap();
+        assert_eq!(candidates(&host), []);
+        assert!(matches!(
+            accept("acc-2", second, "read-errors", &dir),
+            Err(ApiError::Rejected { .. })
         ));
         host.shutdown();
     }

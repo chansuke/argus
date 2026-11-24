@@ -65,6 +65,9 @@ pub struct HostConfig {
     pub snapshot_deny: Vec<String>,
     pub retention: Retention,
     pub tz: UtcOffset,
+    /// Directories whose subdirectories are skills (`<dir>/<name>/SKILL.md`). Their names
+    /// go into insight prompts, so a model improves a skill instead of copying it.
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 /// Terminal (PTY) logs dominate disk and no projection reads them, so they alone may be
@@ -423,6 +426,7 @@ mod tests {
                 terminal_days: Some(30),
             },
             tz: UtcOffset { minutes: 540 },
+            skill_dirs: Vec::new(),
         }
     }
 
