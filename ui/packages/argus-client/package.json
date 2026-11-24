@@ -9,8 +9,8 @@
     "./react": "./src/react.ts"
   },
   "peerDependencies": {
-    "react": "^19",
-    "@tauri-apps/api": "^2"
+    "@tauri-apps/api": "^2",
+    "react": "^19"
   },
   "peerDependenciesMeta": {
     "@tauri-apps/api": {
@@ -18,12 +18,14 @@
     }
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p ."
+    "typecheck": "tsc --noEmit -p .",
+    "test": "vitest run"
   },
   "devDependencies": {
-    "typescript": "5.9.3",
+    "@tauri-apps/api": "2.12.5",
     "@types/react": "19.3.0",
     "react": "19.3.1",
-    "@tauri-apps/api": "2.12.5"
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
   }
 }

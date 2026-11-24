@@ -40,6 +40,11 @@ step_ui-lint() {
   (cd ui && pnpm install --frozen-lockfile --silent && pnpm -s lint)
 }
 
+# Unit tests of the TS client (vitest), with a fake transport.
+step_ui-test() {
+  (cd ui && pnpm install --frozen-lockfile --silent && pnpm -s -r --if-present test)
+}
+
 step_typos() {
   typos
 }
@@ -79,7 +84,7 @@ step_app() {
   cargo check --locked --manifest-path crates/argus-app/Cargo.toml
 }
 
-default_steps=(fmt clippy test tsgen ts ui-lint typos actionlint hatches tla lean)
+default_steps=(fmt clippy test tsgen ts ui-lint ui-test typos actionlint hatches tla lean)
 all_steps=("${default_steps[@]}" app)
 
 if [[ ${1:-} == --list ]]; then
