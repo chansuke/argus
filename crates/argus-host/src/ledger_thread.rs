@@ -19,6 +19,7 @@ use argus_core::views::{JobViews, MetaViews, ViewSet};
 
 use crate::pulse::Dep;
 use crate::runner::{JobPlace, Running, Workspace};
+use crate::tokens::RunTokens;
 
 pub(crate) enum Cmd {
     Submit {
@@ -225,6 +226,8 @@ pub(crate) struct LoopConfig {
     pub tools: ToolPaths,
     pub socket: PathBuf,
     pub snapshot_deny: Vec<String>,
+    /// Shared with the socket transport, which checks what the runs were handed.
+    pub tokens: RunTokens,
 }
 
 /// One ledger and the runs the host is executing for it. Only this owns the ledger, so
@@ -442,6 +445,7 @@ impl<V: LoopViews, L: Launcher> LedgerLoop<V, L> {
             home: self.cfg.home.clone(),
             blobs: self.ledger.blobs(),
             job: place,
+            tokens: self.cfg.tokens.clone(),
         };
         let running = self.launcher.start(inv, env, ws, self.inbox.clone());
         self.live.insert(run, running);
@@ -677,6 +681,7 @@ mod tests {
             },
             socket: PathBuf::from("/run/argus.sock"),
             snapshot_deny: SNAPSHOT_DENY.iter().map(|s| s.to_string()).collect(),
+            tokens: RunTokens::default(),
         }
     }
 

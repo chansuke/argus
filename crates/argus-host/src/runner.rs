@@ -20,6 +20,7 @@ use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 use argus_log::BlobStore;
 
 use crate::ledger_thread::{self, Cmd, observe};
+use crate::tokens::RunTokens;
 use crate::{git, pty, tail};
 
 pub(crate) struct Running {
@@ -54,6 +55,8 @@ pub(crate) struct Workspace {
     pub blobs: BlobStore,
     /// The job the run belongs to; `None` for a run on the meta ledger.
     pub job: Option<JobPlace>,
+    /// Where a process that talks to argus gets its `ARGUS_TOKEN`.
+    pub tokens: RunTokens,
 }
 
 /// Where a job's runs work: its repository, worktree, and branches.
@@ -208,6 +211,21 @@ fn run_process(
         }
         false => None,
     };
+    // Held until the process ends; dropping it revokes the token.
+    let mut token = None;
+    if spec.env.iter().any(|(k, _)| k == "ARGUS_RUN") {
+        match ws.tokens.issue(env.run) {
+            Ok(issued) => {
+                spec.env.push(("ARGUS_TOKEN".into(), issued.token.clone()));
+                token = Some(issued);
+            }
+            Err(e) => {
+                return RunOutcome::SpawnFailed {
+                    error: e.to_string(),
+                };
+            }
+        }
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let watcher = (!spec.watch.is_empty()).then(|| {
         let specs = spec.watch.clone();
@@ -232,6 +250,7 @@ fn run_process(
         let _ = std::fs::remove_dir_all(artifacts);
     }
     drop(checkout);
+    drop(token);
     match ended {
         Err(e) => RunOutcome::SpawnFailed {
             error: e.to_string(),
@@ -664,6 +683,7 @@ mod tests {
                 previous: None,
                 target: "release".into(),
             }),
+            tokens: RunTokens::default(),
         }
     }
 
@@ -757,6 +777,46 @@ mod tests {
             "{:?}",
             finished(&got)
         );
+    }
+
+    #[test]
+    fn a_process_that_talks_to_argus_holds_a_token_only_while_it_runs() {
+        let dir = scratch_dir("token");
+        let mut spec = sh(
+            "printf %s \"$ARGUS_TOKEN\" > tok.tmp && mv tok.tmp tok; while [ ! -e go ]; do sleep 0.02; done",
+        );
+        spec.env.push(("ARGUS_RUN".into(), "1".into()));
+        let ws = workspace(&dir);
+        let tokens = ws.tokens.clone();
+        let (ledger, thread) = fake_ledger();
+        let running = start(Invocation::Process(spec), env(), ws, ledger.clone());
+        drop(ledger);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.join("tok").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the process never wrote its token"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let token = std::fs::read_to_string(dir.join("tok")).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(tokens.check(RunId(Id128(1)), &token));
+        std::fs::write(dir.join("go"), "").unwrap();
+        let got = thread.join().unwrap();
+        drop(running);
+        assert_eq!(finished(&got), RunOutcome::Exited { code: 0 });
+        assert!(!tokens.check(RunId(Id128(1)), &token));
+    }
+
+    #[test]
+    fn a_process_that_does_not_talk_to_argus_gets_no_token() {
+        let dir = scratch_dir("no-token");
+        let got = run_to_end(
+            Invocation::Process(sh("test -z \"$ARGUS_TOKEN\"")),
+            workspace(&dir),
+        );
+        assert_eq!(finished(&got), RunOutcome::Exited { code: 0 });
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub(crate) const VERSION: u32 = 1;
 /// `.claude/projects/*/<uuid>/subagents/*.jsonl` (glob on the slug instead of re-deriving
 /// Claude's cwd-to-slug rule).
 /// Env: `ARGUS_RUN`, `ARGUS_SOCKET`, so `argus task ...` and `argus hook` inside the agent
-/// know who they speak for.
+/// know who they speak for. The host adds `ARGUS_TOKEN`, which proves it.
 ///
 /// Flags from Claude Code 2.1.303 `--help`. Unverified: that `--resume` with
 /// `--fork-session` accepts `--session-id`, and that a v8 UUID (derived run ids) is

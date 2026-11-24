@@ -25,6 +25,7 @@ mod pty;
 mod pulse;
 mod runner;
 mod tail;
+mod tokens;
 mod transport;
 
 use std::collections::BTreeMap;
@@ -97,6 +98,8 @@ pub(crate) struct HostInner {
     pub(crate) diffs: git::DiffCache,
     /// Re-evaluates dirty subscriptions (`pulse::flush`), coalesced to ~100 ms.
     pulse: Mutex<Option<JoinHandle<()>>>,
+    /// The agents' socket tokens, issued by the runner and checked by the transport.
+    pub(crate) tokens: tokens::RunTokens,
 }
 
 impl HostInner {
@@ -117,6 +120,7 @@ impl HostInner {
             tools: config.tools.clone(),
             socket: config.socket.clone(),
             snapshot_deny,
+            tokens: self.tokens.clone(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let registry = self.registry.clone();
@@ -146,6 +150,7 @@ impl HostInner {
             tools: self.config.tools.clone(),
             socket: self.config.socket.clone(),
             snapshot_deny: Vec::new(),
+            tokens: self.tokens.clone(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let registry = self.registry.clone();
@@ -257,6 +262,7 @@ impl Host {
             registry: Arc::new(Mutex::new(pulse::Registry::new(wake))),
             diffs: git::DiffCache::default(),
             pulse: Mutex::new(None),
+            tokens: tokens::RunTokens::default(),
         });
         inner.open_meta()?;
         for job in inner.store.jobs().map_err(io_error)? {
