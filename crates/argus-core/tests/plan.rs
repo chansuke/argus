@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use argus_core::command::{CommandSpec, Invocation, PlanEnv, SNAPSHOT_DENY, ToolPaths, Workdir};
 use argus_core::event::{
     AgentLaunch, CheckRequest, CheckSpec, LeanMode, LlmCall, ReviewLens, ReviewSpec, RunPurpose,
     TlaEngine,
@@ -11,7 +12,7 @@ use argus_core::event::{
 use argus_core::ids::{Attempt, GitOid, Id128, JobId, ModelId, RepoPath, RunId};
 use argus_core::models::{AgentCli, Effort, ModelChoice};
 use argus_core::period::{BucketWidth, Window};
-use argus_core::plan::{CommandSpec, Invocation, PlanEnv, SNAPSHOT_DENY, ToolPaths, Workdir, plan};
+use argus_core::plan::plan;
 use argus_core::source::SourceKind;
 
 const RUN: &str = "0f8fad5d-d9cb-469f-a165-70867728950e";

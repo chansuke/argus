@@ -1,8 +1,8 @@
 //! Codex CLI. Sketch only: launches in a PTY; its rollout and `exec --json` lines decode
 //! to `Unrecognized` until the adapter is written, so the raw view works from day one.
 
+use crate::command::{CommandSpec, PermissionAnswer, PlanEnv};
 use crate::event::AgentLaunch;
-use crate::plan::{CommandSpec, PermissionAnswer, PlanEnv};
 use crate::source::{Decoded, Observation};
 
 pub(crate) const VERSION: u32 = 0;

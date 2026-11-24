@@ -12,8 +12,8 @@
 //! Unverified: the exact JSON field names of `list`/`events`, and whether `--egress local`
 //! is how a remote device reaches a local Metro for JS-only changes.
 
+use crate::command::{CommandSpec, Invocation, PlanEnv};
 use crate::event::{CheckRequest, DevicePlatform};
-use crate::plan::{CommandSpec, Invocation, PlanEnv};
 use crate::source::Decoded;
 
 pub(crate) const VERSION: u32 = 1;

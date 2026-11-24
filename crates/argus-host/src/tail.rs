@@ -11,9 +11,9 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use argus_core::command::WatchSpec;
 use argus_core::ids::{Attempt, RunId, SourceId};
 use argus_core::ledger::SourceCursor;
-use argus_core::plan::WatchSpec;
 use argus_core::source::{Framer, RawFrame, SourceKind, SourceMeta, SourceOrigin};
 
 use crate::glob;

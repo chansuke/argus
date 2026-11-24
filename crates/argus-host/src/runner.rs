@@ -12,10 +12,10 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use argus_core::command::{CommandSpec, Effect, Invocation, PlanEnv, Workdir};
 use argus_core::event::{Author, Event, RunOutcome};
 use argus_core::ids::{CommitOid, JobId, RunId, TreeOid};
 use argus_core::ledger::SourceCursor;
-use argus_core::plan::{CommandSpec, Effect, Invocation, PlanEnv, Workdir};
 use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 use argus_log::BlobStore;
 
@@ -600,8 +600,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    use argus_core::command::{SNAPSHOT_DENY, ToolPaths, Workdir};
     use argus_core::ids::{Attempt, Id128};
-    use argus_core::plan::{SNAPSHOT_DENY, ToolPaths, Workdir};
     use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 
     fn env() -> PlanEnv {
@@ -667,8 +667,8 @@ mod tests {
 
     // ------------------------------------------------------------ start
 
+    use argus_core::command::{Effect, Invocation};
     use argus_core::event::{Author, Event, RunOutcome};
-    use argus_core::plan::{Effect, Invocation};
 
     fn workspace(worktree: &Path) -> Workspace {
         let data = worktree.join(".argus-data");
@@ -940,7 +940,7 @@ mod tests {
         ws.home = home.clone();
         let mut spec = sh("basename \"$PWD\"; printf 'seen\\n' > notes/run.jsonl");
         spec.workdir = Workdir::Home;
-        spec.watch = vec![argus_core::plan::WatchSpec {
+        spec.watch = vec![argus_core::command::WatchSpec {
             pattern: "notes/*.jsonl".into(),
             kind: SourceKind::ClaudeTranscript,
         }];

@@ -38,10 +38,10 @@ use std::thread::JoinHandle;
 
 use argus_api::{ApiError, Caller};
 use argus_core::Store;
+use argus_core::command::{Invocation, PlanEnv, SNAPSHOT_DENY, ToolPaths};
 use argus_core::ids::{JobId, LedgerRef};
 use argus_core::models::ModelPresets;
 use argus_core::period::UtcOffset;
-use argus_core::plan::{Invocation, PlanEnv, SNAPSHOT_DENY, ToolPaths};
 use argus_core::policy::PolicyConfig;
 use argus_core::views::ViewSet;
 use argus_core::views::packet::PacketConfig;
@@ -67,7 +67,7 @@ pub struct HostConfig {
     /// Review model presets; `request_review { reviewers: Default }` resolves here.
     pub presets: ModelPresets,
     pub packet: PacketConfig,
-    /// Added to `plan::SNAPSHOT_DENY` (never removes from it).
+    /// Added to `command::SNAPSHOT_DENY` (never removes from it).
     pub snapshot_deny: Vec<String>,
     pub retention: Retention,
     pub tz: UtcOffset,
@@ -383,12 +383,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use argus_core::command::ToolPaths;
     use argus_core::event::{
         AgentLaunch, Author, Event, JobInfo, JobOrigin, RunOutcome, RunPurpose,
     };
     use argus_core::ids::{Attempt, GitOid, Id128, RunId};
     use argus_core::models::{AgentCli, ModelChoice, ModelPresets, ModelSet, PresetName};
-    use argus_core::plan::ToolPaths;
 
     fn scratch() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);

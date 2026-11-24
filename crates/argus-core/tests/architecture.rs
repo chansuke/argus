@@ -6,7 +6,6 @@
 //!
 //! See docs/design/RATIONALE.md ("Shape") for what each module is for.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Lowest layer first. A module may use modules of earlier layers only, never its own
@@ -20,7 +19,7 @@ const LAYERS: &[&[&str]] = &[
     &["source"],
     &["diff"],
     &["event"],
-    &["fact"],
+    &["fact", "command"],
     // L2: foreign formats in and commands out.
     &["adapters"],
     // L3: pure folds over facts.
@@ -31,17 +30,6 @@ const LAYERS: &[&[&str]] = &[
     &["codec"],
     &["ledger"],
     &["store"],
-];
-
-/// Uses that point up or sideways today, as (file under src/, path written). This list
-/// may only shrink: cut a cycle, then remove its lines here. Never add a line.
-const KNOWN: &[(&str, &str)] = &[
-    ("adapters/claude.rs", "crate::plan"),
-    ("adapters/codex.rs", "crate::plan"),
-    ("adapters/eas.rs", "crate::plan"),
-    ("adapters/lean.rs", "crate::plan"),
-    ("adapters/llm.rs", "crate::plan"),
-    ("adapters/tlc.rs", "crate::plan"),
 ];
 
 /// Modules that are pure functions of their inputs: replay must equal live, so they
@@ -77,7 +65,6 @@ fn modules_use_only_earlier_layers() {
          Put each in the earliest layer that holds everything it uses."
     );
 
-    let mut found = BTreeSet::new();
     let mut violations = Vec::new();
     for file in &files {
         let rel = relative(&src, file);
@@ -94,14 +81,11 @@ fn modules_use_only_earlier_layers() {
             if ok {
                 continue;
             }
-            found.insert((rel.clone(), path.clone()));
-            if !KNOWN.contains(&(rel.as_str(), path.as_str())) {
-                violations.push(format!(
-                    "src/{rel}:{line}: `{from}` (layer {}) uses `{path}` (layer {})",
-                    rank(from).unwrap(),
-                    rank(to).unwrap()
-                ));
-            }
+            violations.push(format!(
+                "src/{rel}:{line}: `{from}` (layer {}) uses `{path}` (layer {})",
+                rank(from).unwrap(),
+                rank(to).unwrap()
+            ));
         }
     }
     assert!(
@@ -109,20 +93,9 @@ fn modules_use_only_earlier_layers() {
         "{} uses point up or sideways in the layers of argus-core:\n  {}\n\n\
          A module may use only modules in earlier layers (LAYERS in crates/argus-core/tests/architecture.rs).\n\
          Fix the design, not the check: move what both modules need down into the lower module (or into `ids`), \
-         or let the caller pass it in as a value or a function. Do not re-export the item to hide the use, \
-         and do not add the use to KNOWN.",
+         or let the caller pass it in as a value or a function. Do not re-export the item to hide the use.",
         violations.len(),
         violations.join("\n  ")
-    );
-
-    let stale: Vec<_> = KNOWN
-        .iter()
-        .filter(|(file, path)| !found.contains(&(file.to_string(), path.to_string())))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "These KNOWN uses are gone. Remove them from KNOWN in crates/argus-core/tests/architecture.rs \
-         so they cannot come back: {stale:?}"
     );
 }
 

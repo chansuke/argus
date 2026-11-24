@@ -21,9 +21,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use argus_core::command::ToolPaths;
 use argus_core::models::{ModelChoice, ModelPresets, ModelSet, PresetName};
 use argus_core::period::UtcOffset;
-use argus_core::plan::ToolPaths;
 use argus_core::policy::PolicyConfig;
 use argus_core::views::packet::{PacketConfig, SENSITIVE_DEFAULT};
 use argus_json::Json;

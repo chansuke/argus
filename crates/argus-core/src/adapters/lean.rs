@@ -7,7 +7,7 @@ use crate::ids::FactId;
 use std::path::PathBuf;
 
 use crate::adapters::tlc;
-use crate::plan::{CommandSpec, PlanEnv, Workdir};
+use crate::command::{CommandSpec, PlanEnv, Workdir};
 use crate::source::CheckVerdict;
 use crate::source::{Decoded, LeanMessage, LeanSeverity, Observation, SourceKind};
 
