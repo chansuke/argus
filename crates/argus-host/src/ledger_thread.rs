@@ -18,6 +18,7 @@ use argus_core::source::{RawFrame, SourceMeta};
 use argus_core::views::runs::{Due, Runs};
 use argus_core::views::{JobViews, MetaViews, ViewSet};
 
+use crate::clock;
 use crate::pulse::Dep;
 use crate::runner::{JobPlace, Running, Workspace};
 use crate::tokens::RunTokens;
@@ -366,7 +367,7 @@ impl<V: LoopViews, L: Launcher> LedgerLoop<V, L> {
     /// Reconciles once (a restart abandons or retries interrupted runs), then blocks on
     /// the inbox and applies commands in batches until `Cmd::Stop`.
     pub(crate) fn run(mut self, inbox: Receiver<Cmd>) {
-        self.after_batch(now());
+        self.after_batch(clock::now());
         while let Ok(first) = inbox.recv() {
             let mut changed = false;
             let mut stop = false;
@@ -378,7 +379,7 @@ impl<V: LoopViews, L: Launcher> LedgerLoop<V, L> {
                 changed |= self.handle(cmd);
             }
             if changed {
-                self.after_batch(now());
+                self.after_batch(clock::now());
                 if let Some(f) = &mut self.changed {
                     f(&self.ledger);
                 }
@@ -456,11 +457,6 @@ impl<V: LoopViews, L: Launcher> LedgerLoop<V, L> {
     pub(crate) fn ledger(&self) -> &Ledger<V> {
         &self.ledger
     }
-}
-
-fn now() -> UnixMillis {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    UnixMillis(since.map_or(0, |d| d.as_millis() as i64))
 }
 
 /// Appends an authored event on the ledger thread.
@@ -1022,7 +1018,7 @@ mod tests {
         use crate::pulse::Dep;
         use argus_core::ids::JobId;
         use argus_core::views::ViewSet;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         let (inbox, commands) = mpsc::channel();
         let ledger = JobLedger::open(&scratch()).unwrap();
         let job = JobLoop::new(
@@ -1045,14 +1041,17 @@ mod tests {
         ));
         // The loop starts the run after the batch that requested it; compare versions
         // only once it has, or the two reads below may straddle that change.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::clock::monotonic() + Duration::from_secs(5);
         while !handle.read(&mut Vec::new(), |l| {
             l.views()
                 .runs()
                 .get(&run(1))
                 .is_some_and(|r| !r.attempts.is_empty())
         }) {
-            assert!(Instant::now() < deadline, "the run never started");
+            assert!(
+                crate::clock::monotonic() < deadline,
+                "the run never started"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         let mut deps = Vec::new();

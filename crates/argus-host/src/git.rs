@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +13,7 @@ use argus_core::diff::{DiffRequest, HeadDiff, parse_unified};
 use argus_core::event::{FileDelta, FileState, Snapshot};
 use argus_core::ids::{CommitOid, GitOid, JobId, RepoPath, TreeOid};
 
-use crate::glob;
+use crate::{glob, proc};
 
 /// `git worktree add <at> -b argus/<job> <base>`: the job's own checkout, on its own branch.
 /// An existing checkout at `at` (a retried start) is kept as it is.
@@ -205,7 +205,7 @@ fn git(
     env: &[(&str, &OsStr)],
     stdin: Option<&[u8]>,
 ) -> std::io::Result<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = proc::command("git");
     command
         .args(args)
         .current_dir(dir)
@@ -399,7 +399,7 @@ pub(crate) fn merge(
 /// `git merge-tree --write-tree`: the merged tree, or the conflicted paths (exit 1 prints
 /// the tree, then one conflicted path per line).
 fn merge_tree(repo: &Path, ours: &str, theirs: &str) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = proc::command("git")
         .args([
             "merge-tree",
             "--write-tree",
