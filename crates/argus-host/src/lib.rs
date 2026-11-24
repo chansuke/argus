@@ -27,6 +27,7 @@ mod runner;
 mod tail;
 mod tokens;
 mod transport;
+mod ws;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
