@@ -14,7 +14,11 @@
 //!  runner / tailers ─▶ observe (raw frames) / submit (Author::Host) ─▶ ledger threads
 //! ```
 
-#![allow(dead_code, unused_variables)]
+#![expect(
+    dead_code,
+    unused_variables,
+    reason = "todo!() stubs (leases, transports, retention) take arguments and hold items they do not use yet"
+)]
 
 mod clock;
 mod config;

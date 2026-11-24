@@ -1,7 +1,7 @@
 //! Formal verification (TLA+, Lean) and device checks (EAS Simulators): one result per
 //! (target, tree, engine), verdicts derived from captured output on every replay.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::mem::discriminant;
 
 use crate::adapters::{lean, tlc};

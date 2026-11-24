@@ -1,11 +1,11 @@
 //! LLM-backed runs (review, summaries, insights) through headless agent CLIs.
 //! Model choice = which CLI + `--model`. No API keys or HTTP client in argus.
 
-use crate::event::{LlmCall, ReviewLens, ReviewSpec};
+use crate::event::{LlmCall, ReviewSpec};
 use argus_json::Json;
 
 use crate::command::{CommandSpec, PlanEnv, Workdir};
-use crate::ids::{CommitOid, LineRange, RepoPath, SkillName, UnixMillis};
+use crate::ids::{LineRange, RepoPath, SkillName, UnixMillis};
 use crate::models::{AgentCli, Effort};
 use crate::source::SourceKind;
 
@@ -344,6 +344,8 @@ pub(crate) fn parse_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::ReviewLens;
+    use crate::ids::CommitOid;
     use crate::source::Severity;
 
     #[test]

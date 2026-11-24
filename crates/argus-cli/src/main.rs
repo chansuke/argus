@@ -16,7 +16,11 @@
 //!          (ARGUS_RUN / ARGUS_SOCKET / ARGUS_TOKEN come from the run's env)
 //! MCP:     argus mcp — stdio MCP server exposing the `[agent]` ops as tools.
 
-#![allow(dead_code, unused_variables)]
+#![expect(
+    dead_code,
+    unused_variables,
+    reason = "todo!() stubs (socket transport, MCP server) take arguments and hold items they do not use yet"
+)]
 
 mod mcp;
 

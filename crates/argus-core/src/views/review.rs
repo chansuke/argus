@@ -20,7 +20,7 @@ use crate::event::{
 };
 use crate::fact::{Fact, FactBody};
 use crate::ids::*;
-use crate::source::{AgentWhat, Observation, RawFinding, Severity, SourceFamily, SourceMeta};
+use crate::source::{AgentWhat, Observation, Severity, SourceFamily, SourceMeta};
 use crate::views::packet::FeedbackItem;
 use crate::views::{GateState, JobViews, Projection};
 

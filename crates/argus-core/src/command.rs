@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::event::*;
 use crate::ids::*;
-use crate::models::AgentCli;
 use crate::source::SourceKind;
 
 #[derive(Clone, Debug)]

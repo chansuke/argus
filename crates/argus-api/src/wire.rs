@@ -169,6 +169,7 @@ macro_rules! vm_struct {
             fn to_json(&self) -> argus_json::Json {
                 argus_json::Json::Obj(vec![$((stringify!($field).to_string(), $crate::wire::Wire::to_json(&self.$field))),*])
             }
+            #[allow(unused_variables, reason = "a struct with no fields reads nothing from `v`")]
             fn from_json(v: &argus_json::Json) -> Result<Self, $crate::wire::WireError> {
                 Ok(Self { $($field: $crate::wire::field(v, stringify!($field))?),* })
             }
