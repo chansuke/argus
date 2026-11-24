@@ -34,6 +34,12 @@ step_ts() {
   (cd ui && pnpm install --frozen-lockfile --silent && pnpm -s typecheck)
 }
 
+# Typed ESLint over ui/ (ui/eslint.config.js), including the import rules that keep
+# Tauri out of the phone bundle.
+step_ui-lint() {
+  (cd ui && pnpm install --frozen-lockfile --silent && pnpm -s lint)
+}
+
 step_typos() {
   typos
 }
@@ -73,7 +79,7 @@ step_app() {
   cargo check --locked --manifest-path crates/argus-app/Cargo.toml
 }
 
-default_steps=(fmt clippy test tsgen ts typos actionlint hatches tla lean)
+default_steps=(fmt clippy test tsgen ts ui-lint typos actionlint hatches tla lean)
 all_steps=("${default_steps[@]}" app)
 
 if [[ ${1:-} == --list ]]; then
