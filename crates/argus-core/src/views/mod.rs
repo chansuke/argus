@@ -97,7 +97,7 @@ macro_rules! view_set {
     ($(#[$m:meta])* $name:ident ($slot:ident): $kind:expr, admit = $admit:path => {
         $($(#[$fm:meta])* $field:ident : $ty:ty),* $(,)?
     }) => {
-        #[allow(non_camel_case_types)]
+        #[allow(non_camel_case_types, reason = "the slot variants are named after the view fields")]
         #[derive(Clone, Copy, Debug)]
         enum $slot { $($field),* }
 
