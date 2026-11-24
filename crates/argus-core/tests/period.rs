@@ -58,9 +58,22 @@ fn relative_periods_are_measured_from_now() {
         parse("this-week", now),
         Some(period(monday, monday + 7 * DAY))
     );
-    assert_eq!(parse("last-24h", now), Some(period(now - DAY, now)));
-    assert_eq!(parse("last-7d", now), Some(period(now - 7 * DAY, now)));
-    assert_eq!(parse("last-3h", now), Some(period(now - 3 * HOUR, now)));
+    let end = now + 1;
+    assert_eq!(parse("last-24h", now), Some(period(end - DAY, end)));
+    assert_eq!(parse("last-7d", now), Some(period(end - 7 * DAY, end)));
+    assert_eq!(parse("last-3h", now), Some(period(end - 3 * HOUR, end)));
+}
+
+/// An event stamped in the same millisecond as the request has already happened, so a
+/// period that ends "now" includes it.
+#[test]
+fn a_last_period_includes_what_happened_in_the_current_millisecond() {
+    let now = NOV_17_UTC + 5 * HOUR + 123;
+    for s in ["last-24h", "last-7d", "last-3h"] {
+        let p = parse(s, now).unwrap();
+        assert!(p.contains(UnixMillis(now)), "{s}");
+        assert!(!p.contains(UnixMillis(now + 1)), "{s}");
+    }
 }
 
 #[test]

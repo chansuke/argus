@@ -30,7 +30,7 @@ impl HourBucket {
 impl Period {
     /// `2026-11`, `2026-11-17`, `2026-11-01..2026-11-15` (both days included), `today`,
     /// `this-week` (from Monday), `last-<n>h`, `last-<n>d`. Calendar forms are read in
-    /// `tz` and cover whole days; `last-*` ends at `now`.
+    /// `tz` and cover whole days; `last-*` ends at `now`, including its millisecond.
     pub fn parse(s: &str, now: UnixMillis, tz: UtcOffset) -> Option<Self> {
         let offset = i64::from(tz.minutes) * MINUTE;
         let days = |from: i64, n: i64| Period {
@@ -50,9 +50,11 @@ impl Period {
             };
             let n: i64 = digits(n)?;
             let span = n.checked_mul(unit).filter(|_| n > 0)?;
+            // Half-open: what happened in the millisecond of `now` is already past.
+            let to = now.0.checked_add(1)?;
             return Some(Period {
-                from: UnixMillis(now.0.checked_sub(span)?),
-                to: now,
+                from: UnixMillis(to.checked_sub(span)?),
+                to: UnixMillis(to),
             });
         }
         match s {
