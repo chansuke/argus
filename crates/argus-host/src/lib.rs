@@ -105,7 +105,7 @@ impl HostInner {
         let mut snapshot_deny: Vec<String> = SNAPSHOT_DENY.iter().map(|s| s.to_string()).collect();
         snapshot_deny.extend(config.snapshot_deny.iter().cloned());
         let cfg = LoopConfig {
-            info,
+            info: Some(info),
             home: std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_default(),

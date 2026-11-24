@@ -8,14 +8,14 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-use argus_core::event::{Author, Event, JobInfo, LedgerKind, RunOutcome};
+use argus_core::event::{Author, Event, JobInfo, RunOutcome};
 use argus_core::ids::{Attempt, LedgerRef, RunId, SourceId, UnixMillis};
-use argus_core::ledger::{JobLedger, LedgerError, SourceCursor, Submitted};
+use argus_core::ledger::{JobLedger, Ledger, LedgerError, MetaLedger, SourceCursor, Submitted};
 use argus_core::plan::{Invocation, PlanEnv, ToolPaths, plan};
 use argus_core::policy::{self, PolicyConfig};
 use argus_core::source::{RawFrame, SourceMeta};
-use argus_core::views::ViewSet;
-use argus_core::views::runs::Due;
+use argus_core::views::runs::{Due, Runs};
+use argus_core::views::{JobViews, MetaViews, ViewSet};
 
 use crate::pulse::Dep;
 use crate::runner::{JobPlace, Running, Workspace};
@@ -43,7 +43,9 @@ pub(crate) enum Cmd {
     },
     /// Read-only access for API handlers; runs on this thread, so it sees a consistent
     /// state. The thread wraps `f` in `take_reads()` calls and replies with the `Dep`.
-    Read(Box<dyn FnOnce(&JobLedger) + Send>),
+    Read(ReadFn<JobViews>),
+    /// The same for the meta ledger's loop.
+    ReadMeta(ReadFn<MetaViews>),
     /// The runner stopped executing a run (it already submitted `RunFinished`).
     Released {
         run: RunId,
@@ -55,15 +57,101 @@ pub(crate) enum Cmd {
     Retain,
 }
 
-#[derive(Clone)]
-pub(crate) struct LedgerHandle {
-    tx: Sender<Cmd>,
-    ledger: LedgerRef,
+/// What differs between a job's loop and the meta ledger's: how a read reaches it, what
+/// the policy decides, and where a run works.
+pub(crate) trait LoopViews: ViewSet + Sized + 'static {
+    fn read_cmd(read: ReadFn<Self>) -> Cmd;
+    /// Runs the read in `cmd` if it is meant for this kind of ledger; returns any other
+    /// command.
+    fn run_read(ledger: &Ledger<Self>, cmd: Cmd) -> Option<Cmd>;
+    fn runs(&self) -> &Runs;
+    fn decide(&self, cfg: &LoopConfig, now: UnixMillis) -> Vec<Event>;
+    /// Where the job's runs work; `None` outside a job.
+    fn place(&self, cfg: &LoopConfig) -> Option<JobPlace>;
 }
 
-impl LedgerHandle {
+pub(crate) type ReadFn<V> = Box<dyn FnOnce(&Ledger<V>) + Send>;
+
+impl LoopViews for JobViews {
+    fn read_cmd(read: ReadFn<Self>) -> Cmd {
+        Cmd::Read(read)
+    }
+    fn run_read(ledger: &JobLedger, cmd: Cmd) -> Option<Cmd> {
+        match cmd {
+            Cmd::Read(read) => {
+                read(ledger);
+                None
+            }
+            other => Some(other),
+        }
+    }
+    fn runs(&self) -> &Runs {
+        JobViews::runs(self)
+    }
+    fn decide(&self, cfg: &LoopConfig, now: UnixMillis) -> Vec<Event> {
+        policy::decide(self, &cfg.policy, now)
+    }
+    fn place(&self, cfg: &LoopConfig) -> Option<JobPlace> {
+        let info = cfg.info.as_ref()?;
+        Some(JobPlace {
+            repo: info.repo.clone(),
+            worktree: info.worktree.clone(),
+            job: info.job,
+            base: info.base.clone(),
+            previous: self.review().head().map(|h| h.snapshot.tree.clone()),
+            target: info.target.clone(),
+        })
+    }
+}
+
+impl LoopViews for MetaViews {
+    fn read_cmd(read: ReadFn<Self>) -> Cmd {
+        Cmd::ReadMeta(read)
+    }
+    fn run_read(ledger: &MetaLedger, cmd: Cmd) -> Option<Cmd> {
+        match cmd {
+            Cmd::ReadMeta(read) => {
+                read(ledger);
+                None
+            }
+            other => Some(other),
+        }
+    }
+    fn runs(&self) -> &Runs {
+        MetaViews::runs(self)
+    }
+    /// Nothing on the meta ledger runs unasked.
+    fn decide(&self, _: &LoopConfig, _: UnixMillis) -> Vec<Event> {
+        Vec::new()
+    }
+    fn place(&self, _: &LoopConfig) -> Option<JobPlace> {
+        None
+    }
+}
+
+pub(crate) struct LedgerHandle<V = JobViews> {
+    tx: Sender<Cmd>,
+    ledger: LedgerRef,
+    views: std::marker::PhantomData<fn() -> V>,
+}
+
+impl<V> Clone for LedgerHandle<V> {
+    fn clone(&self) -> Self {
+        LedgerHandle {
+            tx: self.tx.clone(),
+            ledger: self.ledger,
+            views: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<V: LoopViews> LedgerHandle<V> {
     pub(crate) fn new(tx: Sender<Cmd>, ledger: LedgerRef) -> Self {
-        LedgerHandle { tx, ledger }
+        LedgerHandle {
+            tx,
+            ledger,
+            views: std::marker::PhantomData,
+        }
     }
     /// `Err(Rejected)` and friends as the ledger said; a stopped loop is an I/O error.
     pub(crate) fn submit(&self, author: Author, event: Event) -> Result<Submitted, LedgerError> {
@@ -87,11 +175,11 @@ impl LedgerHandle {
     pub(crate) fn read<T: Send + 'static>(
         &self,
         deps: &mut Vec<Dep>,
-        f: impl FnOnce(&JobLedger) -> T + Send + 'static,
+        f: impl FnOnce(&Ledger<V>) -> T + Send + 'static,
     ) -> T {
         let (reply, answer) = std::sync::mpsc::channel();
         let at = self.ledger;
-        let read = move |ledger: &JobLedger| {
+        let read = move |ledger: &Ledger<V>| {
             let views = ledger.views();
             // Reads before this one belong to whoever made them.
             let _ = views.take_reads();
@@ -106,7 +194,7 @@ impl LedgerHandle {
         };
         // The loop owns the ledger; if it stopped, the host is going away.
         self.tx
-            .send(Cmd::Read(Box::new(read)))
+            .send(V::read_cmd(Box::new(read)))
             .expect("the ledger thread outlives its handles");
         let (value, dep) = answer.recv().expect("the ledger thread answers every read");
         deps.push(dep);
@@ -128,9 +216,10 @@ pub(crate) trait Launcher {
     ) -> Running;
 }
 
-/// What a job's loop needs besides its ledger: where its runs execute and how.
+/// What a loop needs besides its ledger: where its runs execute and how.
 pub(crate) struct LoopConfig {
-    pub info: JobInfo,
+    /// The job this loop's ledger records; `None` for the meta ledger.
+    pub info: Option<JobInfo>,
     pub home: PathBuf,
     pub policy: PolicyConfig,
     pub tools: ToolPaths,
@@ -138,24 +227,27 @@ pub(crate) struct LoopConfig {
     pub snapshot_deny: Vec<String>,
 }
 
-/// One job's ledger and the runs the host is executing for it. Only this owns the
-/// ledger, so every write is ordered here, live and on replay alike.
-pub(crate) struct JobLoop<L: Launcher> {
-    ledger: JobLedger,
+/// One ledger and the runs the host is executing for it. Only this owns the ledger, so
+/// every write is ordered here, live and on replay alike.
+pub(crate) struct LedgerLoop<V: LoopViews, L: Launcher> {
+    ledger: Ledger<V>,
     /// This loop's own inbox, handed to each run it starts.
     inbox: Sender<Cmd>,
     live: BTreeMap<RunId, Running>,
     launcher: L,
     cfg: LoopConfig,
     /// Told after every batch that may have changed the views (subscriptions).
-    changed: Option<OnChange>,
+    changed: Option<OnChange<V>>,
 }
 
-type OnChange = Box<dyn FnMut(&JobLedger) + Send>;
+pub(crate) type JobLoop<L> = LedgerLoop<JobViews, L>;
+pub(crate) type MetaLoop<L> = LedgerLoop<MetaViews, L>;
 
-impl<L: Launcher> JobLoop<L> {
-    pub(crate) fn new(ledger: JobLedger, inbox: Sender<Cmd>, launcher: L, cfg: LoopConfig) -> Self {
-        JobLoop {
+type OnChange<V> = Box<dyn FnMut(&Ledger<V>) + Send>;
+
+impl<V: LoopViews, L: Launcher> LedgerLoop<V, L> {
+    pub(crate) fn new(ledger: Ledger<V>, inbox: Sender<Cmd>, launcher: L, cfg: LoopConfig) -> Self {
+        LedgerLoop {
             ledger,
             inbox,
             live: BTreeMap::new(),
@@ -165,13 +257,16 @@ impl<L: Launcher> JobLoop<L> {
         }
     }
 
-    pub(crate) fn on_change(mut self, f: impl FnMut(&JobLedger) + Send + 'static) -> Self {
+    pub(crate) fn on_change(mut self, f: impl FnMut(&Ledger<V>) + Send + 'static) -> Self {
         self.changed = Some(Box::new(f));
         self
     }
 
     /// Applies one command. Returns whether the views may have changed.
     pub(crate) fn handle(&mut self, cmd: Cmd) -> bool {
+        let Some(cmd) = V::run_read(&self.ledger, cmd) else {
+            return false;
+        };
         match cmd {
             Cmd::Submit {
                 author,
@@ -213,10 +308,8 @@ impl<L: Launcher> JobLoop<L> {
                 let _ = reply.send(result);
                 changed
             }
-            Cmd::Read(read) => {
-                read(&self.ledger);
-                false
-            }
+            // A read for another kind of ledger cannot happen: each handle knows its kind.
+            Cmd::Read(_) | Cmd::ReadMeta(_) => false,
             Cmd::Released { run } => self.live.remove(&run).is_some(),
             Cmd::Flush => {
                 let _ = self.ledger.flush();
@@ -233,7 +326,7 @@ impl<L: Launcher> JobLoop<L> {
         // the policy decide again); the bound only guards against a policy bug.
         for _ in 0..8 {
             let mut acted = false;
-            for event in policy::decide(self.ledger.views(), &self.cfg.policy, now) {
+            for event in self.ledger.views().decide(&self.cfg, now) {
                 acted |= self.submit(Author::Policy, event);
             }
             let live: BTreeSet<RunId> = self.live.keys().copied().collect();
@@ -306,12 +399,12 @@ impl<L: Launcher> JobLoop<L> {
         let Some(state) = views.runs().get(&run) else {
             return false;
         };
-        // Meta-ledger purposes never belong to a job.
-        if state.purpose.ledger_kind() != LedgerKind::Job {
+        // A purpose of the other kind of ledger never runs here.
+        if state.purpose.ledger_kind() != V::KIND {
             return false;
         }
         let purpose = state.purpose.clone();
-        let previous = views.review().head().map(|h| h.snapshot.tree.clone());
+        let place = views.place(&self.cfg);
         if !self.submit(
             Author::Host,
             Event::RunStarted {
@@ -322,9 +415,8 @@ impl<L: Launcher> JobLoop<L> {
         ) {
             return false;
         }
-        let info = &self.cfg.info;
         let env = PlanEnv {
-            job: Some(info.job),
+            job: self.cfg.info.as_ref().map(|i| i.job),
             run,
             attempt,
             socket: self.cfg.socket.clone(),
@@ -349,21 +441,14 @@ impl<L: Launcher> JobLoop<L> {
         let ws = Workspace {
             home: self.cfg.home.clone(),
             blobs: self.ledger.blobs(),
-            job: Some(JobPlace {
-                repo: info.repo.clone(),
-                worktree: info.worktree.clone(),
-                job: info.job,
-                base: info.base.clone(),
-                previous,
-                target: info.target.clone(),
-            }),
+            job: place,
         };
         let running = self.launcher.start(inv, env, ws, self.inbox.clone());
         self.live.insert(run, running);
         true
     }
 
-    pub(crate) fn ledger(&self) -> &JobLedger {
+    pub(crate) fn ledger(&self) -> &Ledger<V> {
         &self.ledger
     }
 }
@@ -568,7 +653,7 @@ mod tests {
 
     fn cfg(policy: PolicyConfig) -> LoopConfig {
         LoopConfig {
-            info: JobInfo {
+            info: Some(JobInfo {
                 job: JobId(Id128(1)),
                 title: "fix the gate".into(),
                 repo: PathBuf::from("/w/argus"),
@@ -577,7 +662,7 @@ mod tests {
                 worktree: PathBuf::from("/w/jobs/1"),
                 group: None,
                 origin: JobOrigin::Launched,
-            },
+            }),
             home: PathBuf::from("/h"),
             policy,
             tools: ToolPaths {
@@ -670,6 +755,70 @@ mod tests {
             attempt: Attempt(attempt),
             outcome,
         }
+    }
+
+    #[test]
+    fn the_meta_loop_runs_insights_and_skill_writes_outside_any_job() {
+        use argus_core::event::{LlmCall, SkillDraft};
+        use argus_core::ids::{ModelId, SkillName};
+        use argus_core::models::ModelChoice;
+        use argus_core::period::Period;
+        let launcher = FakeLauncher::default();
+        let (inbox, _) = mpsc::channel();
+        let ledger = MetaLedger::open(&scratch()).unwrap();
+        let mut cfg = cfg(PolicyConfig::default());
+        cfg.info = None;
+        let mut meta = MetaLoop::new(ledger, inbox, launcher.clone(), cfg);
+        let insight = RunPurpose::Insight {
+            period: Period {
+                from: UnixMillis(0),
+                to: NOW,
+            },
+            llm: LlmCall {
+                model: ModelChoice {
+                    cli: AgentCli::Claude,
+                    model: ModelId("haiku".into()),
+                    effort: None,
+                },
+                prompt: "what went wrong?".into(),
+            },
+        };
+        let write = RunPurpose::WriteSkill(SkillDraft {
+            from: None,
+            name: SkillName::parse("read-errors").unwrap(),
+            description: String::new(),
+            body: "Read the error.".into(),
+            target: PathBuf::from("/h/.claude/skills"),
+        });
+        for (n, purpose) in [(1, insight), (2, write)] {
+            let (reply, answer) = mpsc::channel();
+            let event = Event::RunRequested {
+                run: run(n),
+                purpose,
+            };
+            meta.handle(Cmd::Submit {
+                author: Author::Human,
+                event,
+                reply,
+            });
+            answer.recv().unwrap().unwrap();
+            meta.after_batch(NOW);
+        }
+
+        let launched = launcher.0.lock().unwrap();
+        assert_eq!(launched.len(), 2);
+        assert!(launched.iter().all(|s| s.ws.job.is_none()));
+        let Invocation::Process(spec) = &launched[0].inv else {
+            panic!("{:?}", launched[0].inv)
+        };
+        assert!(matches!(spec.workdir, Workdir::Home));
+        assert_eq!(spec.stdin.as_deref(), Some(&b"what went wrong?"[..]));
+        assert!(matches!(
+            launched[1].inv,
+            Invocation::InProcess(argus_core::plan::Effect::WriteSkill(_))
+        ));
+        let runs = meta.ledger().views().runs();
+        assert_eq!(runs.get(&run(1)).unwrap().attempts.len(), 1);
     }
 
     #[test]
@@ -878,7 +1027,7 @@ mod tests {
         );
         let thread = std::thread::spawn(move || job.run(commands));
         let at = LedgerRef::Job(JobId(Id128(1)));
-        let handle = LedgerHandle::new(inbox.clone(), at);
+        let handle: LedgerHandle = LedgerHandle::new(inbox.clone(), at);
 
         assert!(matches!(
             handle.submit(Author::Human, agent(1)),
