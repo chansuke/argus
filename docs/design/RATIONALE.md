@@ -154,6 +154,7 @@ await api.answer_permission({ request_id: requestId(), job, run, answer: "Allow"
 - We accept hand-rolled JSON and `vm_struct!`/`vm_enum!`/`vm_tags!` macros in exchange for std-only and Rust/JSON/TS derived from one declaration.
 - We accept agent CLIs for LLM calls (startup latency, output formats owned by the CLI) in exchange for zero key management and a raw transcript of every review.
 - We accept polling tailers (about 250 ms) in exchange for no inotify FFI.
+- We accept one `sh` watchdog per running process in exchange for no `unsafe` signal handler. It holds a pipe from the host and stops the run's process groups when the pipe closes, so no agent keeps running after the host dies, whether it was stopped by Ctrl-C, SIGTERM, SIGKILL, or a crash.
 - We accept `Cell`-based read tracking inside views (a view set is `!Sync` and lives on its ledger thread) in exchange for subscription dependencies that cannot drift from the code that reads.
 - A view-model layer that looks like a duplicate of the views is intentional. Projections are fold state; view models are screens. The host maps one to the other in one file.
 - Size: the sketch is about 5.6k lines of Rust, over the 5k target. The growth is the review layer (packet, glance, models, typed view models), not duplication.
