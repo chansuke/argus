@@ -48,7 +48,9 @@ use argus_json::Json;
 use argus_core::views::MetaViews;
 use ledger_thread::{Cmd, JobLoop, Launcher, LedgerHandle, LoopConfig, MetaLoop};
 
-pub use transport::{PairedDevice, PhoneAccess, PhoneListen, serve_socket, serve_websocket};
+pub use transport::{
+    PairedDevice, PhoneAccess, PhoneListen, Serving, serve_socket, serve_websocket,
+};
 
 #[derive(Clone, Debug)]
 pub struct HostConfig {
