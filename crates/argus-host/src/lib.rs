@@ -30,6 +30,7 @@ mod ledger_thread;
 mod proc;
 mod pty;
 mod pulse;
+mod reaper;
 mod runner;
 mod tail;
 mod tokens;

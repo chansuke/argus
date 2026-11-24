@@ -20,6 +20,7 @@ use argus_core::source::{SourceKind, SourceMeta, SourceOrigin};
 use argus_log::BlobStore;
 
 use crate::ledger_thread::{self, Cmd, observe};
+use crate::reaper::Reaper;
 use crate::tokens::RunTokens;
 use crate::{clock, git, proc, pty, tail};
 
@@ -427,6 +428,20 @@ pub(crate) fn spawn_capture(
     // Its own process group, so a stop reaches what it started too.
     command.process_group(0);
     let mut child = command.spawn()?;
+    let pgid = child.id();
+    // Stops the run if the host dies before it does (`reaper.rs`). A run argus could not
+    // stop that way is not left to run.
+    let reaper = match may_signal(pgid, own_group()) {
+        true => match Reaper::watch(pgid, control.grace) {
+            Ok(reaper) => Some(reaper),
+            Err(e) => {
+                signal_group(pgid, "KILL");
+                let _ = child.wait();
+                return Err(e);
+            }
+        },
+        false => None,
+    };
     let mut stdin = child.stdin.take();
     // `then`, not `zip`: the pipe is taken only when there is something to write, so a
     // terminal's input is not closed by accident.
@@ -461,7 +476,6 @@ pub(crate) fn spawn_capture(
     let started = clock::monotonic();
     let mut stopping: Option<Instant> = None;
     let mut cancelled = false;
-    let pgid = child.id();
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -496,6 +510,9 @@ pub(crate) fn spawn_capture(
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    if let Some(reaper) = reaper {
+        reaper.release();
+    }
     let status = Ended { status, cancelled };
     drop(stdin);
     if let Some(writer) = writer {
