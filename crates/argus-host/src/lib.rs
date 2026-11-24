@@ -60,6 +60,9 @@ pub use transport::{
 #[derive(Clone, Debug)]
 pub struct HostConfig {
     pub data_root: PathBuf,
+    /// The user's home directory, where agent CLIs keep their sessions. The binary that
+    /// builds the config reads `$HOME`; nothing in the host reads the environment.
+    pub home: PathBuf,
     /// Unix socket for the CLI and agents (`$XDG_RUNTIME_DIR/argus.sock`).
     pub socket: PathBuf,
     /// Network listener for the phone. Off by default.
@@ -122,7 +125,7 @@ impl HostInner {
         snapshot_deny.extend(config.snapshot_deny.iter().cloned());
         let cfg = LoopConfig {
             info: Some(info),
-            home: home(),
+            home: config.home.clone(),
             policy: config.policy.clone(),
             tools: config.tools.clone(),
             socket: config.socket.clone(),
@@ -152,7 +155,7 @@ impl HostInner {
         let ledger = self.store.open_meta().map_err(io_error)?;
         let cfg = LoopConfig {
             info: None,
-            home: home(),
+            home: self.config.home.clone(),
             policy: PolicyConfig::default(),
             tools: self.config.tools.clone(),
             socket: self.config.socket.clone(),
@@ -217,12 +220,6 @@ impl HostInner {
             let _ = thread.join();
         }
     }
-}
-
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
 }
 
 fn io_error(e: argus_core::LedgerError) -> std::io::Error {
@@ -415,6 +412,7 @@ mod tests {
         .unwrap();
         HostConfig {
             socket: data_root.join("argus.sock"),
+            home: data_root.join("home"),
             data_root,
             phone: None,
             // No test may start a real tool: agent CLIs and EAS cost money and write

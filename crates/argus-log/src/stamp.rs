@@ -21,6 +21,10 @@ impl Clock {
         Self { last }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one clock read in argus-log: a stamp is hybrid logical time"
+    )]
     pub fn tick(&mut self) -> Stamp {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

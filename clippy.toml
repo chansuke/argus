@@ -2,3 +2,13 @@ disallowed-types = [
     { path = "std::collections::HashMap", reason = "iteration order leaks into views and generated output; use BTreeMap" },
     { path = "std::collections::HashSet", reason = "iteration order leaks into views and generated output; use BTreeSet" },
 ]
+
+# Each of these has one wrapper per crate that carries `#[expect(clippy::disallowed_methods, reason = ...)]`.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "read the clock through `clock::now()` (argus-host) so time-dependent code is visible; pass `now` into core" },
+    { path = "std::time::Instant::now", reason = "use `clock::monotonic()` (argus-host) so time-dependent code is visible" },
+    { path = "std::process::Command::new", reason = "start processes through `proc::command` (argus-host); runs are recorded by core before the host starts them" },
+    { path = "std::env::var", reason = "read configuration in `HostConfig` (argus-host lib.rs) and pass it down; do not read the environment deep in the code" },
+    { path = "std::env::var_os", reason = "read configuration in `HostConfig` (argus-host lib.rs) and pass it down; do not read the environment deep in the code" },
+    { path = "std::process::exit", reason = "return an error or an ExitCode from main so destructors run and logs are flushed" },
+]

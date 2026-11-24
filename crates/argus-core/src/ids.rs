@@ -14,6 +14,10 @@ pub struct Id128(pub u128);
 impl Id128 {
     /// Wall time + pid + counter + `/dev/urandom`. Formats as a UUID so an agent run's
     /// id doubles as the Claude Code `--session-id`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one clock read in argus-core: a fresh id mixes wall time into its random key"
+    )]
     pub fn mint() -> Self {
         use std::io::Read;
         use std::sync::atomic::{AtomicU64, Ordering};

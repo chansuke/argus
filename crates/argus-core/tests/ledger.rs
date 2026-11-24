@@ -396,6 +396,10 @@ fn a_torn_source_log_reopens_to_a_prefix() {
 /// `ARGUS_TRANSCRIPTS=~/.claude/projects cargo nextest run -p argus-core --run-ignored all real_`
 #[test]
 #[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "an opt-in test reads the transcript root from ARGUS_TRANSCRIPTS"
+)]
 fn real_transcripts_replay_equal_to_live() {
     let root = std::env::var_os("ARGUS_TRANSCRIPTS").expect("set ARGUS_TRANSCRIPTS");
     let dir = scratch("real");
@@ -432,6 +436,10 @@ fn real_transcripts_replay_equal_to_live() {
 /// result, the plan share stays in range, and token totals count each message once.
 #[test]
 #[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "an opt-in test reads the transcript root from ARGUS_TRANSCRIPTS"
+)]
 fn real_transcripts_fill_every_job_view() {
     use argus_core::ids::UnixMillis;
     use argus_core::period::BucketWidth;

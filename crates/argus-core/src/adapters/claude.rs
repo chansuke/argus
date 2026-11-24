@@ -756,6 +756,10 @@ mod tests {
     /// `ARGUS_TRANSCRIPTS=~/.claude/projects cargo nextest run -p argus-core --run-ignored all real_`
     #[test]
     #[ignore = "reads real transcripts named by ARGUS_TRANSCRIPTS"]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an opt-in test reads the transcript root from ARGUS_TRANSCRIPTS"
+    )]
     fn real_transcripts_have_no_unrecognized_records() {
         let root = std::env::var_os("ARGUS_TRANSCRIPTS").expect("set ARGUS_TRANSCRIPTS");
         let mut dirs = vec![std::path::PathBuf::from(root)];

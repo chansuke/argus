@@ -5,6 +5,10 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this is the host's one process constructor"
+)]
 pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }

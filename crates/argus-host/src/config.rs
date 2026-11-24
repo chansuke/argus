@@ -132,6 +132,7 @@ pub fn host_config(text: Option<&str>, defaults: &Defaults) -> Result<HostConfig
     };
     Ok(HostConfig {
         data_root,
+        home: defaults.home.clone(),
         socket,
         phone: get("phone").map(phone).transpose()?,
         tools: tools(get("tools"))?,

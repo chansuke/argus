@@ -574,6 +574,10 @@ fn a_torn_header_is_repaired_only_if_it_is_a_prefix_of_ours() {
 
 /// A lock released a moment ago is taken; one held for good is refused after the wait.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "measures how long open waits for a held lock"
+)]
 fn a_briefly_held_lock_is_waited_for_and_a_held_one_is_refused() {
     let dir = scratch("lock-wait");
     let a = actor("host");
@@ -774,6 +778,10 @@ fn a_frame_cut_short_after_indexing_is_corrupt_at_its_offset() {
 
 /// When the cut-off bytes cannot be kept, opening fails instead of dropping them.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "measures that open fails without waiting"
+)]
 fn a_tail_that_cannot_be_set_aside_fails_the_open() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("readonly");

@@ -19,6 +19,11 @@ license = "MIT"
 
 # std only: no third-party dependencies in workspace members.
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.lints.clippy]
+# Configured in clippy.toml; each names the wrapper to call instead.
+disallowed_methods = "warn"
 # Iteration order must never leak into logs, views, or generated TS (same rule as tlars).
 disallowed_types = "warn"

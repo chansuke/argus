@@ -527,7 +527,6 @@ fn commit_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use argus_core::command::SNAPSHOT_DENY;
@@ -535,7 +534,7 @@ mod tests {
     use argus_core::ids::Id128;
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::proc::command("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")

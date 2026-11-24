@@ -1647,6 +1647,10 @@ mod tests {
     /// small haiku turns and leaves two sessions in ~/.claude/projects.
     #[test]
     #[ignore = "runs the real claude CLI, which costs a little and writes ~/.claude"]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the opt-in real run uses the claude login under the user's $HOME"
+    )]
     fn real_claude_answers_under_a_pty_and_feedback_resumes_a_copy_of_its_session() {
         let mut ws = job_repo("real-claude");
         ws.home = PathBuf::from(std::env::var_os("HOME").unwrap());
