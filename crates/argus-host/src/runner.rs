@@ -50,10 +50,17 @@ impl Running {
 /// this says where, from the job's `JobInfo` and the views at start.
 #[derive(Clone)]
 pub(crate) struct Workspace {
-    pub repo: PathBuf,
-    pub worktree: PathBuf,
     pub home: PathBuf,
     pub blobs: BlobStore,
+    /// The job the run belongs to; `None` for a run on the meta ledger.
+    pub job: Option<JobPlace>,
+}
+
+/// Where a job's runs work: its repository, worktree, and branches.
+#[derive(Clone)]
+pub(crate) struct JobPlace {
+    pub repo: PathBuf,
+    pub worktree: PathBuf,
     pub job: JobId,
     pub base: CommitOid,
     /// The head snapshot's tree when the run starts (a new snapshot's `previous`).
@@ -105,11 +112,13 @@ fn execute(
     control: &mut Control,
 ) -> RunOutcome {
     let failed = |reason: String| RunOutcome::Failed { reason };
+    let no_job = || failed("this run needs a job".into());
     match inv {
         Invocation::Process(spec) => run_process(spec, env, ws, ledger, control),
         Invocation::InProcess(Effect::Snapshot) => {
-            let previous = ws.previous.as_ref();
-            match git::snapshot(&ws.worktree, &ws.base, previous, ws.job, &env.snapshot_deny) {
+            let Some(j) = &ws.job else { return no_job() };
+            let previous = j.previous.as_ref();
+            match git::snapshot(&j.worktree, &j.base, previous, j.job, &env.snapshot_deny) {
                 Ok(snapshot) => RunOutcome::Snapshot(snapshot),
                 Err(e) => failed(e.to_string()),
             }
@@ -122,8 +131,9 @@ fn execute(
         }
         Invocation::Leased { .. } => failed("device checks are not supported yet".into()),
         Invocation::InProcess(Effect::Merge(approved)) => {
+            let Some(j) = &ws.job else { return no_job() };
             let (tree, base) = (approved.tree(), approved.base());
-            match git::merge(&ws.repo, ws.job, tree, base, &ws.target) {
+            match git::merge(&j.repo, j.job, tree, base, &j.target) {
                 Ok(commit) => RunOutcome::Merged { commit },
                 Err(reason) => failed(reason),
             }
@@ -141,22 +151,24 @@ fn run_process(
     ledger: &Sender<Cmd>,
     control: &mut Control,
 ) -> RunOutcome {
+    let spawn_failed = |error: String| RunOutcome::SpawnFailed { error };
+    let job = |what: &str| ws.job.as_ref().ok_or(format!("{what} needs a job"));
     // Held until the process ended: dropping it removes the checkout.
-    let checkout = match &spec.workdir {
-        Workdir::Snapshot { tree, base } => match git::materialize(&ws.repo, tree, base) {
-            Ok(checkout) => Some(checkout),
-            Err(e) => {
-                return RunOutcome::SpawnFailed {
-                    error: e.to_string(),
-                };
-            }
+    let mut checkout = None;
+    let dir = match &spec.workdir {
+        Workdir::Home => ws.home.clone(),
+        Workdir::JobWorktree => match job("the job worktree") {
+            Ok(j) => j.worktree.clone(),
+            Err(e) => return spawn_failed(e),
         },
-        Workdir::JobWorktree | Workdir::Home => None,
-    };
-    let dir = match (&spec.workdir, &checkout) {
-        (_, Some(checkout)) => checkout.path.clone(),
-        (Workdir::Home, None) => ws.home.clone(),
-        _ => ws.worktree.clone(),
+        Workdir::Snapshot { tree, base } => {
+            let made = job("a snapshot checkout")
+                .and_then(|j| git::materialize(&j.repo, tree, base).map_err(|e| e.to_string()));
+            match made {
+                Ok(made) => checkout.insert(made).path.clone(),
+                Err(e) => return spawn_failed(e),
+            }
+        }
     };
     let artifacts = match spec.artifacts {
         true => {
@@ -619,14 +631,16 @@ mod tests {
     fn workspace(worktree: &Path) -> Workspace {
         let data = worktree.join(".argus-data");
         Workspace {
-            repo: worktree.to_path_buf(),
-            worktree: worktree.to_path_buf(),
             home: worktree.to_path_buf(),
             blobs: argus_log::LogDir::new(data).blobs(),
-            job: argus_core::ids::JobId(Id128(1)),
-            base: CommitOid::parse(&"b".repeat(40)).unwrap(),
-            previous: None,
-            target: "release".into(),
+            job: Some(JobPlace {
+                repo: worktree.to_path_buf(),
+                worktree: worktree.to_path_buf(),
+                job: argus_core::ids::JobId(Id128(1)),
+                base: CommitOid::parse(&"b".repeat(40)).unwrap(),
+                previous: None,
+                target: "release".into(),
+            }),
         }
     }
 
@@ -900,7 +914,8 @@ mod tests {
         git(&dir, &["add", "-A"]);
         git(&dir, &["commit", "-qm", "base"]);
         let mut ws = workspace(&dir);
-        ws.base = CommitOid::parse(&git(&dir, &["rev-parse", "HEAD"])).unwrap();
+        ws.job.as_mut().unwrap().base =
+            CommitOid::parse(&git(&dir, &["rev-parse", "HEAD"])).unwrap();
         std::fs::write(dir.join("a.txt"), "changed\n").unwrap();
         ws
     }
@@ -981,7 +996,8 @@ mod tests {
     #[test]
     fn a_merge_run_brings_the_approved_snapshot_into_the_target() {
         let ws = job_repo("merge");
-        git(&ws.repo, &["branch", &ws.target, ws.base.as_str()]);
+        let j = ws.job.clone().unwrap();
+        git(&j.repo, &["branch", &j.target, j.base.as_str()]);
         let got = run_to_end(Invocation::InProcess(Effect::Snapshot), ws.clone());
         let RunOutcome::Snapshot(s) = finished(&got) else {
             panic!()
@@ -991,9 +1007,9 @@ mod tests {
         let RunOutcome::Merged { commit } = finished(&got) else {
             panic!("{:?}", finished(&got))
         };
-        assert_eq!(git(&ws.repo, &["rev-parse", &ws.target]), commit.as_str());
+        assert_eq!(git(&j.repo, &["rev-parse", &j.target]), commit.as_str());
         assert_eq!(
-            git(&ws.repo, &["rev-parse", &format!("{}^{{tree}}", ws.target)]),
+            git(&j.repo, &["rev-parse", &format!("{}^{{tree}}", j.target)]),
             s.tree.as_str()
         );
     }
@@ -1021,24 +1037,26 @@ mod tests {
     #[test]
     fn a_snapshot_run_finishes_with_the_snapshot() {
         let ws = job_repo("snapshot");
+        let j = ws.job.clone().unwrap();
         let got = run_to_end(Invocation::InProcess(Effect::Snapshot), ws.clone());
         let RunOutcome::Snapshot(s) = finished(&got) else {
             panic!("{:?}", finished(&got))
         };
-        assert_eq!(s.base, ws.base);
-        let blob = git(&ws.repo, &["show", &format!("{}:a.txt", s.tree.as_str())]);
+        assert_eq!(s.base, j.base);
+        let blob = git(&j.repo, &["show", &format!("{}:a.txt", s.tree.as_str())]);
         assert_eq!(blob, "changed");
     }
 
     #[test]
     fn a_checker_runs_in_a_checkout_of_its_snapshot() {
         let ws = job_repo("checkout");
+        let j = ws.job.clone().unwrap();
         let got = run_to_end(Invocation::InProcess(Effect::Snapshot), ws.clone());
         let RunOutcome::Snapshot(s) = finished(&got) else {
             panic!()
         };
         // The agent edits again; the checker must judge the snapshot, not this.
-        std::fs::write(ws.worktree.join("a.txt"), "later\n").unwrap();
+        std::fs::write(j.worktree.join("a.txt"), "later\n").unwrap();
         let mut spec = sh("cat a.txt; basename \"$PWD\"");
         spec.workdir = Workdir::Snapshot {
             tree: s.tree,

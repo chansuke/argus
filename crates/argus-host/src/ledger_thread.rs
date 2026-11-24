@@ -18,7 +18,7 @@ use argus_core::views::ViewSet;
 use argus_core::views::runs::Due;
 
 use crate::pulse::Dep;
-use crate::runner::{Running, Workspace};
+use crate::runner::{JobPlace, Running, Workspace};
 
 pub(crate) enum Cmd {
     Submit {
@@ -347,14 +347,16 @@ impl<L: Launcher> JobLoop<L> {
             return true;
         };
         let ws = Workspace {
-            repo: info.repo.clone(),
-            worktree: info.worktree.clone(),
             home: self.cfg.home.clone(),
             blobs: self.ledger.blobs(),
-            job: info.job,
-            base: info.base.clone(),
-            previous,
-            target: info.target.clone(),
+            job: Some(JobPlace {
+                repo: info.repo.clone(),
+                worktree: info.worktree.clone(),
+                job: info.job,
+                base: info.base.clone(),
+                previous,
+                target: info.target.clone(),
+            }),
         };
         let running = self.launcher.start(inv, env, ws, self.inbox.clone());
         self.live.insert(run, running);
@@ -686,8 +688,14 @@ mod tests {
             };
             assert_eq!(spec.program, PathBuf::from("claude"));
             assert!(matches!(spec.workdir, Workdir::JobWorktree));
-            assert_eq!(launched.ws.worktree, PathBuf::from("/w/jobs/1"));
-            assert_eq!(launched.ws.repo, PathBuf::from("/w/argus"));
+            assert_eq!(
+                launched.ws.job.as_ref().unwrap().worktree,
+                PathBuf::from("/w/jobs/1")
+            );
+            assert_eq!(
+                launched.ws.job.as_ref().unwrap().repo,
+                PathBuf::from("/w/argus")
+            );
         }
 
         // Nothing new happens on later batches while it runs.
@@ -809,7 +817,7 @@ mod tests {
         let launched = job.launcher.0.lock().unwrap();
         let review = launched.iter().find_map(|s| match &s.inv {
             Invocation::Process(spec) if matches!(spec.workdir, Workdir::Snapshot { .. }) => {
-                Some((s.run, s.ws.previous.clone()))
+                Some((s.run, s.ws.job.as_ref().unwrap().previous.clone()))
             }
             _ => None,
         });
