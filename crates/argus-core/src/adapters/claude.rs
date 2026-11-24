@@ -75,10 +75,16 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
     }
 }
 
-/// Unverified: the prompt is a numbered menu (1 yes, 2 yes and don't ask again, 3 no)
-/// in current versions; confirm per version before relying on it.
-pub(crate) fn permission_keys(answer: PermissionAnswer) -> Vec<u8> {
-    todo!("not implemented")
+/// Seen on 2.1.329 (shell and write prompts): a numbered menu where a digit picks without
+/// Enter. "Yes" was 1 in both. "No" moves (3 for a write, 4 for a shell command), but
+/// Escape denies the same way. Option 2 means a different thing per tool (allow a directory, switch to
+/// accept-edits), never "this kind of call", so `AllowAlways` has no key.
+pub(crate) fn permission_keys(answer: PermissionAnswer) -> Option<Vec<u8>> {
+    match answer {
+        PermissionAnswer::Allow => Some(b"1".to_vec()),
+        PermissionAnswer::Deny => Some(b"\x1b".to_vec()),
+        PermissionAnswer::AllowAlways => None,
+    }
 }
 
 /// One transcript line.
@@ -861,5 +867,18 @@ mod tests {
         assert_eq!(update("completed"), Some(PlanStatus::Completed));
         assert_eq!(update("deleted"), Some(PlanStatus::Deleted));
         assert_eq!(update("someday"), None);
+    }
+
+    #[test]
+    fn a_permission_prompt_is_answered_by_position_one_or_escape() {
+        assert_eq!(
+            permission_keys(PermissionAnswer::Allow),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            permission_keys(PermissionAnswer::Deny),
+            Some(b"\x1b".to_vec())
+        );
+        assert_eq!(permission_keys(PermissionAnswer::AllowAlways), None);
     }
 }

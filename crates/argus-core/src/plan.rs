@@ -187,8 +187,9 @@ pub enum PermissionAnswer {
 }
 
 /// The keystrokes that answer an agent's permission prompt. They are sent as an ordinary
-/// `RunInput`, so the raw log shows exactly what was typed. The adapter owns the keys.
-pub fn permission_input(cli: AgentCli, answer: PermissionAnswer) -> Vec<u8> {
+/// `RunInput`, so the raw log shows exactly what was typed. The adapter owns the keys;
+/// `None` when the agent's prompt has no key for that answer.
+pub fn permission_input(cli: AgentCli, answer: PermissionAnswer) -> Option<Vec<u8>> {
     match cli {
         AgentCli::Claude => adapters::claude::permission_keys(answer),
         AgentCli::Codex => adapters::codex::permission_keys(answer),

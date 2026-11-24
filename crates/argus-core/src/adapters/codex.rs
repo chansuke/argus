@@ -12,8 +12,9 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
     todo!("not implemented")
 }
 
-pub(crate) fn permission_keys(answer: PermissionAnswer) -> Vec<u8> {
-    todo!("not implemented")
+/// Not verified against a real prompt yet, so no answer has keys.
+pub(crate) fn permission_keys(_answer: PermissionAnswer) -> Option<Vec<u8>> {
+    None
 }
 
 pub(crate) fn decode_rollout(bytes: &[u8]) -> Decoded {
