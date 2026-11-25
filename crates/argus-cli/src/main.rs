@@ -10,17 +10,13 @@
 //! argus call set_task '{"title": "Parser", "weight": 2}'
 //! argus watch job '{"job": "<id>"}'  prints the value again each time it changes
 //! argus hook                         an agent CLI's hook: stdin, verbatim, to `hook`
+//! argus mcp                          the ops open to agents as MCP tools (`mcp.rs`)
 //! ```
 //!
 //! The socket is `$ARGUS_SOCKET`, else the host's default (`argus_api::place::socket`).
 //! A run argus started has `ARGUS_RUN` and `ARGUS_TOKEN` in its environment, and the
 //! host then treats the caller as that run's agent; otherwise the caller is the user.
 
-#[expect(
-    dead_code,
-    unused_variables,
-    reason = "the MCP server is a stub that takes a client it does not use"
-)]
 mod mcp;
 mod socket;
 
@@ -37,13 +33,15 @@ use socket::SocketTransport;
 const USAGE: &str = "usage: argus ops
        argus call <op> [<input JSON>]
        argus watch <op> [<input JSON>]
-       argus hook";
+       argus hook
+       argus mcp";
 
 enum Command {
     Ops,
     Call { op: String, input: Json },
     Watch { op: String, input: Json },
     Hook,
+    Mcp,
 }
 
 fn parse(args: &[String]) -> Option<Command> {
@@ -54,6 +52,7 @@ fn parse(args: &[String]) -> Option<Command> {
     match args {
         [cmd] if cmd == "ops" => Some(Command::Ops),
         [cmd] if cmd == "hook" => Some(Command::Hook),
+        [cmd] if cmd == "mcp" => Some(Command::Mcp),
         [cmd, op, rest @ ..] if cmd == "call" && rest.len() <= 1 => Some(Command::Call {
             op: op.clone(),
             input: input(rest.first())?,
@@ -124,6 +123,33 @@ fn run(command: Command) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|e| refused("hook", e))
         }
+        Command::Mcp => {
+            let mut transport = Reconnecting { socket: None };
+            mcp::serve(&mut transport, std::io::stdin().lock(), std::io::stdout())
+                .map_err(|e| format!("mcp: {e}"))
+        }
+    }
+}
+
+/// Connects on the first call, so an MCP client can start before the host, and again
+/// after a call that failed inside the host or on the way to it.
+struct Reconnecting {
+    socket: Option<SocketTransport>,
+}
+
+impl Transport for Reconnecting {
+    fn call(&mut self, op: &str, input: Json) -> Result<Json, ApiError> {
+        let socket = match &mut self.socket {
+            Some(socket) => socket,
+            None => self
+                .socket
+                .insert(connect().map_err(|what| ApiError::Internal { what })?),
+        };
+        let reply = socket.call(op, input);
+        if let Err(ApiError::Internal { .. }) = reply {
+            self.socket = None;
+        }
+        reply
     }
 }
 

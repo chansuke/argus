@@ -240,3 +240,37 @@ fn a_hello_the_host_refuses_is_reported_as_such() {
     let err = text(&out.stderr);
     assert!(err.contains("ARGUS_TOKEN"), "{err}");
 }
+
+#[test]
+fn mcp_tools_reach_the_host_as_the_runs_agent() {
+    let dir = scratch();
+    let socket = dir.join("s.sock");
+    let host = Host::serve(&socket, |id| {
+        vec![format!(
+            r#"{{"kind":"Reply","id":{id},"ok":{{"task":"t1"}},"err":null}}"#
+        )]
+    });
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"set_task","arguments":{"job":"j","title":"Parser"}}}"#,
+    ]
+    .join("\n");
+    let env = [("ARGUS_RUN", "r1"), ("ARGUS_TOKEN", "secret")];
+    let out = argus(&socket, &["mcp"], &env, requests.as_bytes());
+    let [hello, request] = host.seen();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(hello, r#"{"kind":"Hello","token":"secret","run":"r1"}"#);
+    assert!(request.contains(r#""op":"set_task""#), "{request}");
+    let replies = text(&out.stdout);
+    let lines: Vec<&str> = replies.lines().collect();
+    assert_eq!(lines.len(), 2, "{replies}");
+    assert!(
+        lines[0].contains(r#""protocolVersion":"2025-11-25""#),
+        "{replies}"
+    );
+    assert!(
+        lines[1].contains(r#""structuredContent":{"task":"t1"}"#),
+        "{replies}"
+    );
+}
