@@ -1502,3 +1502,58 @@ fn the_overview_queue_puts_the_most_urgent_first_across_jobs() {
         .collect();
     assert_eq!(order, vec![(2, true), (1, false)]);
 }
+
+#[test]
+fn a_codex_reviews_findings_come_from_its_last_message() {
+    let mut job = Job::open();
+    job.snapshot_of(10, oid('1'), None, Vec::new());
+    let spec = ReviewSpec {
+        tree: oid('1'),
+        base: oid('b'),
+        lens: ReviewLens::General,
+        llm: LlmCall {
+            model: ModelChoice {
+                cli: AgentCli::Codex,
+                model: argus_core::ids::ModelId("gpt-6.2-sol".into()),
+                effort: None,
+            },
+            prompt: "review".into(),
+        },
+    };
+    job.ok(
+        Author::Human,
+        Event::RunRequested {
+            run: run(5),
+            purpose: RunPurpose::Review(spec),
+        },
+    );
+    job.start(5);
+    let answer = format!("Notes.\n\n```json\n{FINDINGS_2}\n```\n");
+    let message = |id: &str, text: &str| {
+        format!(
+            r#"{{"type":"item.completed","item":{{"id":"{id}","type":"agent_message","text":{}}}}}"#,
+            json_string(text)
+        )
+    };
+    job.feed(
+        5,
+        SourceKind::CodexExec,
+        SourceOrigin::Stdout,
+        &[
+            r#"{"type":"thread.started","thread_id":"t"}"#.to_owned(),
+            r#"{"type":"turn.started"}"#.to_owned(),
+            message("item_0", "Reading the diff first."),
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"git diff","aggregated_output":"","exit_code":0,"status":"completed"}}"#.to_owned(),
+            message("item_2", &answer),
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}"#.to_owned(),
+        ],
+    );
+    job.finish(5, RunOutcome::Exited { code: 0 });
+    let views = job.ledger.views();
+    let (_, r) = views.review().reviews().next().unwrap();
+    let argus_core::views::review::ReviewOutput::Findings(found) = &r.output else {
+        panic!("{:?}", r.output)
+    };
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].title, "line2 is wrong");
+}

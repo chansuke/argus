@@ -173,6 +173,54 @@ fn a_reviewer_reads_a_checkout_of_the_snapshot_and_answers_on_stdout() {
 }
 
 #[test]
+fn a_codex_reviewer_runs_exec_read_only_and_answers_on_stdout() {
+    let review = |effort| {
+        RunPurpose::Review(ReviewSpec {
+            tree: oid('1'),
+            base: oid('b'),
+            lens: ReviewLens::General,
+            llm: LlmCall {
+                model: ModelChoice {
+                    cli: AgentCli::Codex,
+                    model: ModelId("gpt-6.2-sol".into()),
+                    effort,
+                },
+                prompt: "review this".into(),
+            },
+        })
+    };
+    let spec = process(&review(Some(Effort::Max)));
+    assert_eq!(spec.program, std::path::PathBuf::from("/bin/codex"));
+    assert_eq!(
+        args(&spec),
+        vec![
+            "exec",
+            "--json",
+            "--model",
+            "gpt-6.2-sol",
+            "-c",
+            "model_reasoning_effort=\"xhigh\"",
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "-",
+        ]
+    );
+    assert_eq!(spec.stdin.as_deref(), Some(b"review this".as_slice()));
+    assert_eq!(
+        (spec.stdout, spec.stderr),
+        (SourceKind::CodexExec, SourceKind::PlainText)
+    );
+    assert!(!spec.terminal);
+    assert_eq!(snapshot_workdir(&spec), (oid('1'), oid('b')));
+    // Without an effort, Codex's own default applies.
+    assert!(!args(&process(&review(None))).contains(&"-c"));
+}
+
+#[test]
 fn a_summary_gets_no_tools_at_all() {
     let summarize = RunPurpose::Summarize {
         window: Window {

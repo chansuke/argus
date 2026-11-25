@@ -24,7 +24,16 @@ pub(crate) enum ToolAccess {
 ///          limited to `git diff`/`git log`/`git show`. Flags from Claude Code 2.1.303
 ///          `--help`; unverified: that print mode denies a Bash call outside the allowed
 ///          patterns instead of waiting for an answer.
-/// Codex:  `codex exec --model <m> --json -`, stdout `CodexExec` (not written yet).
+/// Codex:  `codex exec --json --model <m> [-c model_reasoning_effort="<e>"] --sandbox
+///          read-only --ephemeral --skip-git-repo-check --color never -`, prompt on stdin,
+///          stdout `CodexExec`. `--ephemeral` keeps the session out of `~/.codex/sessions`
+///          for the same reason as Claude's flag. Codex has no switch that removes its
+///          tools, so both `ToolAccess` levels are its read-only sandbox: it may read and
+///          run read-only commands, never write. `Max` effort is `xhigh`, the highest level
+///          seen in codex-cli 0.171.0 sessions. `--skip-git-repo-check`: a snapshot
+///          checkout or the home directory need not be a repository. Flags from
+///          codex-cli 0.171.0 `exec --help`; unverified: that exec never stops to ask for
+///          an approval under `read-only`.
 pub(crate) fn headless(
     call: &LlmCall,
     access: ToolAccess,
@@ -80,7 +89,48 @@ pub(crate) fn headless(
                 timeout: None,
             }
         }
-        AgentCli::Codex => todo!("not implemented"),
+        AgentCli::Codex => {
+            let mut args: Vec<String> = ["exec", "--json", "--model"]
+                .map(String::from)
+                .into_iter()
+                .chain([call.model.model.0.clone()])
+                .collect();
+            if let Some(effort) = call.model.effort {
+                let effort = match effort {
+                    Effort::Low => "low",
+                    Effort::Medium => "medium",
+                    Effort::High => "high",
+                    Effort::Max => "xhigh",
+                };
+                args.extend(["-c".into(), format!("model_reasoning_effort=\"{effort}\"")]);
+            }
+            args.extend(
+                [
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    "-",
+                ]
+                .map(String::from),
+            );
+            CommandSpec {
+                program: env.tools.codex.clone(),
+                args,
+                env: Vec::new(),
+                workdir,
+                cwd: None,
+                stdin: Some(call.prompt.clone().into_bytes()),
+                stdout: SourceKind::CodexExec,
+                stderr: SourceKind::PlainText,
+                terminal: false,
+                watch: Vec::new(),
+                artifacts: false,
+                timeout: None,
+            }
+        }
     }
 }
 
