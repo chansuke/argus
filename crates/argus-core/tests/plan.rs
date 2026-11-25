@@ -110,6 +110,74 @@ fn a_claude_agent_runs_interactively_under_its_run_id() {
     );
 }
 
+fn codex_agent(prompt: &str, resume: Option<RunId>) -> RunPurpose {
+    RunPurpose::Agent(AgentLaunch {
+        cli: AgentCli::Codex,
+        model: Some(ModelId("gpt-6.2-sol".into())),
+        prompt: prompt.into(),
+        resume,
+    })
+}
+
+#[test]
+fn a_codex_agent_works_on_its_own_in_the_worktree_and_reports_on_stdout() {
+    let spec = process(&codex_agent("fix the gate", None));
+    assert_eq!(spec.program, PathBuf::from("/bin/codex"));
+    assert_eq!(
+        args(&spec),
+        vec![
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "--json",
+            "--model",
+            "gpt-6.2-sol",
+            "--skip-git-repo-check",
+            "-",
+        ]
+    );
+    assert_eq!(spec.stdin.as_deref(), Some(b"fix the gate".as_slice()));
+    assert_eq!(
+        (spec.stdout, spec.stderr),
+        (SourceKind::CodexAgentExec, SourceKind::PlainText)
+    );
+    assert!(!spec.terminal);
+    assert!(spec.watch.is_empty());
+    assert!(matches!(spec.workdir, Workdir::JobWorktree));
+    assert!(spec.env.contains(&("ARGUS_RUN".into(), RUN.into())));
+    assert!(
+        spec.env
+            .contains(&("ARGUS_SOCKET".into(), "/run/argus.sock".into()))
+    );
+}
+
+#[test]
+fn codex_feedback_continues_the_latest_session_in_the_worktree() {
+    let spec = process(&codex_agent(
+        "- src/a.rs:2: keep the old name",
+        Some(RunId(Id128(7))),
+    ));
+    assert_eq!(
+        args(&spec),
+        vec![
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "resume",
+            "--last",
+            "--json",
+            "--model",
+            "gpt-6.2-sol",
+            "--skip-git-repo-check",
+            "-",
+        ]
+    );
+    assert_eq!(
+        spec.stdin.as_deref(),
+        Some(b"- src/a.rs:2: keep the old name".as_slice())
+    );
+}
+
 #[test]
 fn feedback_resumes_a_copy_of_the_earlier_session_under_the_new_run_id() {
     let prev = RunId(Id128(7));

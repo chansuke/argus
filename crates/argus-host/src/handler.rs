@@ -487,6 +487,7 @@ fn raw_format(kind: SourceKind) -> RawFormat {
         | SourceKind::ClaudeHook
         | SourceKind::CodexRollout
         | SourceKind::CodexExec
+        | SourceKind::CodexAgentExec
         | SourceKind::LeanJson
         | SourceKind::EasEvents => RawFormat::Json,
     }

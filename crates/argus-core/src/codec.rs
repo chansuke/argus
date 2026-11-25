@@ -406,6 +406,7 @@ wire_enum! {
         ClaudeHook {},
         CodexRollout {},
         CodexExec {},
+        CodexAgentExec {},
         Terminal {},
         TlcTool {},
         LeanText {},

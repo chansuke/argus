@@ -19,7 +19,9 @@ pub(crate) fn decoder_version(kind: SourceKind) -> u32 {
         SourceKind::ClaudeTranscript | SourceKind::ClaudeStreamJson | SourceKind::ClaudeHook => {
             claude::VERSION
         }
-        SourceKind::CodexRollout | SourceKind::CodexExec => codex::VERSION,
+        SourceKind::CodexRollout | SourceKind::CodexExec | SourceKind::CodexAgentExec => {
+            codex::VERSION
+        }
         SourceKind::TlcTool => tlc::VERSION,
         SourceKind::LeanText | SourceKind::LeanJson => lean::VERSION,
         SourceKind::EasEvents => eas::VERSION,
@@ -35,6 +37,7 @@ pub(crate) fn decode(kind: SourceKind, bytes: &[u8]) -> Decoded {
         SourceKind::ClaudeHook => claude::decode_hook(bytes),
         SourceKind::CodexRollout => codex::decode_rollout(bytes),
         SourceKind::CodexExec => codex::decode_exec(bytes),
+        SourceKind::CodexAgentExec => codex::decode_agent_exec(bytes),
         SourceKind::TlcTool => tlc::decode(bytes),
         SourceKind::LeanText => lean::decode_text(bytes),
         SourceKind::LeanJson => lean::decode_json(bytes),

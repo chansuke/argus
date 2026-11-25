@@ -72,6 +72,9 @@ pub enum SourceKind {
     CodexRollout,
     /// `codex exec --json` stdout (headless runs).
     CodexExec,
+    /// `codex exec --json` stdout of an agent run: the session itself, as Codex agents
+    /// run on their own (no terminal).
+    CodexAgentExec,
     Terminal,
     /// `-tool` output of java TLC or tlars.
     TlcTool,
@@ -107,7 +110,9 @@ pub enum SourceFamily {
 impl SourceKind {
     pub fn family(self) -> SourceFamily {
         match self {
-            SourceKind::ClaudeTranscript | SourceKind::CodexRollout => SourceFamily::AgentSession,
+            SourceKind::ClaudeTranscript
+            | SourceKind::CodexRollout
+            | SourceKind::CodexAgentExec => SourceFamily::AgentSession,
             SourceKind::ClaudeStreamJson | SourceKind::CodexExec => SourceFamily::AgentHeadless,
             SourceKind::ClaudeHook => SourceFamily::AgentHook,
             SourceKind::TlcTool | SourceKind::LeanText | SourceKind::LeanJson => {

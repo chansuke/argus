@@ -1,4 +1,5 @@
-//! Codex CLI: headless `codex exec --json` lines, and the session rollout files.
+//! Codex CLI: `codex exec --json` lines (headless runs and agent runs), and the session
+//! rollout files.
 //! This module is the only code that knows either format.
 //!
 //! `exec --json` events follow `codex-rs/exec/src/exec_events.rs` (main branch):
@@ -9,22 +10,66 @@
 use argus_json::Json;
 
 use super::touch::{inserted, shell_paths};
-use crate::command::{CommandSpec, PermissionAnswer, PlanEnv};
+use crate::command::{CommandSpec, PermissionAnswer, PlanEnv, Workdir};
 use crate::event::AgentLaunch;
 use crate::ids::{RecordKey, ToolCallId, ToolName, UnixMillis};
 use crate::source::{
     AgentEvent, AgentWhat, Decoded, FileTouch, Observation, PlanItem, PlanOp, PlanStatus,
-    TokenUsage, TouchHow,
+    SourceKind, TokenUsage, TouchHow,
 };
 
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
-/// `codex [--model m] [resume <session>] <prompt>` under a PTY; watch the rollout file.
+/// `codex exec --sandbox workspace-write --json [--model m] --skip-git-repo-check -` in
+/// the job worktree, prompt on stdin, stdout `CodexAgentExec`: the agent works on its own
+/// (no terminal), may write only inside the worktree, and its stdout is the run's session
+/// log. Codex cannot be given a session id at start, so its rollout file is not known in
+/// advance; the stdout carries the same turn (user decision, 2026-11-26).
+///
+/// Feedback (`launch.resume`) is `codex exec --sandbox workspace-write resume --last ...`:
+/// the newest session recorded in that working directory, which is the job's previous
+/// agent run because each job has its own worktree and its agent runs are sequential. A
+/// Codex session someone starts by hand in the worktree would be picked instead.
+///
+/// Env: `ARGUS_RUN`, `ARGUS_SOCKET`, as for Claude. Flags from codex-cli 0.171.0
+/// `exec --help` and `exec resume --help`; unverified: that `--last` filters by the
+/// working directory (its help says `--all` disables that filtering), and that exec never
+/// stops to ask for an approval under `workspace-write`.
 pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
-    todo!("not implemented")
+    let mut args: Vec<String> = ["exec", "--sandbox", "workspace-write"]
+        .map(String::from)
+        .into();
+    if launch.resume.is_some() {
+        args.extend(["resume".into(), "--last".into()]);
+    }
+    args.push("--json".into());
+    if let Some(model) = &launch.model {
+        args.extend(["--model".into(), model.0.clone()]);
+    }
+    args.extend(["--skip-git-repo-check".into(), "-".into()]);
+    CommandSpec {
+        program: env.tools.codex.clone(),
+        args,
+        env: vec![
+            ("ARGUS_RUN".to_owned(), env.run.0.to_string()),
+            (
+                "ARGUS_SOCKET".to_owned(),
+                env.socket.to_string_lossy().into_owned(),
+            ),
+        ],
+        workdir: Workdir::JobWorktree,
+        cwd: None,
+        stdin: Some(launch.prompt.clone().into_bytes()),
+        stdout: SourceKind::CodexAgentExec,
+        stderr: SourceKind::PlainText,
+        terminal: false,
+        watch: Vec::new(),
+        artifacts: false,
+        timeout: None,
+    }
 }
 
-/// Not verified against a real prompt yet, so no answer has keys.
+/// An agent run has no terminal to answer a prompt in.
 pub(crate) fn permission_keys(_answer: PermissionAnswer) -> Option<Vec<u8>> {
     None
 }
@@ -264,6 +309,25 @@ fn mcp_call(item: &Json, id: ToolCallId, status: Option<&str>) -> Vec<AgentWhat>
 /// - `turn.completed` -> `Usage` (no message id: one per turn, added) + `TurnEnded`.
 /// - `turn.failed` and `error` -> `Result { is_error }`, so a failed review says why.
 pub(crate) fn decode_exec(bytes: &[u8]) -> Decoded {
+    exec_line(bytes, Purpose::Answer)
+}
+
+/// One `codex exec --json` line of an agent run: as `decode_exec`, except that a message
+/// is a `Reply` (the agent talking while it works), not the answer of a headless call.
+pub(crate) fn decode_agent_exec(bytes: &[u8]) -> Decoded {
+    exec_line(bytes, Purpose::Work)
+}
+
+/// What an exec run's messages are.
+#[derive(Clone, Copy)]
+enum Purpose {
+    /// A headless call: the last message is its answer (`Result`).
+    Answer,
+    /// An agent run: messages are replies.
+    Work,
+}
+
+fn exec_line(bytes: &[u8], purpose: Purpose) -> Decoded {
     let v = match argus_json::parse(bytes) {
         Ok(v) => v,
         Err(e) => return unrecognized(format!("not JSON at byte {}: {}", e.at, e.what)),
@@ -284,7 +348,7 @@ pub(crate) fn decode_exec(bytes: &[u8]) -> Decoded {
                 return unrecognized("item.completed without an item".into());
             };
             let record = str_at(item, "id").map(|id| RecordKey(id.to_owned()));
-            (record, exec_item(item))
+            (record, exec_item(item, purpose))
         }
         "turn.completed" => {
             let mut whats = Vec::new();
@@ -314,14 +378,20 @@ pub(crate) fn decode_exec(bytes: &[u8]) -> Decoded {
     events(record, None, whats)
 }
 
-fn exec_item(item: &Json) -> Vec<AgentWhat> {
+fn exec_item(item: &Json, purpose: Purpose) -> Vec<AgentWhat> {
     let id = ToolCallId(str_at(item, "id").unwrap_or_default().to_owned());
     let status = str_at(item, "status");
     match str_at(item, "type").unwrap_or_default() {
-        "agent_message" => vec![AgentWhat::Result {
-            text: str_at(item, "text").unwrap_or_default().to_owned(),
-            is_error: false,
-        }],
+        "agent_message" => {
+            let text = str_at(item, "text").unwrap_or_default().to_owned();
+            vec![match purpose {
+                Purpose::Answer => AgentWhat::Result {
+                    text,
+                    is_error: false,
+                },
+                Purpose::Work => AgentWhat::Reply { text, model: None },
+            }]
+        }
         "reasoning" => vec![AgentWhat::Thinking {
             text: str_at(item, "text").unwrap_or_default().to_owned(),
         }],
@@ -806,5 +876,20 @@ mod tests {
                 "{unknown}"
             );
         }
+    }
+
+    #[test]
+    fn an_agent_runs_messages_are_replies_not_answers() {
+        let line = br#"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Fixed the gate."}}"#;
+        assert_eq!(
+            whats(&decode_agent_exec(line)),
+            vec![&AgentWhat::Reply {
+                text: "Fixed the gate.".into(),
+                model: None
+            }]
+        );
+        // Everything else reads as in a headless run.
+        let line = br#"{"type":"turn.completed","usage":{"input_tokens":3,"cached_input_tokens":0,"output_tokens":1}}"#;
+        assert_eq!(whats(&decode_agent_exec(line)), whats(&decode_exec(line)));
     }
 }
