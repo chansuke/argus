@@ -8,6 +8,7 @@ pub(crate) mod eas;
 pub(crate) mod lean;
 pub(crate) mod llm;
 pub(crate) mod tlc;
+mod touch;
 
 use crate::source::{Decoded, Observation, SourceKind};
 
