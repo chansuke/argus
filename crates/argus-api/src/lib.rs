@@ -14,6 +14,7 @@
 //! until it implements the new `Handler` method.
 
 mod ops;
+pub mod place;
 pub mod vm;
 pub mod wire;
 

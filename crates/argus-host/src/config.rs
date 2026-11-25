@@ -43,19 +43,12 @@ pub struct Defaults {
 impl Defaults {
     /// From the environment as `std::env::var_os` reads it. `None` without `$HOME`.
     pub fn from_env(var: impl Fn(&str) -> Option<String>) -> Option<Defaults> {
-        let absolute = |name: &str| var(name).map(PathBuf::from).filter(|p| p.is_absolute());
-        let home = absolute("HOME")?;
-        let data = absolute("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
-        let config = absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
-        let data_root = data.join("argus");
-        let socket = absolute("XDG_RUNTIME_DIR")
-            .map(|run| run.join("argus.sock"))
-            .unwrap_or_else(|| data_root.join("argus.sock"));
+        use argus_api::place;
         Some(Defaults {
-            config: config.join("argus").join("config.json"),
-            home,
-            data_root,
-            socket,
+            home: place::home(&var)?,
+            data_root: place::data_root(&var)?,
+            socket: place::socket(&var)?,
+            config: place::config_file(&var)?,
         })
     }
 }
