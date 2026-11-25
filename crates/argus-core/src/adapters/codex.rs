@@ -8,16 +8,16 @@
 
 use argus_json::Json;
 
-use super::touch::shell_paths;
+use super::touch::{inserted, shell_paths};
 use crate::command::{CommandSpec, PermissionAnswer, PlanEnv};
 use crate::event::AgentLaunch;
-use crate::ids::{RecordKey, ToolCallId, ToolName};
+use crate::ids::{RecordKey, ToolCallId, ToolName, UnixMillis};
 use crate::source::{
     AgentEvent, AgentWhat, Decoded, FileTouch, Observation, PlanItem, PlanOp, PlanStatus,
     TokenUsage, TouchHow,
 };
 
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
 /// `codex [--model m] [resume <session>] <prompt>` under a PTY; watch the rollout file.
 pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
@@ -29,10 +29,226 @@ pub(crate) fn permission_keys(_answer: PermissionAnswer) -> Option<Vec<u8>> {
     None
 }
 
+/// Record types seen in codex-cli 0.171.0 rollouts that carry nothing argus models. The
+/// `response_item` records are the model's own messages and calls: the completed items
+/// (`event_msg` / `item_completed`) say the same, so only those are read.
+const ROLLOUT_BOOKKEEPING: &[&str] = &[
+    "compacted",
+    "inter_agent_communication_metadata",
+    "response_item",
+    "session_meta",
+    "turn_context",
+    "world_state",
+];
+
+/// `event_msg` types seen in those rollouts that carry nothing argus models.
+const EVENT_BOOKKEEPING: &[&str] = &["task_started", "thread_settings_applied", "token_count"];
+
+/// One rollout line, `{ timestamp, ordinal, type, payload }`, in the shapes of codex-cli
+/// 0.171.0 (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`; the format is undocumented).
+///
+/// - `event_msg` / `item_completed`: the item by its `type`. `UserMessage` -> Prompt,
+///   `AgentMessage` -> Reply, `Reasoning` -> Thinking (or `Other` when only encrypted),
+///   `CommandExecution`, `FileChange` (its `unified_diff` gives the inserted lines) and
+///   `McpToolCall` -> ToolCall + ToolResult.
+/// - `token_usage_record` -> Usage keyed by `response_id`; `token_count` repeats running
+///   totals and is not read.
+/// - `event_msg` / `task_complete` or `turn_aborted` -> TurnEnded.
+/// - Known bookkeeping -> `Other`; any other type -> `Unrecognized` (bump VERSION once
+///   modeled). Rollouts of older versions, which lack `item_completed`, decode to `Other`
+///   and stay readable in the raw view.
 pub(crate) fn decode_rollout(bytes: &[u8]) -> Decoded {
-    Decoded::one(Observation::Unrecognized {
-        reason: "codex rollout adapter not written".into(),
-    })
+    let v = match argus_json::parse(bytes) {
+        Ok(v) => v,
+        Err(e) => return unrecognized(format!("not JSON at byte {}: {}", e.at, e.what)),
+    };
+    let Some(kind) = str_at(&v, "type") else {
+        return unrecognized("record without a type".into());
+    };
+    let at = str_at(&v, "timestamp").and_then(UnixMillis::parse_rfc3339);
+    let payload = v.get("payload").cloned().unwrap_or(Json::Null);
+    let (record, whats) = match kind {
+        "event_msg" => {
+            let event = str_at(&payload, "type").unwrap_or_default();
+            match event {
+                "item_completed" => {
+                    let item = payload.get("item").cloned().unwrap_or(Json::Null);
+                    let record = str_at(&item, "id").map(|id| RecordKey(id.to_owned()));
+                    (record, rollout_item(&item))
+                }
+                "task_complete" | "turn_aborted" => (
+                    None,
+                    vec![AgentWhat::TurnEnded {
+                        stop_reason: Some(event.to_owned()),
+                    }],
+                ),
+                _ if EVENT_BOOKKEEPING.contains(&event) => {
+                    (None, vec![other(&format!("event_msg:{event}"))])
+                }
+                _ => return unrecognized(format!("event_msg type `{event}`")),
+            }
+        }
+        "token_usage_record" => (
+            None,
+            vec![AgentWhat::Usage {
+                message: str_at(&payload, "response_id").map(str::to_owned),
+                usage: usage_of(payload.get("usage").unwrap_or(&Json::Null)),
+            }],
+        ),
+        _ if ROLLOUT_BOOKKEEPING.contains(&kind) => {
+            let tag = match str_at(&payload, "type") {
+                Some(sub) => format!("{kind}:{sub}"),
+                None => kind.to_owned(),
+            };
+            (None, vec![other(&tag)])
+        }
+        _ => return unrecognized(format!("record type `{kind}`")),
+    };
+    events(record, at, whats)
+}
+
+/// The text blocks of a message's `content`, joined.
+fn texts(content: Option<&Json>) -> String {
+    items(content)
+        .iter()
+        .filter_map(|b| str_at(b, "text"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rollout_item(item: &Json) -> Vec<AgentWhat> {
+    let id = ToolCallId(str_at(item, "id").unwrap_or_default().to_owned());
+    let status = str_at(item, "status");
+    let kind = str_at(item, "type").unwrap_or_default();
+    match kind {
+        "UserMessage" => vec![AgentWhat::Prompt {
+            text: texts(item.get("content")),
+        }],
+        "AgentMessage" => vec![AgentWhat::Reply {
+            text: texts(item.get("content")),
+            model: None,
+        }],
+        "Reasoning" => {
+            let parts: Vec<&str> = items(item.get("summary_text"))
+                .iter()
+                .chain(items(item.get("raw_content")))
+                .filter_map(Json::as_str)
+                .collect();
+            match parts.is_empty() {
+                true => vec![other("item:Reasoning")],
+                false => vec![AgentWhat::Thinking {
+                    text: parts.join("\n"),
+                }],
+            }
+        }
+        "CommandExecution" => {
+            let words: Vec<&str> = items(item.get("command"))
+                .iter()
+                .filter_map(Json::as_str)
+                .collect();
+            let exit_code = match item.get("exit_code") {
+                Some(Json::Num(n)) => n.as_i64(),
+                _ => None,
+            };
+            let input = Json::Obj(vec![
+                (
+                    "command".into(),
+                    item.get("command").cloned().unwrap_or(Json::Null),
+                ),
+                ("cwd".into(), item.get("cwd").cloned().unwrap_or(Json::Null)),
+            ]);
+            vec![
+                AgentWhat::ToolCall {
+                    call: id.clone(),
+                    name: ToolName(kind.to_owned()),
+                    input_json: argus_json::write(&input),
+                    touches: shell_touches(&words.join(" ")),
+                },
+                AgentWhat::ToolResult {
+                    call: id,
+                    is_error: status != Some("completed") || exit_code != Some(0),
+                    output: str_at(item, "aggregated_output")
+                        .unwrap_or_default()
+                        .to_owned(),
+                },
+            ]
+        }
+        "FileChange" => {
+            let changes = item
+                .get("changes")
+                .cloned()
+                .unwrap_or(Json::Obj(Vec::new()));
+            let touches = match &changes {
+                Json::Obj(files) => files
+                    .iter()
+                    .flat_map(|(path, change)| {
+                        let diff = str_at(change, "unified_diff").unwrap_or_default();
+                        let added: Vec<&str> = diff
+                            .lines()
+                            .filter(|l| !l.starts_with("+++"))
+                            .filter_map(|l| l.strip_prefix('+'))
+                            .collect();
+                        inserted(Some(path), &added)
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let output = [str_at(item, "stdout"), str_at(item, "stderr")]
+                .into_iter()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            vec![
+                AgentWhat::ToolCall {
+                    call: id.clone(),
+                    name: ToolName(kind.to_owned()),
+                    input_json: argus_json::write(&changes),
+                    touches,
+                },
+                AgentWhat::ToolResult {
+                    call: id,
+                    is_error: status != Some("completed"),
+                    output,
+                },
+            ]
+        }
+        "McpToolCall" => mcp_call(item, id, status),
+        _ => vec![other(&format!("item:{kind}"))],
+    }
+}
+
+/// An MCP tool call, as both formats write it: `server`, `tool`, `arguments`, and a
+/// `result` or an `error { message }`.
+fn mcp_call(item: &Json, id: ToolCallId, status: Option<&str>) -> Vec<AgentWhat> {
+    let name = format!(
+        "mcp:{}/{}",
+        str_at(item, "server").unwrap_or_default(),
+        str_at(item, "tool").unwrap_or_default()
+    );
+    let arguments = item
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Json::Obj(Vec::new()));
+    let error = item.get("error").and_then(|e| str_at(e, "message"));
+    let output = match (error, item.get("result")) {
+        (Some(message), _) => message.to_owned(),
+        (None, Some(result)) => argus_json::write(result),
+        (None, None) => String::new(),
+    };
+    vec![
+        AgentWhat::ToolCall {
+            call: id.clone(),
+            name: ToolName(name),
+            input_json: argus_json::write(&arguments),
+            touches: Vec::new(),
+        },
+        AgentWhat::ToolResult {
+            call: id,
+            is_error: status == Some("failed") || error.is_some(),
+            output,
+        },
+    ]
 }
 
 /// One `codex exec --json` line.
@@ -95,7 +311,7 @@ pub(crate) fn decode_exec(bytes: &[u8]) -> Decoded {
         "error" => (None, vec![failed(str_at(&v, "message"))]),
         _ => return unrecognized(format!("event type `{kind}`")),
     };
-    events(record, whats)
+    events(record, None, whats)
 }
 
 fn exec_item(item: &Json) -> Vec<AgentWhat> {
@@ -154,36 +370,7 @@ fn exec_item(item: &Json) -> Vec<AgentWhat> {
                 touches,
             }]
         }
-        "mcp_tool_call" => {
-            let name = format!(
-                "mcp:{}/{}",
-                str_at(item, "server").unwrap_or_default(),
-                str_at(item, "tool").unwrap_or_default()
-            );
-            let arguments = item
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Json::Obj(Vec::new()));
-            let error = item.get("error").and_then(|e| str_at(e, "message"));
-            let output = match (error, item.get("result")) {
-                (Some(message), _) => message.to_owned(),
-                (None, Some(result)) => argus_json::write(result),
-                (None, None) => String::new(),
-            };
-            vec![
-                AgentWhat::ToolCall {
-                    call: id.clone(),
-                    name: ToolName(name),
-                    input_json: argus_json::write(&arguments),
-                    touches: Vec::new(),
-                },
-                AgentWhat::ToolResult {
-                    call: id,
-                    is_error: status == Some("failed") || error.is_some(),
-                    output,
-                },
-            ]
-        }
+        "mcp_tool_call" => mcp_call(item, id, status),
         "todo_list" => vec![AgentWhat::Plan(PlanOp::Replace(
             items(item.get("items"))
                 .iter()
@@ -222,12 +409,12 @@ fn usage_of(usage: &Json) -> TokenUsage {
     }
 }
 
-fn events(record: Option<RecordKey>, whats: Vec<AgentWhat>) -> Decoded {
+fn events(record: Option<RecordKey>, at: Option<UnixMillis>, whats: Vec<AgentWhat>) -> Decoded {
     let mut obs = whats.into_iter().map(|what| {
         Observation::Agent(AgentEvent {
             record: record.clone(),
             parent: None,
-            at: None,
+            at,
             sidechain: false,
             what,
         })
@@ -441,6 +628,182 @@ mod tests {
             assert!(
                 matches!(d.iter().next(), Some(Observation::Unrecognized { .. })),
                 "{line}"
+            );
+        }
+    }
+
+    /// A rollout line as codex-cli 0.171.0 writes one (shape only; the values are made up).
+    fn line(kind: &str, payload: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-11-25T14:16:49.120Z","ordinal":7,"type":"{kind}","payload":{payload}}}"#
+        )
+    }
+
+    fn item(item: &str) -> String {
+        line(
+            "event_msg",
+            &format!(
+                r#"{{"type":"item_completed","thread_id":"th","turn_id":"tu","item":{item},"started_at_ms":1,"completed_at_ms":2}}"#
+            ),
+        )
+    }
+
+    #[test]
+    fn rollout_messages_are_prompts_and_replies_with_their_time() {
+        let d = decode_rollout(
+            item(r#"{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"fix the gate","text_elements":[]}]}"#)
+                .as_bytes(),
+        );
+        assert_eq!(
+            whats(&d),
+            vec![&AgentWhat::Prompt {
+                text: "fix the gate".into()
+            }]
+        );
+        let Observation::Agent(ev) = d.iter().next().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(ev.record, Some(RecordKey("u1".into())));
+        assert_eq!(
+            ev.at,
+            crate::ids::UnixMillis::parse_rfc3339("2026-11-25T14:16:49.120Z")
+        );
+        let d = decode_rollout(
+            item(r#"{"type":"AgentMessage","id":"a1","content":[{"type":"Text","text":"Done."}],"phase":"final_answer"}"#)
+                .as_bytes(),
+        );
+        assert_eq!(
+            whats(&d),
+            vec![&AgentWhat::Reply {
+                text: "Done.".into(),
+                model: None
+            }]
+        );
+        // Reasoning the rollout keeps only encrypted shows as such, not as empty thinking.
+        let d = decode_rollout(
+            item(r#"{"type":"Reasoning","id":"r1","summary_text":[],"raw_content":[]}"#).as_bytes(),
+        );
+        assert!(matches!(whats(&d)[..], [AgentWhat::Other { .. }]));
+        let d = decode_rollout(
+            item(r#"{"type":"Reasoning","id":"r2","summary_text":["Check the lock first."],"raw_content":[]}"#)
+                .as_bytes(),
+        );
+        assert_eq!(
+            whats(&d),
+            vec![&AgentWhat::Thinking {
+                text: "Check the lock first.".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn rollout_commands_and_patches_are_calls_with_what_they_touch() {
+        let d = decode_rollout(
+            item(r#"{"type":"CommandExecution","id":"c1","process_id":"1","command":["sed","-i","s/a/b/","src/lib.rs"],"cwd":"/w","parsed_cmd":[],"source":"agent","status":"completed","aggregated_output":"","exit_code":2,"duration":{"secs":0,"nanos":1}}"#)
+                .as_bytes(),
+        );
+        let w = whats(&d);
+        let AgentWhat::ToolCall { name, touches, .. } = w[0] else {
+            panic!("{w:?}")
+        };
+        assert_eq!(name, &ToolName("CommandExecution".into()));
+        assert_eq!(touches[0].path, "src/lib.rs");
+        assert!(matches!(w[1], AgentWhat::ToolResult { is_error: true, .. }));
+
+        // Escaped as the rollout's JSON escapes it.
+        let diff = r"@@ -1,2 +1,2 @@\n fn a() {}\n-fn b() {}\n+fn b() -> u8 { 1 }\n+fn c() {}\n";
+        let d = decode_rollout(
+            item(&format!(
+                r#"{{"type":"FileChange","id":"f1","changes":{{"/w/src/a.rs":{{"type":"update","unified_diff":"{diff}","move_path":null}}}},"status":"completed","stdout":"Success.","stderr":""}}"#
+            ))
+            .as_bytes(),
+        );
+        let w = whats(&d);
+        let AgentWhat::ToolCall { touches, .. } = w[0] else {
+            panic!("{w:?}")
+        };
+        assert_eq!(
+            touches,
+            &vec![FileTouch {
+                path: "/w/src/a.rs".into(),
+                how: TouchHow::Inserted(vec![
+                    crate::diff::line_hash("fn b() -> u8 { 1 }"),
+                    crate::diff::line_hash("fn c() {}"),
+                ]),
+            }]
+        );
+        assert_eq!(
+            w[1],
+            &AgentWhat::ToolResult {
+                call: ToolCallId("f1".into()),
+                is_error: false,
+                output: "Success.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rollout_usage_is_per_response_and_a_finished_task_ends_the_turn() {
+        let d = decode_rollout(
+            line(
+                "token_usage_record",
+                r#"{"thread_id":"th","turn_id":"tu","session_id":"s","root_turn_id":"tu","response_id":"resp_1","usage":{"input_tokens":900,"cached_input_tokens":600,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":940}}"#,
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            whats(&d),
+            vec![&AgentWhat::Usage {
+                message: Some("resp_1".into()),
+                usage: TokenUsage {
+                    input: 300,
+                    output: 40,
+                    cache_read: 600,
+                    cache_write: 0
+                }
+            }]
+        );
+        let d = decode_rollout(
+            line("event_msg", r#"{"type":"task_complete","turn_id":"tu","last_agent_message":"Done.","started_at":1,"completed_at":2,"duration_ms":1}"#)
+                .as_bytes(),
+        );
+        assert!(matches!(whats(&d)[..], [AgentWhat::TurnEnded { .. }]));
+    }
+
+    #[test]
+    fn rollout_records_said_twice_count_once_and_unknown_ones_are_shown_raw() {
+        // The model's own records repeat what the completed items say.
+        for known in [
+            line(
+                "response_item",
+                r#"{"type":"message","role":"user","content":[]}"#,
+            ),
+            line(
+                "response_item",
+                r#"{"type":"function_call","name":"wait","arguments":"{}","call_id":"c"}"#,
+            ),
+            line("event_msg", r#"{"type":"token_count","info":null}"#),
+            line("session_meta", r#"{"id":"s","cwd":"/w"}"#),
+            line("turn_context", r#"{"model":"m","effort":"high"}"#),
+            item(r#"{"type":"ImageView","id":"i","path":"/w/a.png"}"#),
+        ] {
+            assert!(
+                matches!(
+                    whats(&decode_rollout(known.as_bytes()))[..],
+                    [AgentWhat::Other { .. }]
+                ),
+                "{known}"
+            );
+        }
+        for unknown in [
+            line("hologram", "{}"),
+            line("event_msg", r#"{"type":"turn_teleported"}"#),
+            "not json".to_owned(),
+        ] {
+            let d = decode_rollout(unknown.as_bytes());
+            assert!(
+                matches!(d.iter().next(), Some(Observation::Unrecognized { .. })),
+                "{unknown}"
             );
         }
     }
