@@ -28,7 +28,13 @@ macro_rules! api {
             $( $(#[doc = $doc])* fn $op(&mut self, caller: &Caller, input: $input) -> Result<$output, ApiError>; )*
         }
 
-        pub const OPS: &[OpInfo] = &[ $( OpInfo { name: stringify!($op), kind: api!(@kind $kind), access: api!(@access $($access)?) } ),* ];
+        pub const OPS: &[OpInfo] = &[ $( OpInfo {
+            name: stringify!($op),
+            kind: api!(@kind $kind),
+            access: api!(@access $($access)?),
+            doc: concat!($($doc, "\n"),*),
+            input_schema: <$input as Wire>::schema,
+        } ),* ];
 
         /// The single entry point for every transport.
         pub fn dispatch<H: Handler>(h: &mut H, caller: &Caller, op: &str, input: &Json) -> Result<Json, ApiError> {
@@ -91,7 +97,11 @@ api! {
     // -- review & verification --
     subscribe review(JobRef) -> ReviewScreen;
     query presets(Empty) -> Presets;
+    /// Asks the chosen models (a preset, or the default) to review the job's head through
+    /// one lens. Repeating a `request_id` repeats nothing.
     command request_review(RequestReview) -> RunRefs [agent];
+    /// Runs a TLA+ model check, a Lean build, or a device check on the job's head. Repeating
+    /// a `request_id` repeats nothing.
     command request_check(RequestCheck) -> RunRef [agent];
     command open_thread(OpenThread) -> Ack;
     command reply(Reply) -> Ack;
@@ -106,7 +116,11 @@ api! {
     command send_input(SendInput) -> Ack;
     command answer_permission(AnswerPermission) -> Ack;
     command cancel_run(RunRef) -> Ack;
+    /// Adds a task to the job's plan (no `task`; needs a `title`) or changes one (`task`).
+    /// An agent may change only the tasks it added.
     command set_task(SetTask) -> TaskSaved [agent];
+    /// A Claude Code hook payload from inside a run, kept verbatim in that run's hook log.
+    /// Only the run's own agent may send one.
     command hook(HookPayload) -> Ack [agent];
     // -- assets --
     command bookmark(Bookmark) -> Ack;

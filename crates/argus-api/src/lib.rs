@@ -56,6 +56,10 @@ pub struct OpInfo {
     pub name: &'static str,
     pub kind: OpKind,
     pub access: OpAccess,
+    /// The op's doc comment in `ops.rs`, one line per `///` line.
+    pub doc: &'static str,
+    /// JSON Schema of the op's input (`Wire::schema`).
+    pub input_schema: fn() -> Json,
 }
 
 impl Caller {

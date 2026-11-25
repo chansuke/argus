@@ -82,3 +82,103 @@ fn a_float_writes_json_that_reads_back_as_the_same_number() {
         assert_eq!(x.to_json(), Json::Null);
     }
 }
+
+/// The part of JSON Schema that `Wire::schema` emits: `type`, `properties`, `required`,
+/// `items`, `anyOf`, `oneOf`, `enum`, `const`, `minimum`, `maximum`.
+fn fits(schema: &Json, value: &Json) -> bool {
+    let Json::Obj(rules) = schema else {
+        panic!("a schema is an object: {}", argus_json::write(schema))
+    };
+    rules.iter().all(|(rule, arg)| match (rule.as_str(), arg) {
+        ("type", Json::Str(t)) => match (t.as_str(), value) {
+            ("object", Json::Obj(_)) | ("array", Json::Arr(_)) => true,
+            ("string", Json::Str(_)) | ("boolean", Json::Bool(_)) | ("null", Json::Null) => true,
+            ("number", Json::Num(_)) => true,
+            ("integer", Json::Num(n)) => n.as_i64().is_some(),
+            _ => false,
+        },
+        ("properties", Json::Obj(props)) => props
+            .iter()
+            .all(|(name, s)| value.get(name).is_none_or(|v| fits(s, v))),
+        ("required", Json::Arr(names)) => names
+            .iter()
+            .all(|n| value.get(n.as_str().unwrap()).is_some()),
+        ("items", s) => match value {
+            Json::Arr(xs) => xs.iter().all(|x| fits(s, x)),
+            _ => true,
+        },
+        ("anyOf", Json::Arr(ss)) => ss.iter().any(|s| fits(s, value)),
+        ("oneOf", Json::Arr(ss)) => ss.iter().filter(|s| fits(s, value)).count() == 1,
+        ("enum", Json::Arr(xs)) => xs.contains(value),
+        ("const", x) => x == value,
+        ("minimum", Json::Num(m)) => match value {
+            Json::Num(n) => n.as_f64() >= m.as_f64(),
+            _ => true,
+        },
+        ("maximum", Json::Num(m)) => match value {
+            Json::Num(n) => n.as_f64() <= m.as_f64(),
+            _ => true,
+        },
+        ("description", _) => true,
+        (rule, _) => panic!("a rule the schema should not use: {rule}"),
+    })
+}
+
+/// The schema accepts exactly what the decoder accepts, on each sample.
+fn agrees<T: Wire>(samples: &[&str]) {
+    let schema = T::schema();
+    for sample in samples {
+        let value = json(sample);
+        assert_eq!(
+            fits(&schema, &value),
+            T::from_json(&value).is_ok(),
+            "{sample} against {}",
+            argus_json::write(&schema)
+        );
+    }
+}
+
+#[test]
+fn a_types_json_schema_accepts_what_its_decoder_accepts() {
+    use argus_api::vm::{RequestCheck, SetTask};
+    agrees::<SetTask>(&[
+        r#"{"job":"j"}"#,
+        r#"{"job":"j","title":"Parser","weight":2,"status":{"kind":"Done"}}"#,
+        r#"{"job":"j","status":{"kind":"Blocked","reason":"needs a key"}}"#,
+        r#"{"job":"j","task":null}"#,
+        r#"{}"#,
+        r#"{"job":1}"#,
+        r#"{"job":"j","weight":-1}"#,
+        r#"{"job":"j","weight":1.5}"#,
+        r#"{"job":"j","status":{"kind":"Blocked"}}"#,
+        r#"{"job":"j","status":{"kind":"Nope"}}"#,
+        r#"[]"#,
+    ]);
+    agrees::<RequestCheck>(&[
+        r#"{"request_id":"r","job":"j","check":{"kind":"Lean","root":"p","files":["A.lean"]}}"#,
+        r#"{"request_id":"r","job":"j","check":{"kind":"Tla","spec":"s","engine":"Tlars"}}"#,
+        r#"{"request_id":"r","job":"j","check":{"kind":"Tla","spec":"s","engine":"Tlars","workers":70000}}"#,
+        r#"{"request_id":"r","job":"j","check":{"kind":"Tla","spec":"s","engine":"Tlc"}}"#,
+        r#"{"request_id":"r","job":"j","check":{"kind":"Lean","root":"p","files":[1]}}"#,
+        r#"{"request_id":"r","job":"j","check":{"kind":"Coq"}}"#,
+    ]);
+}
+
+#[test]
+fn every_op_says_what_input_it_takes_and_what_it_does() {
+    for op in OPS {
+        let schema = (op.input_schema)();
+        assert_eq!(
+            schema.get("type"),
+            Some(&Json::str("object")),
+            "{}",
+            op.name
+        );
+        // Agents pick tools by their description.
+        if op.access == OpAccess::Agent {
+            assert!(!op.doc.trim().is_empty(), "{} has no doc", op.name);
+        }
+    }
+    let set_task = OPS.iter().find(|op| op.name == "set_task").unwrap();
+    assert_eq!((set_task.input_schema)(), argus_api::vm::SetTask::schema());
+}

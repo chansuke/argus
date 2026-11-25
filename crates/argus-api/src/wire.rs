@@ -5,6 +5,9 @@
 //! Wire conventions: field and op names stay snake_case in JSON and TS (no renaming
 //! layer to get wrong); enums are tagged unions `{ kind: "Variant", ...fields }`;
 //! ids and 64-bit counters that may exceed 2^53 travel as strings.
+//!
+//! `schema()` is the same declaration as a JSON Schema, for clients that pick inputs from
+//! one (MCP tools). A field whose type is an `Option` may be left out.
 
 use std::collections::BTreeMap;
 
@@ -23,8 +26,27 @@ pub trait Wire: Sized {
     fn ts_collect(out: &mut BTreeMap<String, String>) {
         let _ = out;
     }
+    /// JSON Schema of the values `from_json` accepts.
+    fn schema() -> Json;
+    /// Whether `null` is a value of this type, so a field of it may be left out.
+    const NULLABLE: bool = false;
     fn to_json(&self) -> Json;
     fn from_json(v: &Json) -> Result<Self, WireError>;
+}
+
+/// `{ "key": value, ... }` in the order given.
+pub(crate) fn object(pairs: Vec<(&str, Json)>) -> Json {
+    Json::Obj(pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
+}
+
+/// `{ "type": "<name>" }`.
+fn typed(name: &str) -> Json {
+    object(vec![("type", Json::str(name))])
+}
+
+/// A declaration's doc lines as one description.
+pub(crate) fn describe(lines: &[&str]) -> String {
+    lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ")
 }
 
 /// Reads one field; a missing field reads as `null` (so `Option` fields may be omitted).
@@ -46,6 +68,9 @@ impl Wire for String {
     fn ts_ref() -> String {
         "string".into()
     }
+    fn schema() -> Json {
+        typed("string")
+    }
     fn to_json(&self) -> Json {
         Json::Str(self.clone())
     }
@@ -59,6 +84,9 @@ impl Wire for String {
 impl Wire for bool {
     fn ts_ref() -> String {
         "boolean".into()
+    }
+    fn schema() -> Json {
+        typed("boolean")
     }
     fn to_json(&self) -> Json {
         Json::Bool(*self)
@@ -75,6 +103,13 @@ macro_rules! wire_int {
     ($($t:ty),*) => {$(
         impl Wire for $t {
             fn ts_ref() -> String { "number".into() }
+            fn schema() -> Json {
+                object(vec![
+                    ("type", Json::str("integer")),
+                    ("minimum", Json::Num(Number::from_i64(<$t>::MIN as i64))),
+                    ("maximum", Json::Num(Number::from_i64(<$t>::MAX as i64))),
+                ])
+            }
             fn to_json(&self) -> Json { Json::Num(Number::from_i64(*self as i64)) }
             fn from_json(v: &Json) -> Result<Self, WireError> {
                 match v {
@@ -90,6 +125,9 @@ wire_int!(u16, u32, i64);
 impl Wire for f64 {
     fn ts_ref() -> String {
         "number".into()
+    }
+    fn schema() -> Json {
+        typed("number")
     }
     fn to_json(&self) -> Json {
         Number::from_f64(*self).map_or(Json::Null, Json::Num)
@@ -107,6 +145,10 @@ impl Wire for Json {
     fn ts_ref() -> String {
         "unknown".into()
     }
+    fn schema() -> Json {
+        object(vec![])
+    }
+    const NULLABLE: bool = true;
     fn to_json(&self) -> Json {
         self.clone()
     }
@@ -118,6 +160,9 @@ impl Wire for Json {
 impl<T: Wire> Wire for Vec<T> {
     fn ts_ref() -> String {
         format!("Array<{}>", T::ts_ref())
+    }
+    fn schema() -> Json {
+        object(vec![("type", Json::str("array")), ("items", T::schema())])
     }
     fn ts_collect(out: &mut BTreeMap<String, String>) {
         T::ts_collect(out)
@@ -137,6 +182,10 @@ impl<T: Wire> Wire for Option<T> {
     fn ts_ref() -> String {
         format!("{} | null", T::ts_ref())
     }
+    fn schema() -> Json {
+        object(vec![("anyOf", Json::Arr(vec![T::schema(), typed("null")]))])
+    }
+    const NULLABLE: bool = true;
     fn ts_collect(out: &mut BTreeMap<String, String>) {
         T::ts_collect(out)
     }
@@ -166,6 +215,33 @@ macro_rules! vm_struct {
                 out.insert(stringify!($name).to_string(), format!("export interface {} {{\n{}\n}}", stringify!($name), fields.join("\n")));
                 $(<$ty as $crate::wire::Wire>::ts_collect(out);)*
             }
+            fn schema() -> argus_json::Json {
+                use argus_json::Json;
+                let properties: Vec<(&str, Json)> = vec![$((stringify!($field), {
+                    let mut schema = <$ty as $crate::wire::Wire>::schema();
+                    let doc = $crate::wire::describe(&[$($fdoc),*]);
+                    if let (Json::Obj(rules), false) = (&mut schema, doc.is_empty()) {
+                        rules.push(("description".into(), Json::str(doc)));
+                    }
+                    schema
+                })),*];
+                let fields: Vec<(&str, bool)> = vec![$(( stringify!($field), <$ty as $crate::wire::Wire>::NULLABLE )),*];
+                let required: Vec<Json> = fields
+                    .into_iter()
+                    .filter(|(_, nullable)| !nullable)
+                    .map(|(name, _)| Json::str(name))
+                    .collect();
+                let mut schema = vec![
+                    ("type", Json::str("object")),
+                    ("properties", $crate::wire::object(properties)),
+                    ("required", Json::Arr(required)),
+                ];
+                let doc = $crate::wire::describe(&[$($doc),*]);
+                if !doc.is_empty() {
+                    schema.push(("description", Json::str(doc)));
+                }
+                $crate::wire::object(schema)
+            }
             fn to_json(&self) -> argus_json::Json {
                 argus_json::Json::Obj(vec![$((stringify!($field).to_string(), $crate::wire::Wire::to_json(&self.$field))),*])
             }
@@ -194,6 +270,26 @@ macro_rules! vm_enum {
                 }),*];
                 out.insert(stringify!($name).to_string(), format!("export type {} =\n  | {};", stringify!($name), arms.join("\n  | ")));
                 $($(<$ty as $crate::wire::Wire>::ts_collect(out);)*)*
+            }
+            fn schema() -> argus_json::Json {
+                use argus_json::Json;
+                let arms: Vec<Json> = vec![$({
+                    let properties: Vec<(&str, Json)> = vec![
+                        ("kind", $crate::wire::object(vec![("const", Json::str(stringify!($variant)))]))
+                        $(, (stringify!($field), <$ty as $crate::wire::Wire>::schema()))*
+                    ];
+                    let required: Vec<Json> = vec![("kind", false) $(, (stringify!($field), <$ty as $crate::wire::Wire>::NULLABLE))*]
+                        .into_iter()
+                        .filter(|(_, nullable)| !nullable)
+                        .map(|(name, _)| Json::str(name))
+                        .collect();
+                    $crate::wire::object(vec![
+                        ("type", Json::str("object")),
+                        ("properties", $crate::wire::object(properties)),
+                        ("required", Json::Arr(required)),
+                    ])
+                }),*];
+                $crate::wire::object(vec![("oneOf", Json::Arr(arms))])
             }
             fn to_json(&self) -> argus_json::Json {
                 match self {
@@ -228,6 +324,12 @@ macro_rules! vm_tags {
             fn ts_collect(out: &mut ::std::collections::BTreeMap<String, String>) {
                 let tags: Vec<String> = vec![$(format!("\"{}\"", stringify!($variant))),*];
                 out.insert(stringify!($name).to_string(), format!("export type {} = {};", stringify!($name), tags.join(" | ")));
+            }
+            fn schema() -> argus_json::Json {
+                $crate::wire::object(vec![
+                    ("type", argus_json::Json::str("string")),
+                    ("enum", argus_json::Json::Arr(vec![$(argus_json::Json::str(stringify!($variant))),*])),
+                ])
             }
             fn to_json(&self) -> argus_json::Json {
                 argus_json::Json::str(match self { $(Self::$variant => stringify!($variant)),* })
