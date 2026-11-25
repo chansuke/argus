@@ -2888,7 +2888,8 @@ mod tests {
         let id = JobId(Id128::parse(job).unwrap());
         let handle = host.inner.job(id).unwrap();
         let run = RunId(Id128::derive("agent", &id.0.0.to_le_bytes()));
-        let origin = SourceOrigin::Stdin;
+        // A file the agent's run never writes itself: its stdin source holds the prompt.
+        let origin = SourceOrigin::File("fed.txt".into());
         let meta = SourceMeta {
             id: SourceMeta::derive_id(run, Attempt(0), &origin),
             run,
