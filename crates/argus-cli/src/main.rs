@@ -1,46 +1,137 @@
 //! `argus`: the user's and the agents' command line. A client of the same API as the
-//! desktop and the phone (generated `argus_api::Client`), over the host's Unix socket.
+//! desktop and the phone, over the host's Unix socket (`socket.rs`).
 //!
-//! Human:   argus run --agent claude:opus --agent codex:gpt-5 "Implement X"
-//!          argus status | argus timeline <job> --since 1h | argus raw <job> --source <s>
-//!          argus review <job> [--preset panel | --model claude:opus ...] --lens security
-//!          argus packet <job>            (the review screen as text, agenda by tier)
-//!          argus promote <job> <finding> | argus feedback <job> (preview what will be sent)
-//!          argus decide <job> approve|request-changes|abandon [--note ...] | argus merge <job>
-//!          argus check <job> tla specs/Raft.tla --engine tlars
-//!          argus check <job> device apps/mobile --platform ios --app fingerprint:<hash>
-//!          argus stats --period last-7d --by model | argus insights --period 2026-11
-//!          argus skill accept <candidate> --to <skills dir>
-//! Agent:   argus task add "Parser" --weight 2 | argus task done <id> --result "..."
-//!          argus task block <id> "needs API key" | argus check --self tla <spec> | argus hook
-//!          (ARGUS_RUN / ARGUS_SOCKET / ARGUS_TOKEN come from the run's env)
-//! MCP:     argus mcp — stdio MCP server exposing the `[agent]` ops as tools.
+//! It names ops as `argus_api::OPS` does and passes their input as JSON, so every op is
+//! reachable and none can drift from the API:
+//!
+//! ```text
+//! argus ops                          every op, its kind, and whether agents may call it
+//! argus call presets
+//! argus call set_task '{"title": "Parser", "weight": 2}'
+//! argus watch job '{"job": "<id>"}'  prints the value again each time it changes
+//! argus hook                         an agent CLI's hook: stdin, verbatim, to `hook`
+//! ```
+//!
+//! The socket is `$ARGUS_SOCKET`, else the host's default (`argus_api::place::socket`).
+//! A run argus started has `ARGUS_RUN` and `ARGUS_TOKEN` in its environment, and the
+//! host then treats the caller as that run's agent; otherwise the caller is the user.
 
-#![expect(
+#[expect(
     dead_code,
     unused_variables,
-    reason = "unimplemented stubs (socket transport, MCP server) take arguments and hold items they do not use yet"
+    reason = "the MCP server is a stub that takes a client it does not use"
 )]
-
 mod mcp;
+mod socket;
 
-use argus_api::{ApiError, Transport};
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use argus_api::wire::Wire;
+use argus_api::{ApiError, Client, Transport, vm::HookPayload};
 use argus_json::Json;
 
-/// Unix-socket transport: `Hello`, then one `Call` per request.
-struct SocketTransport {
-    // stream: UnixStream, next_id: u32
+use socket::SocketTransport;
+
+const USAGE: &str = "usage: argus ops
+       argus call <op> [<input JSON>]
+       argus watch <op> [<input JSON>]
+       argus hook";
+
+enum Command {
+    Ops,
+    Call { op: String, input: Json },
+    Watch { op: String, input: Json },
+    Hook,
 }
 
-impl Transport for SocketTransport {
-    fn call(&mut self, op: &str, input: Json) -> Result<Json, ApiError> {
-        todo!("not implemented")
+fn parse(args: &[String]) -> Option<Command> {
+    let input = |text: Option<&String>| match text {
+        None => Some(Json::Obj(Vec::new())),
+        Some(text) => argus_json::parse(text.as_bytes()).ok(),
+    };
+    match args {
+        [cmd] if cmd == "ops" => Some(Command::Ops),
+        [cmd] if cmd == "hook" => Some(Command::Hook),
+        [cmd, op, rest @ ..] if cmd == "call" && rest.len() <= 1 => Some(Command::Call {
+            op: op.clone(),
+            input: input(rest.first())?,
+        }),
+        [cmd, op, rest @ ..] if cmd == "watch" && rest.len() <= 1 => Some(Command::Watch {
+            op: op.clone(),
+            input: input(rest.first())?,
+        }),
+        _ => None,
     }
 }
 
-fn main() {
-    // TODO: parse args (no clap: std-only); build the input view model; call the
-    //       generated Client method; print. `argus hook` reads stdin verbatim into
-    //       HookPayload. `argus mcp` -> mcp::serve(client).
-    todo!("not implemented")
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the CLI's one read of its environment"
+)]
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(command) = parse(&args) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    match run(command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("argus: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(command: Command) -> Result<(), String> {
+    let refused = |op: &str, e: ApiError| format!("{op}: {}", argus_json::write(&e.to_json()));
+    match command {
+        Command::Ops => {
+            for op in argus_api::OPS {
+                let kind = format!("{:?}", op.kind).to_lowercase();
+                let access = format!("{:?}", op.access).to_lowercase();
+                println!("{} {kind} {access}", op.name);
+            }
+            Ok(())
+        }
+        Command::Call { op, input } => {
+            let value = connect()?.call(&op, input).map_err(|e| refused(&op, e))?;
+            println!("{}", argus_json::write(&value));
+            Ok(())
+        }
+        Command::Watch { op, input } => connect()?
+            .subscribe(&op, input, |value| {
+                println!("{}", argus_json::write(&value))
+            })
+            .map_err(|e| refused(&op, e)),
+        Command::Hook => {
+            let mut body = String::new();
+            std::io::stdin()
+                .read_to_string(&mut body)
+                .map_err(|e| format!("cannot read the hook's input: {e}"))?;
+            // Nothing on stdout: an agent CLI may read a hook's output as instructions.
+            let mut client = Client {
+                transport: connect()?,
+            };
+            client
+                .hook(&HookPayload { body })
+                .map(|_| ())
+                .map_err(|e| refused("hook", e))
+        }
+    }
+}
+
+fn connect() -> Result<SocketTransport, String> {
+    let path: PathBuf = env("ARGUS_SOCKET")
+        .map(PathBuf::from)
+        .or_else(|| argus_api::place::socket(&env))
+        .ok_or("cannot tell where the host's socket is: set ARGUS_SOCKET or HOME")?;
+    SocketTransport::connect(&path, env("ARGUS_TOKEN"), env("ARGUS_RUN"))
+        .map_err(|e| format!("cannot reach the host at {}: {e}", path.display()))
 }
