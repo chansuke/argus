@@ -4,8 +4,10 @@
 //!
 //! `exec --json` events follow `codex-rs/exec/src/exec_events.rs` (main branch):
 //! <https://github.com/openai/codex/blob/main/codex-rs/exec/src/exec_events.rs>. The help
-//! of codex-cli 0.171.0 confirms the flags used here. Unverified against a real run:
-//! that an item's `type` is snake_case on the wire, and how usage splits cached input.
+//! of codex-cli 0.171.0 confirms the flags used here. One real agent run (0.171.0,
+//! 2026-11-26) confirmed the snake_case item types, and that `turn.completed` counts
+//! cached input inside `input_tokens`: its uncached part equals the sum over the turn's
+//! rollout `token_usage_record`s.
 
 use argus_json::Json;
 
@@ -32,9 +34,11 @@ pub(crate) const VERSION: u32 = 4;
 /// Codex session someone starts by hand in the worktree would be picked instead.
 ///
 /// Env: `ARGUS_RUN`, `ARGUS_SOCKET`, as for Claude. Flags from codex-cli 0.171.0
-/// `exec --help` and `exec resume --help`; unverified: that `--last` filters by the
-/// working directory (its help says `--all` disables that filtering), and that exec never
-/// stops to ask for an approval under `workspace-write`.
+/// `exec --help` and `exec resume --help`; `--last` filters by the working directory
+/// (its help says `--all` disables that filtering), and with one positional the
+/// positional is the prompt (`codex-rs/exec`), so `-` reads stdin. Exec never waits for
+/// an approval: its policy is `never`, so an action that needs one fails as a tool error
+/// (seen in a real run for an MCP tool call).
 pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
     let mut args: Vec<String> = ["exec", "--sandbox", "workspace-write"]
         .map(String::from)
