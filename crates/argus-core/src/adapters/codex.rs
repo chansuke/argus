@@ -47,6 +47,9 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
         args.extend(["resume".into(), "--last".into()]);
     }
     args.push("--json".into());
+    for setting in mcp_settings(env) {
+        args.extend(["-c".into(), setting]);
+    }
     if let Some(model) = &launch.model {
         args.extend(["--model".into(), model.0.clone()]);
     }
@@ -71,6 +74,45 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
         artifacts: false,
         timeout: None,
     }
+}
+
+/// The argus MCP server (`adapters::MCP_SERVER`) as `-c` overrides of `[mcp_servers]`.
+/// Codex gives a server only an allowlist of the agent's environment plus `env_vars`, so
+/// those name the run's identity; and exec cannot ask for an approval, so the server's
+/// tools are `approve`d (the host decides what each call may do). Keys and values checked
+/// with codex-cli 0.171.0 `codex -c ... mcp get argus --json`, which rejects an unknown
+/// approval mode. Unverified: that `approve` lets a call through in exec.
+fn mcp_settings(env: &PlanEnv) -> Vec<String> {
+    let key = format!("mcp_servers.{}", super::MCP_SERVER);
+    let list = |items: &[&str]| -> String {
+        let quoted: Vec<String> = items.iter().map(|i| toml_str(i)).collect();
+        format!("[{}]", quoted.join(","))
+    };
+    vec![
+        format!(
+            "{key}.command={}",
+            toml_str(&env.tools.argus.to_string_lossy())
+        ),
+        format!("{key}.args={}", list(super::MCP_ARGS)),
+        format!("{key}.env_vars={}", list(super::MCP_ENV)),
+        format!("{key}.default_tools_approval_mode={}", toml_str("approve")),
+    ]
+}
+
+/// A TOML basic string: `"` and `\\` escaped, and every control character TOML forbids
+/// in one (U+0000..U+001F and U+007F) as `\uXXXX`.
+fn toml_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c < '\u{20}' || c == '\u{7f}' => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// An agent run has no terminal to answer a prompt in.
@@ -536,6 +578,13 @@ fn u64_at(v: &Json, key: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_toml_string_escapes_what_toml_forbids_raw() {
+        assert_eq!(toml_str("a b"), r#""a b""#);
+        assert_eq!(toml_str("q\"b\\"), r#""q\"b\\""#);
+        assert_eq!(toml_str("n\nd\u{7f}é"), r#""n\u000Ad\u007Fé""#);
+    }
+
     use super::*;
 
     fn whats(decoded: &Decoded) -> Vec<&AgentWhat> {

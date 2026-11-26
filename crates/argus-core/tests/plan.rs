@@ -64,6 +64,18 @@ fn snapshot_workdir(spec: &CommandSpec) -> (GitOid, GitOid) {
     }
 }
 
+/// The argus MCP server (`argus mcp`), as Claude Code takes it (`--mcp-config`).
+const CLAUDE_MCP: &str = r#"{"mcpServers":{"argus":{"command":"/bin/argus","args":["mcp"]}}}"#;
+
+/// The same server as codex `-c` overrides: it gets the run's identity from the agent's
+/// environment, and its tools need no approval (exec cannot ask for one).
+const CODEX_MCP: [&str; 4] = [
+    r#"mcp_servers.argus.command="/bin/argus""#,
+    r#"mcp_servers.argus.args=["mcp"]"#,
+    r#"mcp_servers.argus.env_vars=["ARGUS_RUN","ARGUS_SOCKET","ARGUS_TOKEN"]"#,
+    r#"mcp_servers.argus.default_tools_approval_mode="approve""#,
+];
+
 fn agent(prompt: &str, resume: Option<RunId>) -> RunPurpose {
     RunPurpose::Agent(AgentLaunch {
         cli: AgentCli::Claude,
@@ -79,7 +91,17 @@ fn a_claude_agent_runs_interactively_under_its_run_id() {
     assert_eq!(spec.program, PathBuf::from("/bin/claude"));
     assert_eq!(
         args(&spec),
-        vec!["--session-id", RUN, "--model", "opus", "fix the gate"]
+        vec![
+            "--mcp-config",
+            CLAUDE_MCP,
+            "--allowedTools",
+            "mcp__argus",
+            "--session-id",
+            RUN,
+            "--model",
+            "opus",
+            "fix the gate"
+        ]
     );
     assert!(spec.terminal);
     assert!(matches!(spec.workdir, Workdir::JobWorktree));
@@ -131,6 +153,14 @@ fn a_codex_agent_works_on_its_own_in_the_worktree_and_reports_on_stdout() {
             "--sandbox",
             "workspace-write",
             "--json",
+            "-c",
+            CODEX_MCP[0],
+            "-c",
+            CODEX_MCP[1],
+            "-c",
+            CODEX_MCP[2],
+            "-c",
+            CODEX_MCP[3],
             "--model",
             "gpt-6.2-sol",
             "--skip-git-repo-check",
@@ -167,6 +197,14 @@ fn codex_feedback_continues_the_latest_session_in_the_worktree() {
             "resume",
             "--last",
             "--json",
+            "-c",
+            CODEX_MCP[0],
+            "-c",
+            CODEX_MCP[1],
+            "-c",
+            CODEX_MCP[2],
+            "-c",
+            CODEX_MCP[3],
             "--model",
             "gpt-6.2-sol",
             "--skip-git-repo-check",
@@ -180,6 +218,32 @@ fn codex_feedback_continues_the_latest_session_in_the_worktree() {
 }
 
 #[test]
+fn the_mcp_config_quotes_any_path_to_argus() {
+    let mut env = env();
+    env.tools.argus = PathBuf::from(r#"/opt/my "tools"\bin/argus"#);
+    let arg_after = |purpose: &RunPurpose, flag: &str| -> String {
+        let Invocation::Process(spec) = plan(purpose, &env) else {
+            panic!()
+        };
+        let at = spec.args.iter().position(|a| a == flag).unwrap();
+        spec.args[at + 1].clone()
+    };
+    let claude = arg_after(&agent("go", None), "--mcp-config");
+    let parsed = argus_json::parse(claude.as_bytes()).unwrap();
+    let command = parsed
+        .get("mcpServers")
+        .and_then(|s| s.get("argus"))
+        .and_then(|s| s.get("command"))
+        .and_then(argus_json::Json::as_str);
+    assert_eq!(command, Some(r#"/opt/my "tools"\bin/argus"#));
+    // A TOML basic string: quotes and backslashes escaped.
+    assert_eq!(
+        arg_after(&codex_agent("go", None), "-c"),
+        r#"mcp_servers.argus.command="/opt/my \"tools\"\\bin/argus""#
+    );
+}
+
+#[test]
 fn feedback_resumes_a_copy_of_the_earlier_session_under_the_new_run_id() {
     let prev = RunId(Id128(7));
     let spec = process(&agent("- src/a.rs:2: keep the old name", Some(prev)));
@@ -189,6 +253,10 @@ fn feedback_resumes_a_copy_of_the_earlier_session_under_the_new_run_id() {
             "--resume",
             prev.0.to_string().as_str(),
             "--fork-session",
+            "--mcp-config",
+            CLAUDE_MCP,
+            "--allowedTools",
+            "mcp__argus",
             "--session-id",
             RUN,
             "--model",

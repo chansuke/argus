@@ -29,8 +29,13 @@ pub(crate) const VERSION: u32 = 1;
 ///
 /// Flags from Claude Code 2.1.303 `--help`. Unverified: that `--resume` with
 /// `--fork-session` accepts `--session-id`, and that a v8 UUID (derived run ids) is
-/// accepted as a session id. No MCP config is passed yet: the argus MCP server does not
-/// exist.
+/// accepted as a session id.
+///
+/// MCP: `--mcp-config` adds the argus server (`adapters::MCP_SERVER`) to the user's own,
+/// and `--allowedTools mcp__argus` lets the agent call it without a prompt; the host
+/// decides what each call may do. Both flags take several values, so a single-value flag
+/// follows them before the prompt. Unverified: that Claude Code gives a stdio server the
+/// agent's whole environment (its docs only say `env` adds to it).
 pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
     let run = env.run.0.to_string();
     let mut args = Vec::new();
@@ -41,7 +46,14 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
             "--fork-session".to_owned(),
         ]);
     }
-    args.extend(["--session-id".to_owned(), run.clone()]);
+    args.extend([
+        "--mcp-config".to_owned(),
+        mcp_config(env),
+        "--allowedTools".to_owned(),
+        format!("mcp__{}", super::MCP_SERVER),
+        "--session-id".to_owned(),
+        run.clone(),
+    ]);
     if let Some(model) = &launch.model {
         args.extend(["--model".to_owned(), model.0.clone()]);
     }
@@ -73,6 +85,24 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
         artifacts: false,
         timeout: None,
     }
+}
+
+/// `{"mcpServers":{"argus":{"command":<tools.argus>,"args":["mcp"]}}}`.
+fn mcp_config(env: &PlanEnv) -> String {
+    let server = Json::Obj(vec![
+        (
+            "command".into(),
+            Json::str(env.tools.argus.to_string_lossy()),
+        ),
+        (
+            "args".into(),
+            Json::Arr(super::MCP_ARGS.iter().map(|a| Json::str(*a)).collect()),
+        ),
+    ]);
+    argus_json::write(&Json::Obj(vec![(
+        "mcpServers".into(),
+        Json::Obj(vec![(super::MCP_SERVER.into(), server)]),
+    )]))
 }
 
 /// Seen on 2.1.329 (shell and write prompts): a numbered menu where a digit picks without
