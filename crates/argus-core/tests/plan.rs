@@ -24,6 +24,7 @@ fn env() -> PlanEnv {
         attempt: Attempt(0),
         socket: PathBuf::from("/run/argus.sock"),
         tools: ToolPaths {
+            argus: PathBuf::from("/bin/argus"),
             claude: PathBuf::from("/bin/claude"),
             codex: PathBuf::from("/bin/codex"),
             java: PathBuf::from("/bin/java"),

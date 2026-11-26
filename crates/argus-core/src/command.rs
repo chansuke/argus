@@ -99,6 +99,8 @@ pub struct LeaseSpec {
 /// Paths of external tools, resolved once at host start (Nix profile).
 #[derive(Clone, Debug)]
 pub struct ToolPaths {
+    /// The `argus` CLI; agents get `argus mcp` as an MCP server.
+    pub argus: PathBuf,
     pub claude: PathBuf,
     pub codex: PathBuf,
     pub java: PathBuf,
