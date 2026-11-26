@@ -10,6 +10,14 @@ pub(crate) mod llm;
 pub(crate) mod tlc;
 mod touch;
 
+/// The MCP server argus gives every agent it starts: `<tools.argus> mcp`, named
+/// `argus`, so its tools are `mcp__argus__<op>` to Claude Code. The server learns the run
+/// it speaks for from these variables in the agent's environment (the host adds
+/// `ARGUS_TOKEN`).
+pub(crate) const MCP_SERVER: &str = "argus";
+pub(crate) const MCP_ARGS: &[&str] = &["mcp"];
+pub(crate) const MCP_ENV: &[&str] = &["ARGUS_RUN", "ARGUS_SOCKET", "ARGUS_TOKEN"];
+
 use crate::source::{Decoded, Observation, SourceKind};
 
 /// Bumped whenever the adapter's output changes; part of every checkpoint key, so a
