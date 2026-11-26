@@ -18,7 +18,7 @@ use crate::source::{
     SourceKind, TokenUsage, TouchHow,
 };
 
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 
 /// `codex exec --sandbox workspace-write --json [--model m] --skip-git-repo-check -` in
 /// the job worktree, prompt on stdin, stdout `CodexAgentExec`: the agent works on its own
@@ -433,12 +433,19 @@ fn exec_item(item: &Json, purpose: Purpose) -> Vec<AgentWhat> {
                     how: TouchHow::Shell,
                 })
                 .collect();
-            vec![AgentWhat::ToolCall {
-                call: id,
-                name: ToolName("file_change".into()),
-                input_json: argus_json::write(&changes),
-                touches,
-            }]
+            vec![
+                AgentWhat::ToolCall {
+                    call: id.clone(),
+                    name: ToolName("file_change".into()),
+                    input_json: argus_json::write(&changes),
+                    touches,
+                },
+                AgentWhat::ToolResult {
+                    call: id,
+                    is_error: status != Some("completed"),
+                    output: String::new(),
+                },
+            ]
         }
         "mcp_tool_call" => mcp_call(item, id, status),
         "todo_list" => vec![AgentWhat::Plan(PlanOp::Replace(
@@ -621,6 +628,22 @@ mod tests {
         };
         let paths: Vec<&str> = touches.iter().map(|t| t.path.as_str()).collect();
         assert_eq!(paths, ["src/a.rs", "b.md"]);
+        assert_eq!(
+            whats(&d)[1],
+            &AgentWhat::ToolResult {
+                call: ToolCallId("f".into()),
+                is_error: false,
+                output: String::new()
+            }
+        );
+        // A patch the sandbox refused (seen from codex-cli 0.171.0) is an error.
+        let d = decode_exec(
+            br#"{"type":"item.completed","item":{"id":"f","type":"file_change","changes":[{"path":"/w/notes.txt","kind":"add"}],"status":"failed"}}"#,
+        );
+        assert!(matches!(
+            whats(&d)[1],
+            AgentWhat::ToolResult { is_error: true, .. }
+        ));
 
         let d = decode_exec(
             br#"{"type":"item.completed","item":{"id":"t","type":"todo_list","items":[{"text":"parse","completed":true},{"text":"test","completed":false}]}}"#,
