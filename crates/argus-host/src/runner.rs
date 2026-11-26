@@ -635,6 +635,7 @@ mod tests {
                 tlars: "tlars".into(),
                 lake: "lake".into(),
                 eas: "eas".into(),
+                argus: "argus".into(),
                 script: "script".into(),
             },
             snapshot_deny: SNAPSHOT_DENY.iter().map(|s| s.to_string()).collect(),

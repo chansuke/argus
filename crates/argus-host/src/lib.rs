@@ -430,6 +430,7 @@ mod tests {
                 tlars: "/nonexistent/argus-test/tlars".into(),
                 lake: "/nonexistent/argus-test/lake".into(),
                 eas: "/nonexistent/argus-test/eas".into(),
+                argus: "/nonexistent/argus-test/argus".into(),
                 script: "script".into(),
             },
             policy: PolicyConfig::default(),

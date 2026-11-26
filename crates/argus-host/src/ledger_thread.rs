@@ -674,6 +674,7 @@ mod tests {
                 tlars: "tlars".into(),
                 lake: "lake".into(),
                 eas: "eas".into(),
+                argus: "argus".into(),
                 script: "script".into(),
             },
             socket: PathBuf::from("/run/argus.sock"),

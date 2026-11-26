@@ -5,7 +5,7 @@
 //! {
 //!   "data_root": "/home/me/.local/share/argus",
 //!   "socket": "/run/user/1000/argus.sock",
-//!   "tools": { "claude": "claude", "tla2tools_jar": "/opt/tla/tla2tools.jar" },
+//!   "tools": { "claude": "claude", "argus": "argus", "tla2tools_jar": "/opt/tla/tla2tools.jar" },
 //!   "presets": { "default": ["claude:opus"], "panel": ["claude:opus", "codex:gpt-5:high"] },
 //!   "default_preset": "default",
 //!   "snapshot_on_turn_end": true,
@@ -181,6 +181,7 @@ fn int(v: &Json, what: &str, min: i64, max: i64) -> Result<i64, String> {
 /// Each tool by name, looked up on `PATH` when the process starts, unless set.
 fn tools(v: Option<&Json>) -> Result<ToolPaths, String> {
     let mut tools = ToolPaths {
+        argus: "argus".into(),
         claude: "claude".into(),
         codex: "codex".into(),
         java: "java".into(),
@@ -196,6 +197,7 @@ fn tools(v: Option<&Json>) -> Result<ToolPaths, String> {
     };
     for (name, path) in fields {
         let slot = match name.as_str() {
+            "argus" => &mut tools.argus,
             "claude" => &mut tools.claude,
             "codex" => &mut tools.codex,
             "java" => &mut tools.java,
@@ -354,7 +356,7 @@ mod tests {
         let text = format!(
             r#"{{
             "data_root": "/srv/argus", "socket": "/srv/argus.sock",
-            "tools": {{"claude": "/opt/claude", "tla2tools_jar": "/opt/tla.jar"}},
+            "tools": {{"claude": "/opt/claude", "tla2tools_jar": "/opt/tla.jar", "argus": "/opt/argus"}},
             "presets": {{"quick": ["claude:haiku"], "panel": ["claude:opus", "codex:gpt-5:high"]}},
             "default_preset": "panel",
             "snapshot_on_turn_end": false, "snapshot_deny": ["*.sqlite"], "sensitive": ["infra/**"],
@@ -368,6 +370,7 @@ mod tests {
         assert_eq!(c.tools.claude, PathBuf::from("/opt/claude"));
         assert_eq!(c.tools.tla2tools_jar, PathBuf::from("/opt/tla.jar"));
         assert_eq!(c.tools.codex, PathBuf::from("codex"));
+        assert_eq!(c.tools.argus, PathBuf::from("/opt/argus"));
         assert_eq!(c.presets.default_name().as_str(), "panel");
         let panel: Vec<String> = c
             .presets
