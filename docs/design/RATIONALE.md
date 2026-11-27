@@ -18,29 +18,30 @@ Constraints honored: Rust 2024, std-only workspace (`cargo check --offline --wor
 
 ## Usage (caller's view)
 
-Quickstart (human, fish):
+Quickstart (human, fish). Every op is a subcommand (`argus help <op>` lists its arguments); `<tree>` is the head the human looked at, `head.tree` in `argus review`:
 
 ```fish
-argus run --agent claude:opus --agent codex:gpt-5 "Add retry to the uploader"   # fan-out: 2 jobs, 1 group
-argus status                                      # the attention queue, then one card per job
-argus review j-7f3a --preset panel --lens security   # one review run per model in the preset
-argus packet j-7f3a                               # headline, then hunks by tier, each with provenance
-argus raw j-7f3a --fact human:12.0                # verbatim bytes behind any item on screen
-argus promote j-7f3a <finding>                    # an AI finding becomes a draft comment
-argus feedback j-7f3a                             # exactly what RequestChanges will send
-argus decide j-7f3a request-changes --note "keep the old retry budget"
-argus decide j-7f3a approve && argus merge j-7f3a
-argus check j-7f3a tla specs/Upload.tla --engine tlars    # same target with --engine tlc to compare
-argus check j-7f3a device apps/mobile --platform ios --app fingerprint:ab12
-argus stats --period last-7d --by model
-argus insights --period 2026-11 && argus skill accept <candidate> --to ~/dotfiles/.../skills
+argus start-jobs ~/src/app "Add retry" "Add retry to the uploader" --agents claude:opus,codex:gpt-5   # fan-out: 2 jobs, 1 group
+argus overview                                    # the attention queue, then one card per job
+argus request-review j-7f3a --reviewers preset:panel --lens security   # one review run per model in the preset
+argus review j-7f3a                               # headline, then hunks by tier, each with provenance
+argus raw j-7f3a --around-fact human:12.0 --limit 20   # verbatim bytes behind any item on screen
+argus promote-finding j-7f3a <finding>            # an AI finding becomes a draft comment
+argus preview-feedback j-7f3a "keep the old retry budget"   # exactly what RequestChanges will send
+argus decide j-7f3a "keep the old retry budget" --verdict request-changes --tree <tree>
+argus decide j-7f3a "" --verdict approve --tree <tree> && argus merge j-7f3a <tree>
+argus request-check j-7f3a --check tla:specs/Upload.tla::tlars   # same target with tla:...::java-tlc to compare
+argus request-check j-7f3a --check '{"kind":"Device","project":"apps/mobile","platform":"Ios","app":{"kind":"Fingerprint","hash":"ab12"},"driver":{"kind":"Script","path":"e2e/smoke.sh"},"max_minutes":10}'
+argus stats last-7d --group-by model
+argus request-insights 2026-11 --model claude:opus && argus accept-candidate <candidate> <name> <body> ~/dotfiles/.../skills
+argus import ~/.claude/projects/-src-app/<session>.jsonl ~/src/app --agent claude   # a session from before argus
 ```
 
-Inside an agent (env `ARGUS_RUN`, `ARGUS_SOCKET`, `ARGUS_TOKEN` set at launch). These calls are optional; argus works without them:
+Inside an agent (env `ARGUS_RUN`, `ARGUS_JOB`, `ARGUS_SOCKET`, `ARGUS_TOKEN` set at launch; `job` defaults to `ARGUS_JOB`, and the host refuses any other job). These calls are optional; argus works without them, and the same ops are the agent's MCP tools (`argus mcp`):
 
 ```fish
-argus task add "Parser" --weight 2; argus task block <id> "needs fixture"; argus task done <id> --result "..."
-argus check --self tla specs/Upload.tla          # agents may request checks/reviews of their own work
+argus set-task --title Parser --weight 2; argus set-task --task <id> --status "blocked:needs fixture"; argus set-task --task <id> --status "done:parses every fixture"
+argus request-check --check tla:specs/Upload.tla::tlars   # agents may request checks/reviews of their own work
 ```
 
 Host code (Rust) uses one write path and one read path per ledger:
