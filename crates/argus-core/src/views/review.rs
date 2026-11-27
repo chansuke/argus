@@ -535,7 +535,13 @@ fn shift((start, end): (i64, i64), hunks: &[crate::diff::Hunk]) -> Option<(i64, 
 
 /// `ViewSet::admit` for job ledgers (see the module doc). Reads the field directly, so an
 /// admission check is not recorded as a subscription read.
-pub(crate) fn admit(views: &JobViews, _author: &Author, event: &Event) -> Result<(), Rejected> {
+pub(crate) fn admit(views: &JobViews, author: &Author, event: &Event) -> Result<(), Rejected> {
+    // The host proves which run an agent is (its token), not which job: the run says.
+    if let Author::Agent(run) = author
+        && views.runs.get(run).is_none()
+    {
+        return Err(Rejected::ForeignRun);
+    }
     let board = &views.review;
     match event {
         Event::Decided { tree, verdict, .. } => {
