@@ -274,3 +274,69 @@ fn mcp_tools_reach_the_host_as_the_runs_agent() {
         "{replies}"
     );
 }
+
+#[test]
+fn an_op_takes_its_fields_as_arguments() {
+    let dir = scratch();
+    let socket = dir.join("s.sock");
+    let host = Host::serve(&socket, |id| {
+        vec![format!(
+            r#"{{"kind":"Reply","id":{id},"ok":{{"runs":[]}},"err":null}}"#
+        )]
+    });
+    let args = [
+        "request-review",
+        "j1",
+        "--reviewers",
+        "preset:quick",
+        "--lens",
+        "security",
+        "--request-id",
+        "r1",
+    ];
+    let out = argus(&socket, &args, &[], b"");
+    let [_, request] = host.seen();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(request.contains(r#""op":"request_review""#), "{request}");
+    assert!(
+        request.contains(
+            r#""input":{"request_id":"r1","job":"j1","reviewers":{"kind":"Preset","name":"quick"},"lens":"Security","focus":null}"#
+        ),
+        "{request}"
+    );
+    assert_eq!(text(&out.stdout), "{\"runs\":[]}\n");
+}
+
+#[test]
+fn a_watch_takes_arguments_too() {
+    let dir = scratch();
+    let socket = dir.join("s.sock");
+    let host = Host::serve(&socket, |id| {
+        vec![format!(r#"{{"kind":"Push","id":{id},"value":{{"n":1}}}}"#)]
+    });
+    let out = argus(&socket, &["watch", "job", "j1"], &[], b"");
+    let [_, request] = host.seen();
+    assert!(request.contains(r#""kind":"Subscribe""#), "{request}");
+    assert!(request.contains(r#""input":{"job":"j1"}"#), "{request}");
+    assert_eq!(text(&out.stdout), "{\"n\":1}\n");
+}
+
+#[test]
+fn a_mistake_in_the_arguments_points_at_the_ops_help() {
+    let dir = scratch();
+    let socket = dir.join("none.sock");
+    let out = argus(&socket, &["decide", "j1", "looks good"], &[], b"");
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(err.contains("missing --verdict"), "{err}");
+    assert!(err.contains("argus help decide"), "{err}");
+
+    let out = argus(&socket, &["help", "decide"], &[], b"");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let help = text(&out.stdout);
+    assert!(help.contains("argus decide <job> <note>"), "{help}");
+    assert!(
+        help.contains("--verdict approve|request-changes|abandon"),
+        "{help}"
+    );
+}
