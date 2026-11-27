@@ -340,3 +340,23 @@ fn a_mistake_in_the_arguments_points_at_the_ops_help() {
         "{help}"
     );
 }
+
+#[test]
+fn inside_a_run_job_defaults_to_the_runs_own() {
+    let dir = scratch();
+    let socket = dir.join("s.sock");
+    let host = Host::serve(&socket, |id| {
+        vec![format!(
+            r#"{{"kind":"Reply","id":{id},"ok":{{"task":"t1"}},"err":null}}"#
+        )]
+    });
+    let env = [
+        ("ARGUS_RUN", "r1"),
+        ("ARGUS_JOB", "j9"),
+        ("ARGUS_TOKEN", "secret"),
+    ];
+    let out = argus(&socket, &["set-task", "--title", "Parser"], &env, b"");
+    let [_, request] = host.seen();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(request.contains(r#""input":{"job":"j9","#), "{request}");
+}
