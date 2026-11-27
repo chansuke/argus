@@ -34,8 +34,9 @@ pub(crate) const VERSION: u32 = 1;
 /// MCP: `--mcp-config` adds the argus server (`adapters::MCP_SERVER`) to the user's own,
 /// and `--allowedTools mcp__argus` lets the agent call it without a prompt; the host
 /// decides what each call may do. Both flags take several values, so a single-value flag
-/// follows them before the prompt. Unverified: that Claude Code gives a stdio server the
-/// agent's whole environment (its docs only say `env` adds to it).
+/// follows them before the prompt. A real run (2.1.329, `-p` with these flags,
+/// 2026-11-27) connected the server, called its tool without a prompt, and the server
+/// saw the agent's `ARGUS_RUN` and `ARGUS_TOKEN`.
 pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
     let run = env.run.0.to_string();
     let mut args = Vec::new();

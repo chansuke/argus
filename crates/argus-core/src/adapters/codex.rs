@@ -81,7 +81,8 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
 /// those name the run's identity; and exec cannot ask for an approval, so the server's
 /// tools are `approve`d (the host decides what each call may do). Keys and values checked
 /// with codex-cli 0.171.0 `codex -c ... mcp get argus --json`, which rejects an unknown
-/// approval mode. Unverified: that `approve` lets a call through in exec.
+/// approval mode. A real exec run (0.171.0, 2026-11-27) called the server's tool, and the
+/// server saw the agent's `ARGUS_RUN` and `ARGUS_TOKEN`.
 fn mcp_settings(env: &PlanEnv) -> Vec<String> {
     let key = format!("mcp_servers.{}", super::MCP_SERVER);
     let list = |items: &[&str]| -> String {
