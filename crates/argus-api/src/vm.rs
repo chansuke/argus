@@ -182,6 +182,10 @@ vm_struct! { Candidates { candidates: Vec<Candidate> } }
 vm_struct! { AgentChoice { agent: Agent, model: Option<String> } }
 vm_struct! { StartJobs { request_id: String, repo: String, base: Option<String>, title: String, prompt: String, agents: Vec<AgentChoice> } }
 vm_struct! { Started { jobs: Vec<String> } }
+vm_struct! { /// `transcript`: a Claude Code transcript or a Codex rollout written before argus
+/// watched it. `repo`: the repository the session worked in. `title` defaults to the
+/// file's name. No request id: the job derives from the file's path.
+ImportTranscript { transcript: String, agent: Agent, repo: String, title: Option<String> } }
 vm_enum! { Reviewers { Default {}, Preset { name: String }, Models { models: Vec<ModelPick> } } }
 vm_struct! { /// One review run per resolved model, all of the head snapshot.
 RequestReview { request_id: String, job: String, reviewers: Reviewers, lens: Lens, focus: Option<String> } }

@@ -1456,6 +1456,58 @@ impl Handler for ApiHandler<'_> {
         }
         Ok(Started { jobs })
     }
+    /// A transcript written before argus watched it becomes a job of its own, read once
+    /// (`RunPurpose::Import`). Job and run ids derive from the file's absolute path, so a
+    /// second import of it is the same job. Nothing runs in the repository, so the job's
+    /// worktree is the repository itself: the session's edits inside it are the job's.
+    fn import(&mut self, caller: &Caller, input: ImportTranscript) -> Result<RunRef, ApiError> {
+        let author = author(caller)?;
+        let transcript =
+            std::fs::canonicalize(&input.transcript).map_err(|e| ApiError::BadInput {
+                path: "transcript".into(),
+                what: e.to_string(),
+            })?;
+        let repo = PathBuf::from(&input.repo);
+        let base = git::resolve(&repo, "HEAD").map_err(|e| ApiError::BadInput {
+            path: "repo".into(),
+            what: e.to_string(),
+        })?;
+        let target = git::current_branch(&repo).unwrap_or_else(|| "main".into());
+        let job = JobId(derived("import", &transcript.to_string_lossy()));
+        let title = input.title.unwrap_or_else(|| {
+            transcript
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        let info = JobInfo {
+            job,
+            title,
+            repo: repo.clone(),
+            base,
+            target,
+            worktree: repo,
+            group: None,
+            origin: JobOrigin::Imported {
+                transcript: transcript.clone(),
+            },
+        };
+        self.host.create_job(info).map_err(internal)?;
+        let handle = self
+            .host
+            .job(job)
+            .ok_or_else(|| internal("the job did not open"))?;
+        let run = RunId(Id128::derive("import", &job.0.0.to_le_bytes()));
+        let purpose = RunPurpose::Import {
+            transcript,
+            cli: agent_cli(input.agent),
+        };
+        self.submit(&handle, author, Event::RunRequested { run, purpose })?;
+        Ok(RunRef {
+            job: job.0.to_string(),
+            run: run.0.to_string(),
+        })
+    }
     /// Bytes for the run's terminal, recorded first (`RunInput`), typed once.
     fn send_input(&mut self, caller: &Caller, input: SendInput) -> Result<Ack, ApiError> {
         let author = author(caller)?;
@@ -2842,6 +2894,51 @@ mod tests {
             host.subscribe(&Caller::Local, "nope", parse(b"{}").unwrap(), into),
             Err(ApiError::UnknownOp { .. })
         ));
+        host.shutdown();
+    }
+
+    #[test]
+    fn an_import_makes_one_job_of_a_transcript_and_reads_it() {
+        let (host, root, repo) = host();
+        let file = root.join("old-session.jsonl");
+        let line = r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2025-06-01T10:00:00.000Z","isSidechain":false,"message":{"role":"user","content":"add retries"}}"#;
+        std::fs::write(&file, format!("{line}\n")).unwrap();
+        let input = format!(
+            r#"{{"transcript":"{}","agent":"Claude","repo":"{}","title":null}}"#,
+            file.display(),
+            repo.display()
+        );
+        let first = call(&host, &Caller::Local, "import", &input).unwrap();
+        // The same file again is the same job and run: nothing is read twice.
+        assert_eq!(
+            call(&host, &Caller::Local, "import", &input).unwrap(),
+            first
+        );
+        let job = text(&first, &["job"]).to_owned();
+
+        let overview = call(&host, &Caller::Local, "overview", "{}").unwrap();
+        let Some(Json::Arr(cards)) = overview.get("jobs") else {
+            panic!("{}", argus_json::write(&overview))
+        };
+        assert_eq!(cards.len(), 1);
+        assert_eq!(text(&cards[0], &["title"]), "old-session");
+        let ask =
+            format!(r#"{{"job":"{job}","from_ms":0,"to_ms":9007199254740991,"bucket":null}}"#);
+        eventually("the transcript's prompt is on the timeline", || {
+            let page = call(&host, &Caller::Local, "timeline", &ask).unwrap();
+            let Json::Arr(items) = get(&page, "items") else {
+                panic!()
+            };
+            items.iter().any(|i| text(i, &["kind"]) == "Prompt")
+        });
+
+        // A file that is not there makes no job.
+        let missing = input.replace("old-session", "no-such-session");
+        let err = call(&host, &Caller::Local, "import", &missing).unwrap_err();
+        assert!(
+            matches!(&err, ApiError::BadInput { path, .. } if path == "transcript"),
+            "{err:?}"
+        );
         host.shutdown();
     }
 
