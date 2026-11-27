@@ -1557,3 +1557,23 @@ fn a_codex_reviews_findings_come_from_its_last_message() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].title, "line2 is wrong");
 }
+
+#[test]
+fn an_agent_writes_only_to_the_job_it_runs_in() {
+    let mut job = Job::open();
+    job.agent(1);
+    let task = |n| Event::TaskSet {
+        task: TaskKey(Id128(n)),
+        patch: TaskPatch {
+            title: Some("Parser".into()),
+            ..TaskPatch::default()
+        },
+    };
+    job.ok(Author::Agent(run(1)), task(5));
+    // A run this job never requested is another job's (or none), however valid its token.
+    let foreign = job.submit(Author::Agent(run(77)), task(6));
+    assert!(
+        matches!(foreign, Err(LedgerError::Rejected(Rejected::ForeignRun))),
+        "{foreign:?}"
+    );
+}

@@ -638,6 +638,9 @@ pub enum Rejected {
     },
     /// A merge whose approval is no longer current.
     NotApproved,
+    /// An agent wrote to a job that never requested its run: an agent acts on its own
+    /// job only, whatever job id it names.
+    ForeignRun,
 }
 
 /// Identity used to drop a re-submitted event (a retried CLI call, a policy decision made
