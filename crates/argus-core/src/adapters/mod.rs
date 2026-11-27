@@ -12,11 +12,25 @@ mod touch;
 
 /// The MCP server argus gives every agent it starts: `<tools.argus> mcp`, named
 /// `argus`, so its tools are `mcp__argus__<op>` to Claude Code. The server learns the run
-/// it speaks for from these variables in the agent's environment (the host adds
-/// `ARGUS_TOKEN`).
+/// it speaks for from these variables in the agent's environment (`agent_env`; the host
+/// adds `ARGUS_TOKEN`).
 pub(crate) const MCP_SERVER: &str = "argus";
 pub(crate) const MCP_ARGS: &[&str] = &["mcp"];
-pub(crate) const MCP_ENV: &[&str] = &["ARGUS_RUN", "ARGUS_SOCKET", "ARGUS_TOKEN"];
+pub(crate) const MCP_ENV: &[&str] = &["ARGUS_RUN", "ARGUS_JOB", "ARGUS_SOCKET", "ARGUS_TOKEN"];
+
+/// What an agent's `argus` calls need to know: the run they speak for, its job (so the
+/// agent need not be told its id; `argus` fills `job` from it), and the host's socket.
+pub(crate) fn agent_env(env: &crate::command::PlanEnv) -> Vec<(String, String)> {
+    let mut vars = vec![("ARGUS_RUN".to_owned(), env.run.0.to_string())];
+    if let Some(job) = env.job {
+        vars.push(("ARGUS_JOB".to_owned(), job.0.to_string()));
+    }
+    vars.push((
+        "ARGUS_SOCKET".to_owned(),
+        env.socket.to_string_lossy().into_owned(),
+    ));
+    vars
+}
 
 use crate::source::{Decoded, Observation, SourceKind};
 
