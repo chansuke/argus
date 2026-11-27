@@ -24,8 +24,9 @@ pub(crate) const VERSION: u32 = 1;
 /// starts: watch `.claude/projects/*/<uuid>.jsonl` and
 /// `.claude/projects/*/<uuid>/subagents/*.jsonl` (glob on the slug instead of re-deriving
 /// Claude's cwd-to-slug rule).
-/// Env: `ARGUS_RUN`, `ARGUS_SOCKET`, so `argus task ...` and `argus hook` inside the agent
-/// know who they speak for. The host adds `ARGUS_TOKEN`, which proves it.
+/// Env: `ARGUS_RUN`, `ARGUS_JOB`, `ARGUS_SOCKET` (`adapters::agent_env`), so `argus
+/// set-task ...` and `argus hook` inside the agent know who they speak for. The host adds
+/// `ARGUS_TOKEN`, which proves it.
 ///
 /// Flags from Claude Code 2.1.303 `--help`. Unverified: that `--resume` with
 /// `--fork-session` accepts `--session-id`, and that a v8 UUID (derived run ids) is
@@ -66,13 +67,7 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
     CommandSpec {
         program: env.tools.claude.clone(),
         args,
-        env: vec![
-            ("ARGUS_RUN".to_owned(), run.clone()),
-            (
-                "ARGUS_SOCKET".to_owned(),
-                env.socket.to_string_lossy().into_owned(),
-            ),
-        ],
+        env: super::agent_env(env),
         workdir: Workdir::JobWorktree,
         cwd: None,
         stdin: None,

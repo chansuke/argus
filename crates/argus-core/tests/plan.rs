@@ -16,6 +16,7 @@ use argus_core::plan::plan;
 use argus_core::source::SourceKind;
 
 const RUN: &str = "0f8fad5d-d9cb-469f-a165-70867728950e";
+const JOB: &str = "00000000-0000-0000-0000-000000000001";
 
 fn env() -> PlanEnv {
     PlanEnv {
@@ -72,7 +73,7 @@ const CLAUDE_MCP: &str = r#"{"mcpServers":{"argus":{"command":"/bin/argus","args
 const CODEX_MCP: [&str; 4] = [
     r#"mcp_servers.argus.command="/bin/argus""#,
     r#"mcp_servers.argus.args=["mcp"]"#,
-    r#"mcp_servers.argus.env_vars=["ARGUS_RUN","ARGUS_SOCKET","ARGUS_TOKEN"]"#,
+    r#"mcp_servers.argus.env_vars=["ARGUS_RUN","ARGUS_JOB","ARGUS_SOCKET","ARGUS_TOKEN"]"#,
     r#"mcp_servers.argus.default_tools_approval_mode="approve""#,
 ];
 
@@ -131,6 +132,8 @@ fn a_claude_agent_runs_interactively_under_its_run_id() {
         spec.env
             .contains(&("ARGUS_SOCKET".into(), "/run/argus.sock".into()))
     );
+    // The agent names its own job in `argus` calls without being told it.
+    assert!(spec.env.contains(&("ARGUS_JOB".into(), JOB.into())));
 }
 
 fn codex_agent(prompt: &str, resume: Option<RunId>) -> RunPurpose {
@@ -180,6 +183,8 @@ fn a_codex_agent_works_on_its_own_in_the_worktree_and_reports_on_stdout() {
         spec.env
             .contains(&("ARGUS_SOCKET".into(), "/run/argus.sock".into()))
     );
+    // The agent names its own job in `argus` calls without being told it.
+    assert!(spec.env.contains(&("ARGUS_JOB".into(), JOB.into())));
 }
 
 #[test]

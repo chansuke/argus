@@ -33,7 +33,7 @@ pub(crate) const VERSION: u32 = 4;
 /// agent run because each job has its own worktree and its agent runs are sequential. A
 /// Codex session someone starts by hand in the worktree would be picked instead.
 ///
-/// Env: `ARGUS_RUN`, `ARGUS_SOCKET`, as for Claude. Flags from codex-cli 0.171.0
+/// Env: `adapters::agent_env`, as for Claude. Flags from codex-cli 0.171.0
 /// `exec --help` and `exec resume --help`; `--last` filters by the working directory
 /// (its help says `--all` disables that filtering), and with one positional the
 /// positional is the prompt (`codex-rs/exec`), so `-` reads stdin. Exec never waits for
@@ -57,13 +57,7 @@ pub(crate) fn launch(launch: &AgentLaunch, env: &PlanEnv) -> CommandSpec {
     CommandSpec {
         program: env.tools.codex.clone(),
         args,
-        env: vec![
-            ("ARGUS_RUN".to_owned(), env.run.0.to_string()),
-            (
-                "ARGUS_SOCKET".to_owned(),
-                env.socket.to_string_lossy().into_owned(),
-            ),
-        ],
+        env: super::agent_env(env),
         workdir: Workdir::JobWorktree,
         cwd: None,
         stdin: Some(launch.prompt.clone().into_bytes()),
