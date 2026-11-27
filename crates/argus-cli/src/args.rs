@@ -17,6 +17,8 @@
 //!   (`preset:quick`, `default`); a list as items joined by `,` (a repeated flag adds
 //!   items). In `a:b:c`, the last field takes the rest, so it may hold `:`; an empty
 //!   part leaves an optional field out. A value starting with `{` or `[` is JSON.
+//! - A field the caller has a default for (`job` inside a run: `ARGUS_JOB`) takes no
+//!   positional and is filled when not named.
 //! - A missing `request_id` is minted (an error if none can be); other missing required
 //!   fields are an error. A
 //!   bare `--<field>` of a boolean is `true`.
@@ -58,13 +60,17 @@ pub(crate) fn input(
     schema: &Json,
     args: &[String],
     mint: impl FnOnce() -> Option<String>,
+    defaults: &[(&str, String)],
 ) -> Result<Json, ArgsError> {
+    let default = |name: &str| defaults.iter().find(|(d, _)| *d == name).map(|(_, v)| v);
     let fields = properties(schema);
     let required = required(schema);
     let mut given: Vec<(String, Json)> = Vec::new();
     let mut positionals = fields
         .iter()
-        .filter(|(name, s)| required.contains(name) && name != "request_id" && is_text(s))
+        .filter(|(name, s)| {
+            required.contains(name) && name != "request_id" && is_text(s) && default(name).is_none()
+        })
         .map(|(name, _)| name.clone());
     let mut rest = args.iter().peekable();
     while let Some(arg) = rest.next() {
@@ -121,6 +127,15 @@ pub(crate) fn input(
                     continue;
                 }
             },
+            None if default(name).is_some() => {
+                let text = default(name).expect("some");
+                let schema = &fields.iter().find(|(n, _)| n == name).expect("found").1;
+                value(schema, text).map_err(|expected| ArgsError::BadValue {
+                    field: name.clone(),
+                    value: text.clone(),
+                    expected,
+                })?
+            }
             None if required.contains(name) => {
                 missing.push(name.clone());
                 continue;
@@ -427,7 +442,7 @@ mod tests {
     }
 
     fn read<T: Wire>(text: &[&str]) -> Result<T, ArgsError> {
-        let json = input(&T::schema(), &args(text), || Some("minted".into()))?;
+        let json = input(&T::schema(), &args(text), || Some("minted".into()), &[])?;
         Ok(T::from_json(&json).unwrap_or_else(|e| panic!("{}: {}", e.path, e.what)))
     }
 
@@ -569,11 +584,33 @@ mod tests {
             &Decide::schema(),
             &args(&["j", "n", "--verdict", "approve"]),
             || None,
+            &[],
         );
         assert_eq!(
             err.unwrap_err(),
             ArgsError::Missing(vec!["request_id".into()])
         );
+    }
+
+    #[test]
+    fn a_field_with_a_default_is_filled_and_takes_no_positional() {
+        let job = [("job", "j9".to_owned())];
+        let got = input(&SetTask::schema(), &args(&["--title", "P"]), || None, &job).unwrap();
+        assert_eq!(SetTask::from_json(&got).unwrap().job, "j9");
+        let got = input(
+            &Reply::schema(),
+            &args(&["t1", "hello"]),
+            || Some("r".into()),
+            &job,
+        );
+        let got = Reply::from_json(&got.unwrap()).unwrap();
+        assert_eq!(
+            (got.job, got.thread, got.body),
+            ("j9".into(), "t1".into(), "hello".into())
+        );
+        // Named, it wins.
+        let got = input(&JobRef::schema(), &args(&["--job", "j1"]), || None, &job).unwrap();
+        assert_eq!(JobRef::from_json(&got).unwrap().job, "j1");
     }
 
     #[test]

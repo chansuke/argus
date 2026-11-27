@@ -19,6 +19,7 @@ const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-0
 /// Serves requests from `input` until it ends, writing one response per request.
 pub(crate) fn serve<T: Transport>(
     transport: &mut T,
+    job: Option<&str>,
     input: impl BufRead,
     mut output: impl Write,
 ) -> std::io::Result<()> {
@@ -28,7 +29,7 @@ pub(crate) fn serve<T: Transport>(
             continue;
         }
         let response = match argus_json::parse(line.as_bytes()) {
-            Ok(message) => handle(transport, &message),
+            Ok(message) => handle(transport, job, &message),
             Err(_) => Some(error(Json::Null, -32700, "Parse error")),
         };
         if let Some(response) = response {
@@ -71,8 +72,31 @@ fn tools() -> impl Iterator<Item = &'static OpInfo> {
     OPS.iter().filter(|op| op.access == OpAccess::Agent)
 }
 
+fn has_job(op: &OpInfo) -> bool {
+    (op.input_schema)()
+        .get("properties")
+        .and_then(|p| p.get("job"))
+        .is_some()
+}
+
+/// The op's input schema; inside a run (`ARGUS_JOB`), `job` is no longer required: the
+/// server fills in the run's own, and the host refuses any other.
+fn input_schema(op: &OpInfo, job: Option<&str>) -> Json {
+    let mut schema = (op.input_schema)();
+    if job.is_some()
+        && let Json::Obj(rules) = &mut schema
+    {
+        for (key, value) in rules.iter_mut() {
+            if let ("required", Json::Arr(names)) = (key.as_str(), value) {
+                names.retain(|n| n.as_str() != Some("job"));
+            }
+        }
+    }
+    schema
+}
+
 /// The response to one message; `None` for a notification.
-fn handle<T: Transport>(transport: &mut T, message: &Json) -> Option<Json> {
+fn handle<T: Transport>(transport: &mut T, job: Option<&str>, message: &Json) -> Option<Json> {
     let id = message.get("id").cloned();
     let method = message.get("method").and_then(Json::as_str);
     let (Some(id), Some(method)) = (id, method) else {
@@ -121,7 +145,7 @@ fn handle<T: Transport>(transport: &mut T, message: &Json) -> Option<Json> {
                     obj(vec![
                         ("name", Json::str(op.name)),
                         ("description", Json::str(op.doc.trim_end())),
-                        ("inputSchema", (op.input_schema)()),
+                        ("inputSchema", input_schema(op, job)),
                     ])
                 })
                 .collect();
@@ -132,7 +156,13 @@ fn handle<T: Transport>(transport: &mut T, message: &Json) -> Option<Json> {
             let Some(op) = tools().find(|op| op.name == name) else {
                 return Some(error(id, -32602, &format!("Unknown tool: {name}")));
             };
-            let input = param("arguments").cloned().unwrap_or(Json::Obj(Vec::new()));
+            let mut input = param("arguments").cloned().unwrap_or(Json::Obj(Vec::new()));
+            if let (Some(job), Json::Obj(fields)) = (job, &mut input)
+                && has_job(op)
+                && !fields.iter().any(|(k, _)| k == "job")
+            {
+                fields.push(("job".into(), Json::str(job)));
+            }
             // A refusal is the tool's result, so the model reads why (MCP: tool
             // execution errors are reported with `isError`).
             let (value, failed) = match transport.call(op.name, input) {
@@ -183,8 +213,12 @@ mod tests {
 
     /// The response lines to `requests` (one per line).
     fn exchange(transport: &mut Fake, requests: &[&str]) -> Vec<Json> {
+        exchange_as(transport, None, requests)
+    }
+
+    fn exchange_as(transport: &mut Fake, job: Option<&str>, requests: &[&str]) -> Vec<Json> {
         let mut out = Vec::new();
-        serve(transport, requests.join("\n").as_bytes(), &mut out).unwrap();
+        serve(transport, job, requests.join("\n").as_bytes(), &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
         out.lines()
             .map(|l| argus_json::parse(l.as_bytes()).unwrap())
@@ -294,6 +328,35 @@ mod tests {
         assert_eq!(
             at(&replies[2], &["error", "code"]),
             &Json::Num(Number::from_i64(-32602))
+        );
+    }
+
+    #[test]
+    fn inside_a_run_the_job_is_the_runs_own() {
+        let mut t = fake(|_| Ok(argus_json::parse(br#"{"task":"t1"}"#).unwrap()));
+        let replies = exchange_as(
+            &mut t,
+            Some("j9"),
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"set_task","arguments":{"title":"Parser"}}}"#,
+            ],
+        );
+        let Json::Arr(listed) = at(&replies[0], &["result", "tools"]) else {
+            panic!("tools is a list")
+        };
+        let set_task = listed
+            .iter()
+            .find(|t| at(t, &["name"]) == &Json::str("set_task"))
+            .unwrap();
+        // The model need not know its job id, so it is not asked for it.
+        let Json::Arr(required) = at(set_task, &["inputSchema", "required"]) else {
+            panic!("required is a list")
+        };
+        assert!(!required.contains(&Json::str("job")), "{required:?}");
+        assert_eq!(
+            t.calls,
+            vec![("set_task".into(), r#"{"title":"Parser","job":"j9"}"#.into())]
         );
     }
 

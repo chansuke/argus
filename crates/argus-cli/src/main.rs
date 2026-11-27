@@ -18,6 +18,7 @@
 //! The socket is `$ARGUS_SOCKET`, else the host's default (`argus_api::place::socket`).
 //! A run argus started has `ARGUS_RUN` and `ARGUS_TOKEN` in its environment, and the
 //! host then treats the caller as that run's agent; otherwise the caller is the user.
+//! It also has `ARGUS_JOB`, which an op's `job` defaults to.
 
 mod args;
 mod mcp;
@@ -68,7 +69,11 @@ fn op_named(name: &str) -> Option<&'static OpInfo> {
 
 fn parse(args: &[String]) -> Result<Command, Misuse> {
     let op_input = |op: &'static OpInfo, rest: &[String]| {
-        args::input(&(op.input_schema)(), rest, mint).map_err(|e| Misuse::Op {
+        let defaults: Vec<(&str, String)> = env("ARGUS_JOB")
+            .map(|job| ("job", job))
+            .into_iter()
+            .collect();
+        args::input(&(op.input_schema)(), rest, mint, &defaults).map_err(|e| Misuse::Op {
             op,
             what: e.to_string(),
         })
@@ -197,8 +202,13 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::Mcp => {
             let mut transport = Reconnecting { socket: None };
-            mcp::serve(&mut transport, std::io::stdin().lock(), std::io::stdout())
-                .map_err(|e| format!("mcp: {e}"))
+            mcp::serve(
+                &mut transport,
+                env("ARGUS_JOB").as_deref(),
+                std::io::stdin().lock(),
+                std::io::stdout(),
+            )
+            .map_err(|e| format!("mcp: {e}"))
         }
     }
 }
