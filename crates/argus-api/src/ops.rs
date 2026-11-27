@@ -113,6 +113,9 @@ api! {
     command merge(MergeJob) -> RunRef;
     // -- jobs & agents --
     command start_jobs(StartJobs) -> Started;
+    /// Reads a transcript written before argus watched it into a job of its own, once:
+    /// importing the same file again is the same job.
+    command import(ImportTranscript) -> RunRef;
     command send_input(SendInput) -> Ack;
     command answer_permission(AnswerPermission) -> Ack;
     command cancel_run(RunRef) -> Ack;

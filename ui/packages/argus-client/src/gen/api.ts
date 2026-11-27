@@ -253,6 +253,13 @@ export interface HunkView {
   text: string;
 }
 
+export interface ImportTranscript {
+  transcript: string;
+  agent: Agent;
+  repo: string;
+  title: string | null;
+}
+
 export type ItemKind = "Prompt" | "Reply" | "Thinking" | "ToolCall" | "PlanChange" | "Snapshot" | "RunLifecycle" | "Finding" | "CheckVerdict" | "Artifact" | "Comment" | "TaskChange" | "HumanInput" | "Decision" | "Discontinuity" | "Unrecognized";
 
 export interface JobCard {
@@ -615,6 +622,7 @@ export const OPS = {
   decide: { kind: "command", access: "Human" },
   merge: { kind: "command", access: "Human" },
   start_jobs: { kind: "command", access: "Human" },
+  import: { kind: "command", access: "Human" },
   send_input: { kind: "command", access: "Human" },
   answer_permission: { kind: "command", access: "Human" },
   cancel_run: { kind: "command", access: "Human" },
@@ -647,6 +655,7 @@ export interface ArgusApi {
   decide(input: Decide): Promise<Ack>;
   merge(input: MergeJob): Promise<RunRef>;
   start_jobs(input: StartJobs): Promise<Started>;
+  import(input: ImportTranscript): Promise<RunRef>;
   send_input(input: SendInput): Promise<Ack>;
   answer_permission(input: AnswerPermission): Promise<Ack>;
   cancel_run(input: RunRef): Promise<Ack>;
